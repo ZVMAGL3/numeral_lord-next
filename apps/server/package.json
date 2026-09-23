@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@numeral-lord/content-schema": "workspace:*",
+    "@numeral-lord/core-content": "workspace:*",
     "@numeral-lord/game-core": "workspace:*",
     "@numeral-lord/game-sdk": "workspace:*",
     "colyseus": "0.18.7"

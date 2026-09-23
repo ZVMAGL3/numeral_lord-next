@@ -4,6 +4,7 @@ import {
   applyIntent,
   getLegalIntents
 } from "@numeral-lord/game-core/node";
+import { DEFAULT_MAP_CODE, parseMapCode } from "@numeral-lord/core-content";
 import type {
   GameIntent,
   GameState,
@@ -38,7 +39,7 @@ interface CachedHostSnapshot {
 
 interface RoomCreateOptions {
   allowReconnectionTime?: number;
-  mapPlayerCount?: number;
+  mapCode?: string;
   maxClients?: number;
   metadata?: unknown;
 }
@@ -58,13 +59,19 @@ export class PvpRelayRoom extends RelayRoom {
   private readonly lastRoomSyncAtBySession = new Map<string, number>();
   private phase: LobbyRoomState["phase"] = "lobby";
   private mapPlayerCount = 2;
+  private mapCode = DEFAULT_MAP_CODE;
+  private mapName = "昏晓";
   private settings: LobbySettings = DEFAULT_LOBBY_SETTINGS;
   private matchStartedAtEpochMs: number | null = null;
   private nextJoinOrder = 0;
   private latestHostSnapshot: CachedHostSnapshot | undefined;
 
   override onCreate(options: RoomCreateOptions): void {
-    this.mapPlayerCount = clampInteger(options.mapPlayerCount, 1, MAX_ROOM_CAPACITY, 2);
+    const initialMapCode = options.mapCode ?? DEFAULT_MAP_CODE;
+    const initialMap = parseMapCode(initialMapCode);
+    this.mapCode = initialMapCode;
+    this.mapName = initialMap.name;
+    this.mapPlayerCount = initialMap.players;
     this.settings = { ...DEFAULT_LOBBY_SETTINGS };
     this.maxClients = MAX_ROOM_CAPACITY;
     if (options.allowReconnectionTime) {
@@ -72,6 +79,7 @@ export class PvpRelayRoom extends RelayRoom {
     }
     this.setMetadata({
       ...(typeof options.metadata === "object" && options.metadata ? options.metadata : {}),
+      mapName: this.mapName,
       mapPlayerCount: this.mapPlayerCount
     });
 
@@ -90,10 +98,14 @@ export class PvpRelayRoom extends RelayRoom {
     this.onMessage("host-snapshot", (client, payload: Record<string, unknown> = {}) => {
       if (this.phase !== "playing" || client.sessionId !== this.hostSessionId
         || client.sessionId !== this.authoritativeHostSessionId) return;
-      const snapshot = this.validateSnapshot(payload);
+      const receivedAtEpochMs = Date.now();
+      const snapshot = this.validateSnapshot(payload, receivedAtEpochMs);
       if (!snapshot) return;
       this.latestHostSnapshot = snapshot;
-      this.broadcast("host-snapshot", payload, { except: client });
+      this.broadcast("host-snapshot", {
+        ...snapshot.payload,
+        serverSentAtEpochMs: receivedAtEpochMs
+      }, { except: client });
     });
     this.onMessage("lobby-ready", (client, payload: Record<string, unknown> = {}) => {
       const member = this.members.get(client.sessionId);
@@ -105,6 +117,10 @@ export class PvpRelayRoom extends RelayRoom {
     this.onMessage("lobby-settings", (client, payload: Record<string, unknown> = {}) => {
       if (this.phase !== "lobby" || client.sessionId !== this.hostSessionId) return;
       this.updateSettings(client, payload);
+    });
+    this.onMessage("lobby-map", (client, payload: Record<string, unknown> = {}) => {
+      if (this.phase !== "lobby" || client.sessionId !== this.hostSessionId) return;
+      this.selectMap(client, payload.mapCode);
     });
     this.onMessage("lobby-seat", (client, payload: Record<string, unknown> = {}) => {
       if (this.phase !== "lobby") return;
@@ -144,17 +160,28 @@ export class PvpRelayRoom extends RelayRoom {
     });
   }
 
-  private validateSnapshot(payload: Record<string, unknown>): CachedHostSnapshot | undefined {
+  private validateSnapshot(payload: Record<string, unknown>, receivedAtEpochMs: number): CachedHostSnapshot | undefined {
     const state = payload.state;
     const sequence = isRecord(state) ? state.sequence : undefined;
     if (typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence < 0) return;
     if (this.latestHostSnapshot && sequence < this.latestHostSnapshot.sequence) return;
-    return { payload, sequence };
+    const hostSentAtEpochMs = payload.hostSentAtEpochMs;
+    const offset = typeof hostSentAtEpochMs === "number" && Number.isFinite(hostSentAtEpochMs)
+      ? receivedAtEpochMs - hostSentAtEpochMs
+      : 0;
+    const clock = isRecord(payload.clock) ? payload.clock : undefined;
+    return {
+      payload: clock ? { ...payload, clock: rebaseClockEpochs(clock, offset) } : payload,
+      sequence
+    };
   }
 
   private sendCachedSnapshot(client: Client): boolean {
     if (!this.latestHostSnapshot) return false;
-    client.send("host-snapshot", this.latestHostSnapshot.payload);
+    client.send("host-snapshot", {
+      ...this.latestHostSnapshot.payload,
+      serverSentAtEpochMs: Date.now()
+    });
     return true;
   }
 
@@ -184,6 +211,8 @@ export class PvpRelayRoom extends RelayRoom {
       }));
     return {
       phase: this.phase,
+      mapCode: this.mapCode,
+      mapName: this.mapName,
       mapPlayerCount: this.mapPlayerCount,
       settings: this.settings,
       members,
@@ -309,19 +338,69 @@ export class PvpRelayRoom extends RelayRoom {
 
   private updateSettings(client: Client, payload: Record<string, unknown>): void {
     const wasRandom = this.settings.randomizePositions;
-    this.settings = {
+    const nextSettings: LobbySettings = {
       friendlyFire: typeof payload.friendlyFire === "boolean" ? payload.friendlyFire : this.settings.friendlyFire,
       turnTimeSeconds: clampTimer(payload.turnTimeSeconds, 10, 300, this.settings.turnTimeSeconds),
-      matchTimeMinutes: clampTimer(payload.matchTimeMinutes, 5, 180, this.settings.matchTimeMinutes),
+      matchTimeMinutes: clampTimer(payload.matchTimeMinutes, 1, 180, this.settings.matchTimeMinutes),
       randomizePositions: typeof payload.randomizePositions === "boolean"
         ? payload.randomizePositions
         : this.settings.randomizePositions
     };
+    if (nextSettings.turnTimeSeconds !== 0 && nextSettings.matchTimeMinutes !== 0
+      && nextSettings.turnTimeSeconds > nextSettings.matchTimeMinutes * 60) {
+      this.sendError(client, "步时不能大于局时，请调整后再试。 ");
+      return;
+    }
+    this.settings = nextSettings;
     if (wasRandom !== this.settings.randomizePositions) this.convertPositionMode();
     this.resetReady();
     this.setMetadata({
       protocol: "host-authoritative-relay",
       version: "0.2.0",
+      mapName: this.mapName,
+      mapPlayerCount: this.mapPlayerCount
+    });
+    this.broadcastRoomState();
+  }
+
+  private selectMap(client: Client, requestedCode: unknown): void {
+    if (typeof requestedCode !== "string") {
+      this.sendError(client, "地图码格式不正确。 ");
+      return;
+    }
+    let selectedMap: ReturnType<typeof parseMapCode>;
+    try {
+      selectedMap = parseMapCode(requestedCode);
+    } catch {
+      this.sendError(client, "地图码无法读取，请检查内容后重试。 ");
+      return;
+    }
+    if (requestedCode === this.mapCode) return;
+
+    this.mapCode = requestedCode;
+    this.mapName = selectedMap.name;
+    this.mapPlayerCount = selectedMap.players;
+    if (this.settings.randomizePositions) {
+      const participants = [...this.members.values()]
+        .filter((member) => member.participating)
+        .sort((left, right) => left.joinOrder - right.joinOrder);
+      for (const member of participants.slice(this.mapPlayerCount)) {
+        member.participating = false;
+        member.seat = null;
+      }
+    } else {
+      for (const member of this.members.values()) {
+        if (member.seat !== null && member.seat > this.mapPlayerCount) {
+          member.seat = null;
+          member.participating = false;
+        }
+      }
+    }
+    this.resetReady();
+    this.setMetadata({
+      protocol: "host-authoritative-relay",
+      version: "0.2.0",
+      mapName: this.mapName,
       mapPlayerCount: this.mapPlayerCount
     });
     this.broadcastRoomState();
@@ -441,6 +520,7 @@ export class PvpRelayRoom extends RelayRoom {
     this.authoritativeHostSessionId = this.hostSessionId;
     this.latestHostSnapshot = undefined;
     const payload: MatchStartPayload = {
+      mapCode: this.mapCode,
       settings: this.settings,
       startedAtEpochMs: this.matchStartedAtEpochMs,
       assignments: participants.map((member) => ({
@@ -510,7 +590,6 @@ export function createGameServer(): Server {
   gameServer.define("pvp", PvpRelayRoom, {
     maxClients: MAX_ROOM_CAPACITY,
     allowReconnectionTime: 30,
-    mapPlayerCount: 2,
     metadata: {
       protocol: "host-authoritative-relay",
       version: "0.2.0"
@@ -538,6 +617,18 @@ function playerIdForSeat(seat: number): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/** Keep the cached clock in server time; each delivery receives a fresh stamp. */
+function rebaseClockEpochs(clock: Record<string, unknown>, offset: number): Record<string, unknown> {
+  const rebased = { ...clock };
+  for (const field of ["activeSinceEpochMs", "actionDeadlineEpochMs", "reinforcementDeadlineEpochMs"] as const) {
+    const timestamp = clock[field];
+    if (typeof timestamp === "number" && Number.isFinite(timestamp)) {
+      rebased[field] = timestamp + offset;
+    }
+  }
+  return rebased;
 }
 
 function clampInteger(value: unknown, minimum: number, maximum: number, fallback: number): number {

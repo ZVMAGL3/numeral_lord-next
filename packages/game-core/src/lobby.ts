@@ -30,6 +30,9 @@ export interface LobbyMember {
 
 export interface LobbyRoomState {
   readonly phase: LobbyPhase;
+  /** Selected, validated map code shared by every lobby member. */
+  readonly mapCode: string;
+  readonly mapName: string;
   readonly mapPlayerCount: number;
   readonly settings: LobbySettings;
   readonly members: readonly LobbyMember[];
@@ -48,6 +51,8 @@ export interface MatchPlayerAssignment {
 }
 
 export interface MatchStartPayload {
+  /** Start all clients from the same map definition. */
+  readonly mapCode: string;
   readonly settings: LobbySettings;
   readonly assignments: readonly MatchPlayerAssignment[];
   /** Server timestamp used to start every client's visible clocks together. */

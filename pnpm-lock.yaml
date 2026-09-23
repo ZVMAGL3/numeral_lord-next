@@ -175,6 +175,9 @@ importers:
       '@numeral-lord/content-schema':
         specifier: workspace:*
         version: link:../../packages/content-schema
+      '@numeral-lord/core-content':
+        specifier: workspace:*
+        version: link:../../packages/core-content
       '@numeral-lord/game-core':
         specifier: workspace:*
         version: link:../../packages/game-core

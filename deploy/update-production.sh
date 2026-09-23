@@ -13,6 +13,11 @@ RUNTIME=/opt/numeral-lord-runtime/current/bin
   exit 1
 }
 [[ "$(realpath -m "$APP_DIR")" == /opt/numeral-lord-next ]] || exit 1
+ACTIVE_CONNECTIONS="$(ss -Hnt state established '( sport = :2567 )' | wc -l)"
+if [[ "$ACTIVE_CONNECTIONS" -gt 0 ]]; then
+  echo "Production has $ACTIVE_CONNECTIONS active TCP connection(s); refusing to interrupt live rooms." >&2
+  exit 1
+fi
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP="/opt/numeral-lord-next-backup-$STAMP"

@@ -1,6 +1,7 @@
 import {
   DEFAULT_LOBBY_SETTINGS,
   MAX_ROOM_CAPACITY,
+  PLAYER_COLOR_OPTIONS,
   applyIntent,
   getLegalIntents
 } from "@numeral-lord/game-core/node";
@@ -47,6 +48,7 @@ interface MutableLobbyMember {
   connected: boolean;
   seat: number | null;
   participating: boolean;
+  playerColorId: string | null;
   ready: boolean;
   installedModIds: readonly string[];
   joinOrder: number;
@@ -175,6 +177,24 @@ export class PvpRelayRoom extends RelayRoom {
       if (!member) return;
       this.chooseSeat(client, member, payload.seat);
     });
+    this.onMessage("lobby-color", (client, payload: Record<string, unknown> = {}) => {
+      if (this.phase !== "lobby") return;
+      const member = this.members.get(client.sessionId);
+      if (!member?.participating) return;
+      const colorId = typeof payload.playerColorId === "string" ? payload.playerColorId : "";
+      if (!PLAYER_COLOR_OPTIONS.some((color) => color.id === colorId)) {
+        this.sendError(client, "这个棋子花色不存在。");
+        return;
+      }
+      if ([...this.members.values()].some((candidate) => candidate !== member
+        && candidate.participating && candidate.playerColorId === colorId)) {
+        this.sendError(client, "这个棋子花色已经被其他参战玩家选了。");
+        return;
+      }
+      member.playerColorId = colorId;
+      member.ready = false;
+      this.broadcastRoomState();
+    });
     this.onMessage("lobby-participation", (client, payload: Record<string, unknown> = {}) => {
       if (this.phase !== "lobby") return;
       const member = this.members.get(client.sessionId);
@@ -280,6 +300,7 @@ export class PvpRelayRoom extends RelayRoom {
         isHost: member.sessionId === this.hostSessionId,
         seat: member.seat,
         participating: member.participating,
+        playerColorId: member.playerColorId,
         ready: member.ready,
         installedModIds: member.installedModIds,
         missingModIds: this.missingModIds(member)
@@ -328,6 +349,7 @@ export class PvpRelayRoom extends RelayRoom {
       isHost: member.sessionId === this.hostSessionId,
       seat: member.seat,
       participating: member.participating,
+      playerColorId: member.playerColorId,
       ready: member.ready,
       installedModIds: member.installedModIds,
       missingModIds: this.missingModIds(member)
@@ -371,7 +393,9 @@ export class PvpRelayRoom extends RelayRoom {
       ? this.firstOpenSeat()
       : null;
     const canParticipate = this.phase === "lobby"
-      && (this.settings.randomizePositions ? this.participantCount() < this.mapPlayerCount : defaultSeat !== null);
+      && (this.settings.randomizePositions
+        ? this.participantCount() < Math.min(this.mapPlayerCount, PLAYER_COLOR_OPTIONS.length)
+        : defaultSeat !== null && this.firstAvailablePlayerColor() !== null);
     const member: MutableLobbyMember = {
       sessionId: client.sessionId,
       accountId: requestedAccountId || `guest-${client.sessionId.slice(0, 6)}`,
@@ -379,6 +403,7 @@ export class PvpRelayRoom extends RelayRoom {
       connected: true,
       seat: canParticipate ? defaultSeat : null,
       participating: canParticipate,
+      playerColorId: canParticipate ? this.firstAvailablePlayerColor() : null,
       ready: false,
       installedModIds,
       joinOrder: this.nextJoinOrder++
@@ -498,12 +523,14 @@ export class PvpRelayRoom extends RelayRoom {
       for (const member of participants.slice(this.mapPlayerCount)) {
         member.participating = false;
         member.seat = null;
+        member.playerColorId = null;
       }
     } else {
       for (const member of this.members.values()) {
         if (member.seat !== null && member.seat > this.mapPlayerCount) {
           member.seat = null;
           member.participating = false;
+          member.playerColorId = null;
         }
       }
     }
@@ -543,6 +570,7 @@ export class PvpRelayRoom extends RelayRoom {
     const selected = new Set(participants.map((member) => member.sessionId));
     for (const member of this.members.values()) {
       member.participating = selected.has(member.sessionId);
+      if (!member.participating) member.playerColorId = null;
       member.seat = this.settings.randomizePositions || !member.participating
         ? null
         : participants.findIndex((candidate) => candidate.sessionId === member.sessionId) + 1;
@@ -557,6 +585,7 @@ export class PvpRelayRoom extends RelayRoom {
     if (requestedSeat === null) {
       member.seat = null;
       member.participating = false;
+      member.playerColorId = null;
       member.ready = false;
       this.broadcastRoomState();
       return;
@@ -571,8 +600,14 @@ export class PvpRelayRoom extends RelayRoom {
       this.sendError(client, `${seat} 号位已经有人。`);
       return;
     }
+    const playerColorId = member.playerColorId ?? this.firstAvailablePlayerColor();
+    if (!playerColorId) {
+      this.sendError(client, "旧版棋子花色已用完，当前最多支持 9 位参战玩家。");
+      return;
+    }
     member.seat = seat;
     member.participating = true;
+    member.playerColorId = playerColorId;
     member.ready = false;
     this.broadcastRoomState();
   }
@@ -586,7 +621,15 @@ export class PvpRelayRoom extends RelayRoom {
       this.sendError(client, "参战名额已满，可以先进入观战位。 ");
       return;
     }
+    const playerColorId = participating && !member.participating
+      ? this.firstAvailablePlayerColor()
+      : member.playerColorId;
+    if (participating && !playerColorId) {
+      this.sendError(client, "旧版棋子花色已用完，当前最多支持 9 位参战玩家。");
+      return;
+    }
     member.participating = participating;
+    member.playerColorId = participating ? playerColorId! : null;
     member.seat = null;
     member.ready = false;
     this.broadcastRoomState();
@@ -605,6 +648,7 @@ export class PvpRelayRoom extends RelayRoom {
     if (payload.seat === null) {
       target.seat = null;
       target.participating = false;
+      target.playerColorId = null;
       target.ready = false;
       this.broadcastRoomState();
       return;
@@ -616,13 +660,20 @@ export class PvpRelayRoom extends RelayRoom {
     }
     const previousSeat = target.seat;
     const occupant = [...this.members.values()].find((candidate) => candidate !== target && candidate.seat === seat);
+    const targetColor = target.playerColorId ?? occupant?.playerColorId ?? this.firstAvailablePlayerColor(target);
+    if (!targetColor) {
+      this.sendError(client, "旧版棋子花色已用完，当前最多支持 9 位参战玩家。");
+      return;
+    }
     if (occupant) {
       occupant.seat = previousSeat;
       occupant.participating = previousSeat !== null;
+      if (!occupant.participating) occupant.playerColorId = null;
       occupant.ready = false;
     }
     target.seat = seat;
     target.participating = true;
+    target.playerColorId = targetColor;
     target.ready = false;
     this.broadcastRoomState();
   }
@@ -632,7 +683,8 @@ export class PvpRelayRoom extends RelayRoom {
     let participants = [...this.members.values()]
       .filter((member) => member.participating);
     if (participants.length === 0 || participants.length > this.mapPlayerCount
-      || participants.some((member) => !member.connected || !member.ready || this.missingModIds(member).length > 0)) return;
+      || new Set(participants.map((member) => member.playerColorId)).size !== participants.length
+      || participants.some((member) => !member.connected || !member.ready || !member.playerColorId || this.missingModIds(member).length > 0)) return;
 
     if (this.settings.randomizePositions) {
       participants = shuffle(participants);
@@ -657,7 +709,8 @@ export class PvpRelayRoom extends RelayRoom {
         sessionId: member.sessionId,
         seat: member.seat!,
         playerId: playerIdForSeat(member.seat!),
-        displayName: member.displayName
+        displayName: member.displayName,
+        ...(member.playerColorId ? { playerColorId: member.playerColorId } : {})
       }))
     };
     this.matchStartPayload = payload;
@@ -683,6 +736,7 @@ export class PvpRelayRoom extends RelayRoom {
   }
 
   private firstOpenSeat(): number | null {
+    if (this.participantCount() >= PLAYER_COLOR_OPTIONS.length) return null;
     const occupied = new Set([...this.members.values()].map((member) => member.seat));
     for (let seat = 1; seat <= this.mapPlayerCount; seat += 1) {
       if (!occupied.has(seat)) return seat;
@@ -692,6 +746,14 @@ export class PvpRelayRoom extends RelayRoom {
 
   private participantCount(): number {
     return [...this.members.values()].filter((member) => member.participating).length;
+  }
+
+  private firstAvailablePlayerColor(except?: MutableLobbyMember): string | null {
+    const used = new Set([...this.members.values()]
+      .filter((member) => member !== except && member.participating)
+      .map((member) => member.playerColorId)
+      .filter((colorId): colorId is string => colorId !== null));
+    return PLAYER_COLOR_OPTIONS.find((color) => !used.has(color.id))?.id ?? null;
   }
 
   private resetReady(): void {

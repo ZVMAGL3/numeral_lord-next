@@ -7,6 +7,7 @@ import {
   getActionableUnitIds,
   getLegalActionDestinationIds,
   getPoweredUnitIds,
+  getPlayerColor,
   appendActionNotation,
   appendPhaseEndNotation,
   appendReinforcementNotation,
@@ -786,6 +787,10 @@ function startLobbyMatch(payload: MatchStartPayload): void {
       candidate.playerId,
       candidate.displayName ?? lobbyState.value.members.find((member) => member.sessionId === candidate.sessionId)?.displayName ?? `玩家 ${candidate.seat}`
     ])),
+    playerColors: Object.fromEntries(payload.assignments.flatMap((candidate) => {
+      const color = getPlayerColor(candidate.playerColorId);
+      return color ? [[candidate.playerId, color]] : [];
+    })),
     friendlyFire: payload.settings.friendlyFire,
     roomModSettings: payload.roomModSettings ?? {}
   }); } catch (error) {
@@ -807,6 +812,10 @@ function startLobbyMatch(payload: MatchStartPayload): void {
 
 function sendLobbyReady(ready: boolean): void {
   relayRoom?.send("lobby-ready", { ready });
+}
+
+function sendLobbyColor(playerColorId: string): void {
+  relayRoom?.send("lobby-color", { playerColorId });
 }
 
 function sendLobbySeat(seat: number | null): void {
@@ -1332,6 +1341,7 @@ onBeforeUnmount(() => {
       @ready="sendLobbyReady"
       @seat="sendLobbySeat"
       @participation="sendLobbyParticipation"
+      @color="sendLobbyColor"
       @settings="sendLobbySettings"
       @mod-settings="sendLobbyModSettings"
       @assign="sendLobbyAssignment"

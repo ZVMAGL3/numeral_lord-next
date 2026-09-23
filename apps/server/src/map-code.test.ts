@@ -8,7 +8,7 @@ import {
   parseMapCode,
   serializeMapCode
 } from "@numeral-lord/core-content";
-import type { CellId } from "@numeral-lord/game-core";
+import type { CellId, PlayerId } from "@numeral-lord/game-core";
 import { oilFieldMod, oilFieldTerrainCatalog } from "@numeral-lord/oil-field-mod";
 
 const installedMapCatalogs = {
@@ -17,6 +17,15 @@ const installedMapCatalogs = {
 };
 
 describe("shared map code", () => {
+  it("uses lobby-selected legacy colors when creating a headless match", () => {
+    const state = createMatchFromMapCode(DEFAULT_MAP_CODE, {
+      ...installedMapCatalogs,
+      playerColors: { "player-1": "#CC3563", "player-2": "#53AEBB" }
+    });
+    expect(state.players["player-1" as PlayerId]?.color).toBe("#CC3563");
+    expect(state.players["player-2" as PlayerId]?.color).toBe("#53AEBB");
+  });
+
   it("round trips 昏晓 and keeps every legacy cell and soldier", () => {
     const map = parseMapCode(DEFAULT_MAP_CODE, installedMapCatalogs);
     expect(map.name).toBe("昏晓");

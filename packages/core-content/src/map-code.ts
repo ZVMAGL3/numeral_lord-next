@@ -1,4 +1,4 @@
-import { getHexNeighbours, hasTerrainCapability, startMatch, toCellId } from "@numeral-lord/game-core";
+import { getHexNeighbours, getPlayerColor, hasTerrainCapability, startMatch, toCellId } from "@numeral-lord/game-core";
 import type {
   CellTriggerLink,
   CellId,
@@ -72,6 +72,8 @@ export interface MapMatchOptions extends MapCatalogs {
   readonly activePlayerIds?: readonly PlayerId[];
   /** Online room member names, keyed by the map's stable player ID. */
   readonly playerDisplayNames?: Readonly<Record<string, string>>;
+  /** Selected legacy palette colors keyed by stable map player ID. */
+  readonly playerColors?: Readonly<Record<string, string>>;
   readonly friendlyFire?: boolean;
   /** Host overrides, validated against the installed Mod's setting schema. */
   readonly roomModSettings?: ModSettings;
@@ -92,10 +94,7 @@ const DEFAULT_CONDITIONS = ["core/lose-all-survival-anchors", "core/last-team-st
 const MAX_MAP_CODE_LENGTH = 64 * 1024;
 const MAX_CELLS = 4096;
 const MAX_PLAYERS = 64;
-const PLAYER_COLORS = [
-  "#fb7185", "#60a5fa", "#fbbf24", "#a78bfa",
-  "#34d399", "#f472b6", "#38bdf8", "#fb923c"
-];
+const DEFAULT_PLAYER_COLOR_IDS = ["legacy-1", "legacy-2", "legacy-3", "legacy-4", "legacy-5", "legacy-6", "legacy-7", "legacy-8", "legacy-9"] as const;
 
 /** The old 1001 map is the first built-in map, 昏晓. */
 export const DEFAULT_MAP_DEFINITION: MapDefinition = {
@@ -218,7 +217,8 @@ export function createMatchFromMapDefinition(definition: MapDefinition, options:
       teamId,
       seat,
       displayName: options.playerDisplayNames?.[playerId]?.trim().slice(0, 24) || `玩家 ${seat}`,
-      color: PLAYER_COLORS[(seat - 1) % PLAYER_COLORS.length]!,
+      color: options.playerColors?.[playerId]
+        ?? getPlayerColor(DEFAULT_PLAYER_COLOR_IDS[(seat - 1) % DEFAULT_PLAYER_COLOR_IDS.length])!,
       reinforcementPoints: 0
     };
     const existing = teams[teamId];

@@ -26,6 +26,8 @@ export interface LobbyMember {
   readonly isHost: boolean;
   /** A numbered map seat. Random-position lobbies leave this null until start. */
   readonly seat: number | null;
+  /** Legacy soldier color selected in the lobby; spectators have no color. */
+  readonly playerColorId: string | null;
   /** False means spectator, regardless of whether a seat has been assigned. */
   readonly participating: boolean;
   readonly ready: boolean;
@@ -61,6 +63,8 @@ export interface MatchPlayerAssignment {
   readonly playerId: string;
   /** Name shown on the game board; optional for older relay messages. */
   readonly displayName?: string;
+  /** Legacy soldier color selected for this match. */
+  readonly playerColorId?: string;
 }
 
 export interface MatchStartPayload {

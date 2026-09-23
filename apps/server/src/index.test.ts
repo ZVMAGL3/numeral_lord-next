@@ -180,7 +180,7 @@ describe("PvpRelayRoom lobby contract", () => {
 
     const start = lastBroadcast<MatchStartPayload>(room, "match-start");
     expect(start.assignments).toEqual([
-      { sessionId: "host", seat: 3, playerId: "player-3", displayName: "房主名字" }
+      { sessionId: "host", seat: 3, playerId: "player-3", displayName: "房主名字", playerColorId: "legacy-1" }
     ]);
     expect(start.mapCode).toBe(mapCodeForSeats(4));
     expect(start.assignments).toHaveLength(1);
@@ -226,6 +226,31 @@ describe("PvpRelayRoom lobby contract", () => {
       participating: false,
       seat: null
     });
+  });
+
+  it("lets each participant select a unique legacy color and releases it when they spectate", () => {
+    const room = createRoom(3);
+    const host = join(room, "host");
+    const second = join(room, "second");
+    const third = join(room, "third");
+
+    room.receive("lobby-color", host, { playerColorId: "legacy-2" });
+    expect(lastSent<{ message: string }>(host, "lobby-error").message).toContain("已经被其他参战玩家选了");
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").members[0]?.playerColorId).toBe("legacy-1");
+
+    room.receive("lobby-color", host, { playerColorId: "legacy-9" });
+    room.receive("lobby-seat", second, { seat: null });
+    room.receive("lobby-color", third, { playerColorId: "legacy-2" });
+    const members = lastBroadcast<LobbyRoomState>(room, "room-state").members;
+    const colors = members.filter((member) => member.participating).map((member) => member.playerColorId);
+    expect(colors).toEqual(["legacy-9", "legacy-2"]);
+    expect(new Set(colors).size).toBe(colors.length);
+    expect(members.find((member) => member.sessionId === "second")?.playerColorId).toBeNull();
+
+    room.receive("lobby-ready", host, { ready: true });
+    room.receive("lobby-ready", third, { ready: true });
+    expect(lastBroadcast<MatchStartPayload>(room, "match-start").assignments.map((assignment) => assignment.playerColorId))
+      .toEqual(["legacy-9", "legacy-2"]);
   });
 
   it("admits a late room-code join as a spectator and syncs the active match", () => {

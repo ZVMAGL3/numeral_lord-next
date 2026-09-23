@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import type { GameState, LobbyMember, LobbyModSettings, LobbyRoomState, UnitId } from "@numeral-lord/game-core";
+import { getPlayerColor, getPlayerColorSprite, PLAYER_COLOR_OPTIONS } from "@numeral-lord/game-core";
 import { parseMapCode } from "@numeral-lord/core-content";
 import { missingTerrainMods, type ConfiguredMap } from "../map-library";
 import { installedMapCatalogs, installedTerrainMods } from "../installed-content";
@@ -37,6 +38,7 @@ const emit = defineEmits<{
   ready: [ready: boolean];
   seat: [seat: number | null];
   participation: [participating: boolean];
+  color: [playerColorId: string];
   settings: [settings: Record<string, boolean | number>];
   assign: [payload: { sessionId: string; seat?: number | null; participating?: boolean }];
   map: [mapCode: string];
@@ -110,6 +112,20 @@ function seatLabel(member: LobbyMember): string {
 
 function seatIsOccupied(seat: number, exceptSessionId: string): boolean {
   return props.room.members.some((member) => member.sessionId !== exceptSessionId && member.seat === seat);
+}
+
+function colorIsOccupied(playerColorId: string, exceptSessionId: string): boolean {
+  return props.room.members.some((member) => member.sessionId !== exceptSessionId
+    && member.participating && member.playerColorId === playerColorId);
+}
+
+function colorName(playerColorId: string | null): string {
+  return PLAYER_COLOR_OPTIONS.find((color) => color.id === playerColorId)?.name ?? "未选择";
+}
+
+function availableColorsFor(member: LobbyMember) {
+  return PLAYER_COLOR_OPTIONS.filter((color) => color.id === member.playerColorId
+    || !colorIsOccupied(color.id, member.sessionId));
 }
 
 function onMemberRoleChange(member: LobbyMember, event: Event): void {
@@ -260,6 +276,23 @@ function onModSettingChange(modId: string, setting: ModSetting, event: Event): v
             </select>
             <span v-else class="seat-readonly">{{ seatLabel(member) }}</span>
 
+            <select
+              v-if="member.participating && member.sessionId === selfSessionId"
+              class="color-select"
+              :value="member.playerColorId ?? ''"
+              :style="{ '--swatch-color': getPlayerColor(member.playerColorId) }"
+              aria-label="选择自己的棋子花色"
+              @change="emit('color', ($event.target as HTMLSelectElement).value)"
+            >
+              <option v-for="color in availableColorsFor(member)" :key="color.id" :value="color.id">{{ color.name }}</option>
+            </select>
+            <span
+              v-else-if="member.participating && member.playerColorId"
+              class="color-readonly"
+              :style="{ '--swatch-color': getPlayerColor(member.playerColorId) }"
+            ><img :src="getPlayerColorSprite(member.playerColorId)" alt="" />{{ colorName(member.playerColorId) }}</span>
+            <span v-else class="color-readonly spectator-color">—</span>
+
             <span class="ready-state" :class="{ ready: member.ready }">
               {{ !member.connected ? "重连中" : member.participating ? (member.missingModIds.length ? "缺少 Mod" : member.ready ? "已准备" : "未准备") : "观战" }}
             </span>
@@ -378,10 +411,11 @@ function onModSettingChange(modId: string, setting: ModSetting, event: Event): v
 .settings-stack { display: grid; align-content: start; gap: 14px; min-width: 0; }
 .lobby-card { padding: 18px; border: 1px solid rgba(130, 167, 204, .25); border-radius: 18px; background: rgba(8, 21, 34, .67); }
 .section-title { justify-content: space-between; gap: 12px; margin-bottom: 14px; }.section-title h3 { margin: 0; color: #eaf4ff; font-size: 16px; }.section-title span { color: #7892ad; font-size: 11px; }
-.member-list { display: grid; gap: 8px; }.member-row { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(126px, .7fr) 70px; gap: 10px; padding: 10px 12px; border: 1px solid rgba(108, 145, 182, .22); border-radius: 12px; background: rgba(22, 43, 63, .62); }.member-row.disconnected { opacity: .55; }
+.member-list { display: grid; gap: 8px; }.member-row { display: grid; grid-template-columns: minmax(145px, 1fr) minmax(126px, .7fr) minmax(102px, .58fr) 70px; gap: 10px; padding: 10px 12px; border: 1px solid rgba(108, 145, 182, .22); border-radius: 12px; background: rgba(22, 43, 63, .62); }.member-row.disconnected { opacity: .55; }
 .member-name { gap: 9px; min-width: 0; }.member-name strong, .member-name small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.member-name strong { color: #f4f8fc; }.member-name small { color: #8fa7bf; font-size: 11px; }.presence { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: #4ade80; box-shadow: 0 0 10px rgba(74, 222, 128, .6); }.disconnected .presence { background: #64748b; box-shadow: none; }
 .member-name .missing-mod-note { margin-top: 3px; color: #fbbf94; }
 .seat-select, .number-grid input { width: 100%; border: 1px solid rgba(129, 168, 207, .35); border-radius: 9px; background: #0d2032; color: #eaf4ff; outline: none; }.seat-select { padding: 7px 9px; }.seat-readonly { color: #bfd0e2; font-size: 12px; }.ready-state { color: #8fa5ba; font-size: 11px; text-align: right; }.ready-state.ready { color: #86efac; font-weight: 800; }
+.color-select { width: 100%; min-width: 0; padding: 7px 8px; border: 1px solid rgba(129,168,207,.35); border-left: 4px solid var(--swatch-color, #42566a); border-radius: 9px; outline: none; background: #0d2032; color: #eef5fb; }.color-readonly { display: flex; align-items: center; gap: 8px; min-width: 0; color: #c3d2df; font-size: 11px; }.color-readonly img { width: 24px; height: 22px; flex: 0 0 auto; object-fit: contain; }.spectator-color { color: #6f8499; }
 .ready-button { width: 100%; margin-top: 14px; padding: 12px; border: 0; border-radius: 11px; background: linear-gradient(90deg, #5eead4, #60a5fa); color: #071626; font-weight: 900; cursor: pointer; }.ready-button.active { background: #223b52; color: #c5d6e7; }.spectator-note, .settings-hint { margin: 13px 0 0; color: #7f98b1; font-size: 11px; line-height: 1.55; }
 .ready-button:disabled { cursor: not-allowed; background: #344a5e; color: #c3d0dd; }
 .dependency-warning { margin: 10px 0 0; padding: 9px 11px; border: 1px solid rgba(251, 191, 146, .4); border-radius: 9px; color: #ffd8ba; background: rgba(109, 60, 39, .24); font-size: 11px; line-height: 1.5; }
@@ -418,6 +452,6 @@ function onModSettingChange(modId: string, setting: ModSetting, event: Event): v
 .mod-setting-controls input:disabled, .mod-setting-controls select:disabled { opacity: .72; }
 .reset-mod-setting { padding: 3px 0; border: 0; background: transparent; color: #8de4ed; font-size: 10px; cursor: pointer; }
 .mod-setting-source { grid-column: 1 / -1; color: #7995aa; font-size: 10px; }
-@media (max-width: 800px) { .lobby-shell { padding: 15px; }.lobby-header { display: grid; }.lobby-header-side { width: 100%; grid-template-columns: minmax(0, 1fr) 130px; align-items: stretch; }.map-preview-board { height: 170px; }.ready-summary { display: grid; align-content: center; }.lobby-grid { grid-template-columns: 1fr; }.member-row { grid-template-columns: minmax(120px, 1fr) 120px 58px; }.number-grid { grid-template-columns: 1fr; } }
-@media (max-width: 520px) { .lobby-header-side { grid-template-columns: 1fr; }.ready-summary { min-width: 0; }.member-row { grid-template-columns: 1fr 118px; }.ready-state { grid-column: 1 / -1; text-align: left; padding-left: 17px; }.mod-setting-row { grid-template-columns: minmax(0, 1fr) 105px; } }
+@media (max-width: 800px) { .lobby-shell { padding: 15px; }.lobby-header { display: grid; }.lobby-header-side { width: 100%; grid-template-columns: minmax(0, 1fr) 130px; align-items: stretch; }.map-preview-board { height: 170px; }.ready-summary { display: grid; align-content: center; }.lobby-grid { grid-template-columns: 1fr; }.member-row { grid-template-columns: minmax(115px, 1fr) minmax(105px, .7fr) minmax(96px, .6fr) 58px; }.number-grid { grid-template-columns: 1fr; } }
+@media (max-width: 520px) { .lobby-header-side { grid-template-columns: 1fr; }.ready-summary { min-width: 0; }.member-row { grid-template-columns: minmax(0, 1fr) 118px; }.color-readonly, .color-select { grid-column: 1; }.ready-state { grid-column: 2; grid-row: 2; text-align: right; }.mod-setting-row { grid-template-columns: minmax(0, 1fr) 105px; } }
 </style>

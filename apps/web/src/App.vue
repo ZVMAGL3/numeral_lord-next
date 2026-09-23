@@ -96,7 +96,9 @@ function resolveRelayEndpoint(): string {
   // secret or rebuilding the client for each server address: `?relay=ws...`.
   const configured = new URLSearchParams(window.location.search).get("relay");
   if (configured) return configured;
-  return `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.hostname}:2567`;
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  if (window.location.port === "5173") return `${protocol}://${window.location.hostname}:2567`;
+  return `${protocol}://${window.location.host}/numeral-lord`;
 }
 
 function broadcastSnapshot(): void {

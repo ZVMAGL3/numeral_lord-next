@@ -21,6 +21,18 @@ export interface MapCell {
   readonly unitId?: UnitId;
 }
 
+/** A static relation attached to an enter/leave trigger on one cell. */
+export interface CellTriggerLink {
+  readonly relationId: string;
+  /** The related cell for a directed link; omitted for cell-local triggers. */
+  readonly relatedCellId?: CellId;
+}
+
+export interface CellTriggerSet {
+  readonly enter: readonly CellTriggerLink[];
+  readonly leave: readonly CellTriggerLink[];
+}
+
 export interface UnitState {
   readonly id: UnitId;
   readonly definitionId: string;
@@ -57,6 +69,10 @@ export interface MatchSettings {
   readonly friendlyFire: boolean;
   /** Ordered ids of map-selected match-condition modules. Defaults to last-team-standing. */
   readonly matchConditionIds?: readonly string[];
+  /** Resolved map defaults plus room overrides, kept with a replay/snapshot. */
+  readonly modSettings?: Readonly<Record<string, Readonly<Record<string, number | boolean | string>>>>;
+  /** Generic capability values resolved from Mod setting schemas, by terrain and capability ID. */
+  readonly terrainCapabilityOverrides?: Readonly<Record<string, Readonly<Record<string, Readonly<Record<string, unknown>>>>>>;
 }
 
 /** Persisted settlement data shared by the browser, server and headless AI. */
@@ -78,6 +94,8 @@ export interface GameState {
   /** Present only after a victory-condition module finishes the match. */
   readonly result?: MatchResult;
   readonly cells: Readonly<Record<CellId, MapCell>>;
+  /** Static trigger/link metadata compiled at map load, indexed by trigger cell. */
+  readonly cellTriggers?: Readonly<Record<CellId, CellTriggerSet>>;
   readonly units: Readonly<Record<UnitId, UnitState>>;
   readonly players: Readonly<Record<PlayerId, PlayerState>>;
   readonly teams: Readonly<Record<TeamId, TeamState>>;

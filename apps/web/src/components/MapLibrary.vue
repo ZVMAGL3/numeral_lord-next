@@ -2,11 +2,10 @@
 import { computed, ref, watch } from "vue";
 import { getPoweredUnitIds, type GameState } from "@numeral-lord/game-core";
 import {
-  coreTerrainCatalog,
-  createMatchFromMapCode,
-  oilFieldTerrainCatalog
+  createMatchFromMapCode
 } from "@numeral-lord/core-content";
-import type { ConfiguredMap } from "../map-library";
+import { missingTerrainMods, type ConfiguredMap } from "../map-library";
+import { installedMapCatalogs, installedTerrainCatalog } from "../installed-content";
 import HexBoard from "./HexBoard.vue";
 
 const props = defineProps<{
@@ -29,6 +28,7 @@ const confirmRemoveId = ref<string | null>(null);
 const copyStatus = ref("");
 const codeField = ref<HTMLTextAreaElement | null>(null);
 const selected = computed(() => props.maps.find((map) => map.definition.id === props.selectedId) ?? props.maps[0]);
+const selectedMissingMods = computed(() => selected.value ? missingTerrainMods(selected.value) : []);
 watch(() => props.selectedId, () => {
   showCode.value = false;
   copyStatus.value = "";
@@ -36,10 +36,10 @@ watch(() => props.selectedId, () => {
 });
 const previewState = computed<GameState | null>(() => {
   if (!selected.value) return null;
-  try { return createMatchFromMapCode(selected.value.code); } catch { return null; }
+  try { return createMatchFromMapCode(selected.value.code, installedMapCatalogs); } catch { return null; }
 });
 const previewPoweredUnitIds = computed(() => previewState.value
-  ? [...getPoweredUnitIds(previewState.value, { ...coreTerrainCatalog, ...oilFieldTerrainCatalog })]
+  ? [...getPoweredUnitIds(previewState.value, installedTerrainCatalog)]
   : []);
 
 function selectMap(id: string): void {
@@ -128,6 +128,8 @@ defineExpose({ clearCodeDraft });
         <article v-if="selected" class="map-detail">
           <div class="detail-topline"><span>{{ selected.isDefault ? 'BUILT-IN MAP' : 'CUSTOM MAP' }}</span><span>ID {{ selected.definition.id }}</span></div>
           <div class="detail-title"><div><h3>{{ selected.definition.name }}</h3><p>{{ selected.definition.columns }} × {{ selected.definition.terrain.length / selected.definition.columns }} 格 · {{ selected.definition.players }} 个玩家位</p></div><span class="version-badge">地图码 v{{ selected.definition.version }}</span></div>
+          <p class="dependency-line">需要地块 Mod：{{ selected.definition.requiredTerrainModIds.length ? selected.definition.requiredTerrainModIds.join('、') : '无' }}</p>
+          <p v-if="selectedMissingMods.length" class="missing-mod-note" role="status">尚未安装 {{ selectedMissingMods.join('、') }}；地图码可以保存，安装地块 Mod 后才能预览和对局。</p>
           <div v-if="previewState" class="detail-board">
             <HexBoard
               preview
@@ -180,6 +182,7 @@ defineExpose({ clearCodeDraft });
 .local-note { margin: 17px 2px 0; color: #738fa6; font-size: 10px; line-height: 1.7; }
 .map-detail-column { display: grid; gap: 15px; min-width: 0; }.detail-topline { color: #78b9c7; font-size: 9px; font-weight: 900; letter-spacing: .16em; }.detail-title { align-items: end; margin: 11px 0 14px; }.detail-title h3 { margin: 0; color: #f3f9ff; font-size: 27px; }.detail-title p { margin: 5px 0 0; color: #8eabba; font-size: 11px; }.version-badge { padding: 5px 8px; border: 1px solid rgba(133, 190, 201, .25); border-radius: 7px; color: #86d9cf; font-size: 9px; white-space: nowrap; }
 .detail-board { height: clamp(240px, 29vw, 370px); }.preview-fallback { display: grid; place-items: center; height: 240px; color: #8fa3b9; }.detail-actions { justify-content: flex-start; flex-wrap: wrap; margin-top: 13px; }.detail-actions button { width: auto; min-height: 40px; margin: 0; }.copy-button { min-width: 145px; background: linear-gradient(120deg, #81e9ce, #70c9e7); }.copy-button span { margin-left: 7px; }.outline-button { border: 1px solid rgba(141, 184, 205, .3); color: #b9d4e4; background: rgba(27, 54, 73, .55); }.remove-button { margin-left: auto !important; border: 1px solid rgba(251, 153, 158, .22); color: #eaa1aa; background: rgba(100, 39, 52, .2); }.copy-status { margin: 8px 0 0; color: #8de6bd; font-size: 11px; }.code-output,.code-input { width: 100%; resize: vertical; border: 1px solid rgba(136, 177, 204, .31); border-radius: 10px; outline: none; background: #0c1b2b; color: #c9e3ed; font: 11px/1.6 ui-monospace, Consolas, monospace; }.code-output { min-height: 92px; margin-top: 10px; padding: 11px; }
+.dependency-line { margin: 0 0 11px; color: #b4d9e5; font-size: 11px; }.missing-mod-note { margin: 0 0 11px; color: #f0c38a; font-size: 11px; line-height: 1.6; }
 .import-card p { margin: 10px 0 12px; color: #8fa9bc; font-size: 11px; line-height: 1.6; }.code-input { min-height: 112px; padding: 12px; }.code-input:focus { border-color: #76ddcc; box-shadow: 0 0 0 3px rgba(118, 221, 204, .08); }.import-bottom { margin-top: 10px; }.import-bottom span { color: #8faaa9; font-size: 11px; }.import-bottom span.error { color: #f4a3ab; }.import-bottom button { width: auto; min-width: 150px; margin: 0; background: linear-gradient(120deg, #81e9ce, #70c9e7); }
 .confirm-backdrop { position: fixed; z-index: 30; inset: 0; display: grid; place-items: center; padding: 15px; background: rgba(2, 11, 21, .7); }.confirm-dialog { width: min(430px, 100%); padding: 21px; border: 1px solid rgba(145, 184, 204, .4); border-radius: 16px; background: #1a2b3f; box-shadow: 0 26px 70px rgba(0,0,0,.4); }.confirm-dialog h3 { margin: 0; color: #f4f8ff; }.confirm-dialog p { color: #a9bdd0; font-size: 12px; line-height: 1.7; }.confirm-dialog > div { display: flex; gap: 10px; }.confirm-dialog button { margin: 0; }.danger-button { color: #fff; background: #a14d61; }
 @media (max-width: 800px) { .library-grid { grid-template-columns: 1fr; }.map-list { grid-template-columns: repeat(auto-fit, minmax(180px,1fr)); }.local-note { margin-top: 12px; } }

@@ -9,16 +9,28 @@ const occupiable: CapabilityBinding = { id: "core/occupiable" };
 const powerConductor: CapabilityBinding = { id: "core/power-conductor" };
 
 /**
+ * Terrain controls how many times an occupying unit may counterattack during
+ * one opponent action phase. This is separate from the unit's ability to
+ * counterattack at all (`core/counterattack`). The count resets at the next
+ * player's action phase, so attacking a plain/ocean defender with a small
+ * stack can consume its sole counterattack before a second attack.
+ */
+const oneCounterattack: CapabilityBinding = {
+  id: "core/counterattack-terrain-limit",
+  config: { maxPerActionPhase: 1 }
+};
+const unlimitedCounterattacks: CapabilityBinding = {
+  id: "core/counterattack-terrain-limit",
+  config: { maxPerActionPhase: "unlimited" }
+};
+
+/**
  * A source belongs to whichever player occupies this terrain. An empty
  * stronghold is not a source, so it cannot power any units.
  */
 const occupiedPowerSource: CapabilityBinding = {
-  // 该地形是供电网络的起点。
-  id: "core/power-source",
-  config: {
-    // `occupied` 表示必须有单位占据据点才会供电；空据点不供电。
-    activation: "occupied"
-  }
+  // 当前规则契约固定为“占据后供电”；空据点不是供电网络种子。
+  id: "core/power-source"
 };
 
 /**
@@ -35,19 +47,9 @@ const survivalAnchor: CapabilityBinding = { id: "core/survival-anchor" };
  * 这个关系。
  */
 const adjacentHostileExhaustion: CapabilityBinding = {
-  id: "core/adjacent-hostile-exhaustion",
-  config: {
-    // 以据点所在格为中心，检查一圈六边形相邻格。
-    radius: 1,
-    // 据点必须被单位占据才会形成封锁区。
-    activation: "occupied",
-    // 同队为友方；非同队单位才受封锁影响。
-    friendlyRelation: "same-team",
-    // 据点自身不在影响范围中，符合“据点周围但不包括据点本身”。
-    excludeSourceCell: true,
-    // 命中后产生的规则事件；它会写入 turn.exhaustedUnitIds。
-    effect: "exhaust-unit"
-  }
+  // 当前能力契约固定为“被占据时封锁六邻格的非同队单位”；
+  // game-core 暂不读取半径等配置，不在这里写会被忽略的假参数。
+  id: "core/adjacent-hostile-exhaustion"
 };
 
 /** 离开海洋进入陆地后，本次行动的单位本回合不能再次行动。 */
@@ -67,9 +69,9 @@ const oceanDepartureExhaustion: CapabilityBinding = {
  * remain separate ids solely to allow map authors to give them different art.
  */
 export const coreTerrainMod = defineMod({
-  // Mod 的稳定标识；地图会锁定此 id、版本和内容哈希。
+  // Mod 的稳定标识；当前地图码只记录所需 Mod id。版本/哈希锁定仍待实现。
   id: "core-terrain",
-  // 修改既有规则时必须提升版本，避免旧地图规则被悄悄改变。
+  // 内容包版本供将来的版本锁定使用；当前地图码还未记录它。
   version: "0.1.0",
 
   // 向引擎注册本内容包可使用的公共能力。
@@ -89,11 +91,17 @@ export const coreTerrainMod = defineMod({
       defaultConfig: {}
     },
     {
-      // 供电源：在满足 activation 条件时成为供电网络的起点。
+      // 防守方在这块地皮上每个进攻回合可反击的次数。0 表示不能反击，
+      // "unlimited" 表示不限次数；未设置则由兵种的反击次数能力决定。
+      id: "core/counterattack-terrain-limit",
+      target: "terrain",
+      defaultConfig: { maxPerActionPhase: 1 }
+    },
+    {
+      // 供电源：当前规则固定要求该格有己方单位占据。
       id: "core/power-source",
       target: "terrain",
-      // 未单独配置时，默认必须被单位占据才激活。
-      defaultConfig: { activation: "occupied" }
+      defaultConfig: {}
     },
     {
       // 生存据点：用于“失去全部据点，其余单位阵亡”这一胜负规则。
@@ -111,13 +119,8 @@ export const coreTerrainMod = defineMod({
       // 封锁区：据点占据时，敌方单位走入其相邻格后会失去当前回合行动力。
       id: "core/adjacent-hostile-exhaustion",
       target: "terrain",
-      defaultConfig: {
-        radius: 1,
-        activation: "occupied",
-        friendlyRelation: "same-team",
-        excludeSourceCell: true,
-        effect: "exhaust-unit"
-      }
+      // 六邻格、占据条件、队伍关系是当前能力的固定契约。
+      defaultConfig: {}
     },
   ],
 
@@ -141,13 +144,13 @@ export const coreTerrainMod = defineMod({
       id: "core/ocean",
       displayName: "海洋",
       // 可驻兵，但没有 power-conductor，所以其中单位默认保持游兵。
-      capabilities: [occupiable, oceanDepartureExhaustion]
+      capabilities: [occupiable, oceanDepartureExhaustion, oneCounterattack]
     },
     {
       id: "core/plain",
       displayName: "平原",
       // 可驻兵且可传电；平原本身不产点。
-      capabilities: [occupiable, powerConductor]
+      capabilities: [occupiable, powerConductor, oneCounterattack]
     },
     {
       id: "core/stronghold",
@@ -161,7 +164,8 @@ export const coreTerrainMod = defineMod({
         occupiedPowerSource,
         // 这是胜负锚点，不等同于供电能力；地图可单独选择胜负模块。
         survivalAnchor,
-        adjacentHostileExhaustion
+        adjacentHostileExhaustion,
+        unlimitedCounterattacks
       ]
     },
   ],

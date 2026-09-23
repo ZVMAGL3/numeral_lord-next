@@ -1,5 +1,5 @@
 [Unit]
-Description=Numeral Lord PvP relay
+Description=Numeral Lord public PvP staging relay
 After=network-online.target
 Wants=network-online.target
 
@@ -7,14 +7,14 @@ Wants=network-online.target
 Type=simple
 User=numeral-lord
 Group=numeral-lord
-WorkingDirectory=/opt/numeral-lord-next
+WorkingDirectory=/opt/numeral-lord-next-staging/apps/server
 Environment=NODE_ENV=production
-Environment=PORT=2567
+Environment=PORT=2571
 Environment=HOST=127.0.0.1
 Environment=WORKSHOP_ENABLED=1
-Environment=WORKSHOP_PUBLISH_ENABLED=1
+Environment=WORKSHOP_PUBLISH_ENABLED=0
 Environment=PATH=/opt/numeral-lord-runtime/current/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
-ExecStart=/opt/numeral-lord-runtime/current/bin/pnpm --filter @numeral-lord/server start
+ExecStart=/opt/numeral-lord-runtime/current/bin/node --import tsx src/index.ts
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true

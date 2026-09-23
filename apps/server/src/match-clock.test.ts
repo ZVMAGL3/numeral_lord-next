@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_MAP_CODE, createMatchFromMapCode } from "@numeral-lord/core-content";
+import { DEFAULT_MAP_CODE, coreTerrainCatalog, createMatchFromMapCode } from "@numeral-lord/core-content";
+import { oilFieldMod, oilFieldTerrainCatalog } from "@numeral-lord/oil-field-mod";
 import type { GameState, LobbySettings, PlayerId } from "@numeral-lord/game-core/node";
 import {
   advanceMatchClocks,
@@ -16,7 +17,10 @@ const settings: LobbySettings = {
   matchTimeMinutes: 30,
   randomizePositions: false
 };
-const initial = createMatchFromMapCode(DEFAULT_MAP_CODE);
+const initial = createMatchFromMapCode(DEFAULT_MAP_CODE, {
+  terrains: { ...coreTerrainCatalog, ...oilFieldTerrainCatalog },
+  terrainModIds: Object.fromEntries(oilFieldMod.terrains.map((terrain) => [terrain.id, oilFieldMod.id]))
+});
 
 function turn(state: GameState, phase: GameState["turn"]["phase"], playerId = state.turn.currentPlayerId, round = state.turn.round): GameState {
   return { ...state, turn: { ...state.turn, phase, currentPlayerId: playerId as PlayerId, round } };

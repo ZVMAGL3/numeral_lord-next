@@ -5,6 +5,7 @@ import {
   serializeMapCode,
   type MapDefinition
 } from "@numeral-lord/core-content";
+import { installedMapCatalogs, installedTerrainMods } from "./installed-content";
 
 const STORAGE_KEY = "numeral-lord.map-library.v1";
 const MAX_CUSTOM_MAPS = 32;
@@ -14,6 +15,15 @@ export interface ConfiguredMap {
   readonly definition: MapDefinition;
   readonly isDefault: boolean;
 }
+
+const installedModIds = new Set(installedTerrainMods.map((mod) => mod.id));
+
+/** A map code may be saved without its terrain Mods, but cannot be played yet. */
+export function missingTerrainMods(map: ConfiguredMap): string[] {
+  return map.definition.requiredTerrainModIds.filter((id) => !installedModIds.has(id));
+}
+
+const libraryCatalogs = { ...installedMapCatalogs, allowUnknownTerrainMods: true };
 
 const defaultMap: ConfiguredMap = {
   code: DEFAULT_MAP_CODE,
@@ -35,10 +45,10 @@ export function loadMapLibrary(): ConfiguredMap[] {
   for (const value of saved.slice(0, MAX_CUSTOM_MAPS)) {
     if (typeof value !== "string") continue;
     try {
-      const definition = parseMapCode(value);
+      const definition = parseMapCode(value, libraryCatalogs);
       if (seen.has(definition.id)) continue;
       seen.add(definition.id);
-      maps.push({ code: serializeMapCode(definition), definition, isDefault: false });
+      maps.push({ code: serializeMapCode(definition, libraryCatalogs), definition, isDefault: false });
     } catch {
       // A stale or damaged local entry does not prevent opening the game.
     }
@@ -48,12 +58,12 @@ export function loadMapLibrary(): ConfiguredMap[] {
 
 export function addMapToLibrary(current: readonly ConfiguredMap[], rawCode: string): ConfiguredMap[] {
   if (rawCode.length > 128_000) throw new Error("地图码过长，请检查粘贴内容。");
-  const definition = parseMapCode(rawCode);
+  const definition = parseMapCode(rawCode, libraryCatalogs);
   if (current.some((map) => map.definition.id === definition.id)) {
     throw new Error(`地图「${definition.name}」已经在地图库中。`);
   }
   if (current.length - 1 >= MAX_CUSTOM_MAPS) throw new Error("本机最多可保存 32 张自定义地图。");
-  const next = [...current, { code: serializeMapCode(definition), definition, isDefault: false }];
+  const next = [...current, { code: serializeMapCode(definition, libraryCatalogs), definition, isDefault: false }];
   persistCustomMaps(next);
   return next;
 }

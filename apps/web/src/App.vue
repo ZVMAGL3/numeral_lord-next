@@ -14,6 +14,7 @@ import {
   type GameCommand,
   type LobbyRolePayload,
   type LobbyRoomState,
+  type LobbyModSettings,
   type MatchStartPayload,
   type CommandResult,
   type ActionOutcome,
@@ -26,16 +27,19 @@ import {
   DEFAULT_MAP_CODE,
   DEFAULT_MAP_DEFINITION,
   coreMatchConditionCatalog,
-  coreTerrainCatalog,
   coreUnitCatalog,
-  createMatchFromMapCode,
-  oilFieldTerrainCatalog
+  createMatchFromMapCode
 } from "@numeral-lord/core-content";
 import HexBoard from "./components/HexBoard.vue";
 import HomeScreen from "./components/HomeScreen.vue";
 import LobbyPanel from "./components/LobbyPanel.vue";
 import MapLibrary from "./components/MapLibrary.vue";
+import WorkshopPanel from "./components/WorkshopPanel.vue";
+import type { MapSubmission, MapWorkshopEntry, TerrainModEntry, TerrainModSubmission } from "./components/WorkshopPanel.vue";
 import { addMapToLibrary, loadMapLibrary, removeMapFromLibrary } from "./map-library";
+import { installedMapCatalogs, installedTerrainCatalog, installedTerrainMods } from "./installed-content";
+import { WorkshopClient, type WorkshopConnectionStatus } from "./workshop-client";
+import { requestReturnToLobby } from "./room-reset";
 import {
   advanceMatchClocks,
   clockExpiration,
@@ -46,11 +50,50 @@ import {
   type MatchClockSnapshot
 } from "./match-clock";
 
-// The preview explicitly installs the optional oil-field Mod. A different
-// map can keep only `coreTerrainCatalog` and omit this merge entirely.
-const installedTerrainCatalog = { ...coreTerrainCatalog, ...oilFieldTerrainCatalog };
 const PLAYER_NAME_STORAGE_KEY = "numeral-lord.player-name";
 const ACCOUNT_ID_STORAGE_KEY = "numeral-lord.account-id";
+const CONNECTION_LOG_STORAGE_KEY = "numeral-lord.connection-log.v1";
+
+function readConnectionLog(): string[] {
+  try {
+    const saved: unknown = JSON.parse(sessionStorage.getItem(CONNECTION_LOG_STORAGE_KEY) ?? "[]");
+    return Array.isArray(saved) ? saved.filter((line): line is string => typeof line === "string").slice(-120) : [];
+  } catch { return []; }
+}
+
+const connectionLog = ref<string[]>(readConnectionLog());
+const connectionLogDialogOpen = ref(false);
+const connectionLogCopyMessage = ref("");
+const connectionLogText = computed(() => connectionLog.value.join("\n"));
+
+function logConnection(event: string, detail: Record<string, unknown> = {}): void {
+  const line = `${new Date().toISOString()} ${event} ${JSON.stringify(detail)}`;
+  connectionLog.value = [...connectionLog.value, line].slice(-120);
+  try { sessionStorage.setItem(CONNECTION_LOG_STORAGE_KEY, JSON.stringify(connectionLog.value)); } catch { /* Diagnostics remain in memory. */ }
+}
+
+/** Keep the relay host/path useful for debugging without exposing URL credentials or tokens. */
+function relayEndpointForLog(endpoint: string): string {
+  try {
+    const url = new URL(endpoint);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return "invalid relay URL";
+  }
+}
+
+async function copyConnectionLog(): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(connectionLogText.value);
+    connectionLogCopyMessage.value = "连接日志已复制。";
+  } catch {
+    connectionLogCopyMessage.value = "自动复制不可用，请在下方文本框中手动选择复制。";
+  }
+}
 
 /** randomUUID is unavailable on plain HTTP public IPs; getRandomValues works there. */
 function createCommandId(): string {
@@ -78,19 +121,61 @@ function loadOrCreateLocalValue(key: string, create: () => string): string {
   return value;
 }
 
-const game = ref(createMatchFromMapCode(DEFAULT_MAP_CODE));
+function loadOrCreateTabValue(key: string, create: () => string): string {
+  // A temporary PvP identity belongs to one tab. Refresh keeps the seat;
+  // another tab must not silently replace this one's room session.
+  const saved = sessionStorage.getItem(key)?.trim();
+  if (saved) return saved;
+  const value = create();
+  sessionStorage.setItem(key, value);
+  return value;
+}
+
+const game = ref(createMatchFromMapCode(DEFAULT_MAP_CODE, installedMapCatalogs));
 const playerName = ref(loadOrCreateLocalValue(PLAYER_NAME_STORAGE_KEY, randomPlayerName));
 const configuredMaps = ref(loadMapLibrary());
 const selectedMapLibraryId = ref(DEFAULT_MAP_DEFINITION.id);
 const mapActionMessage = ref("");
 const mapActionError = ref(false);
 const mapLibraryRef = ref<InstanceType<typeof MapLibrary> | null>(null);
-const relayAccountKey = loadOrCreateLocalValue(ACCOUNT_ID_STORAGE_KEY, createCommandId);
+const builtInTerrainMod: TerrainModEntry = {
+  id: "local:mod-oil-field",
+  modId: installedTerrainMods[0].id,
+  name: "油田",
+  version: installedTerrainMods[0].version,
+  description: "占据时每回合产生 2 点；离开时留下 1 点游兵。不导电。这个地块由独立的 oil-field-mod 包提供。",
+  terrainIds: installedTerrainMods[0].terrains.map((terrain) => terrain.id),
+  installed: true,
+  authorName: "Numeral Lord",
+  sourceFiles: []
+};
+const builtInMapWork: MapWorkshopEntry = {
+  id: "local:map-1001",
+  mapId: DEFAULT_MAP_DEFINITION.id,
+  name: DEFAULT_MAP_DEFINITION.name,
+  code: DEFAULT_MAP_CODE,
+  description: "内置示例地图，使用油田地块 Mod。地图作品本身只是一段地图码。",
+  players: DEFAULT_MAP_DEFINITION.players,
+  requiredTerrainModIds: DEFAULT_MAP_DEFINITION.requiredTerrainModIds,
+  authorName: "Numeral Lord"
+};
+const remoteTerrainMods = ref<TerrainModEntry[]>([]);
+const remoteMapWorks = ref<MapWorkshopEntry[]>([]);
+const workshopTerrainMods = computed(() => [builtInTerrainMod, ...remoteTerrainMods.value]);
+const workshopMapWorks = computed(() => [builtInMapWork, ...remoteMapWorks.value]);
+const workshopStatus = ref<WorkshopConnectionStatus>("offline");
+/** Anonymous source publishing is intentionally unavailable on public staging. */
+const workshopPublishingEnabled = !window.location.pathname.startsWith("/numeral-lord-play-stage/");
+const workshopActionMessage = ref("");
+const workshopActionError = ref(false);
+const workshopWorking = ref(false);
+let workshopClient: WorkshopClient | undefined;
+const relayAccountKey = loadOrCreateTabValue(ACCOUNT_ID_STORAGE_KEY, createCommandId);
 const invitedRoomId = new URLSearchParams(window.location.search).get("room")?.trim() ?? "";
 // A room link is already an explicit game entry. Only the bare site URL shows
 // the name/start home page; invite links join immediately with the saved (or
 // freshly generated) local name.
-const page = ref<"home" | "maps" | "rooms">(invitedRoomId ? "rooms" : "home");
+const page = ref<"home" | "maps" | "workshop" | "rooms">(invitedRoomId ? "rooms" : "home");
 const relayStatus = ref(invitedRoomId ? "连接中…" : "未连接");
 const relayRoomId = ref("");
 const roomIdInput = ref("");
@@ -101,26 +186,34 @@ const relayIsHost = ref(false);
 let relayRoom: Room | undefined;
 let relayEndpoint = "";
 let connectionAttempt = 0;
+let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 const leaveDialogOpen = ref(false);
 const clockNow = ref(Date.now());
 const matchClock = ref<MatchClockSnapshot | null>(null);
 let clockTimer: ReturnType<typeof setInterval> | undefined;
 let expiredStepSequence: number | null = null;
+let lastSnapshotSyncAt = 0;
 const initialMapPlayerCount = DEFAULT_MAP_DEFINITION.players;
 const lobbyState = ref<LobbyRoomState>({
   phase: "lobby",
   mapPlayerCount: initialMapPlayerCount,
   mapCode: DEFAULT_MAP_CODE,
   mapName: DEFAULT_MAP_DEFINITION.name,
+  requiredTerrainModIds: DEFAULT_MAP_DEFINITION.requiredTerrainModIds,
+  roomModSettings: {},
   settings: { ...DEFAULT_LOBBY_SETTINGS },
   members: []
 });
 const lobbyError = ref("");
 const lobbyPreviewState = computed(() => {
-  try { return createMatchFromMapCode(lobbyState.value.mapCode); }
-  catch { return createMatchFromMapCode(DEFAULT_MAP_CODE); }
+  try { return createMatchFromMapCode(lobbyState.value.mapCode, {
+    ...installedMapCatalogs,
+    roomModSettings: lobbyState.value.roomModSettings
+  }); }
+  catch { return null; }
 });
-const lobbyPreviewPoweredUnitIds = computed(() => [...getPoweredUnitIds(lobbyPreviewState.value, installedTerrainCatalog)]);
+const lobbyPreviewPoweredUnitIds = computed(() => lobbyPreviewState.value
+  ? [...getPoweredUnitIds(lobbyPreviewState.value, installedTerrainCatalog)] : []);
 const selectedUnitId = ref<UnitId | null>(null);
 /** Cell captured at selection time; notation never infers an attacker from a later click. */
 const selectedSourceCellId = ref<CellId | null>(null);
@@ -179,12 +272,16 @@ const isReinforcementPhase = computed(() => game.value.turn.phase === "reinforce
 const phaseLabel = computed(() => isActionPhase.value ? "行动回合" : isReinforcementPhase.value ? "加点回合" : "已结束");
 const showHome = computed(() => page.value === "home" && !relayRoom);
 const showMaps = computed(() => page.value === "maps" && !relayRoom);
+const showWorkshop = computed(() => page.value === "workshop" && !relayRoom);
 const showLobby = computed(() => relayStatus.value === "已连接" && lobbyState.value.phase === "lobby");
 const showRoomEntry = computed(() => page.value === "rooms"
   && (relayStatus.value === "未连接" || relayStatus.value === "连接失败" || relayStatus.value === "连接已断开"));
 const hasLiveSnapshot = ref(false);
 const showGame = computed(() => relayStatus.value === "已连接" && lobbyState.value.phase === "playing" && hasLiveSnapshot.value);
 const showGameLoading = computed(() => relayStatus.value === "已连接" && lobbyState.value.phase === "playing" && !hasLiveSnapshot.value);
+const missingLocalModIds = computed(() => lobbyState.value.requiredTerrainModIds.filter(
+  (id) => !installedTerrainMods.some((mod) => mod.id === id)
+));
 const isSpectator = computed(() => lobbyState.value.phase === "playing" && relayPlayerId.value === null);
 const canActCurrentPlayer = computed(() => !relayRoom || (lobbyState.value.phase === "playing"
   && relayPlayerId.value === currentPlayer.value?.id));
@@ -211,6 +308,9 @@ function resolveRelayEndpoint(): string {
   if (configured) return configured;
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   if (window.location.port === "5173") return `${protocol}://${window.location.hostname}:2567`;
+  if (window.location.pathname.startsWith("/numeral-lord-play-stage/")) {
+    return `${protocol}://${window.location.host}/numeral-lord-stage`;
+  }
   return `${protocol}://${window.location.host}/numeral-lord`;
 }
 
@@ -227,6 +327,7 @@ function broadcastSnapshot(resolution?: {
   readonly errorMessage?: string;
 }): void {
   if (relayRoom && relayIsHost.value && lobbyState.value.phase === "playing") {
+    logConnection("snapshot.sent", { sequence: game.value.sequence, phase: game.value.turn.phase });
     relayRoom.send("host-snapshot", {
       state: game.value,
       clock: matchClock.value,
@@ -281,17 +382,44 @@ function canCurrentClientAct(): boolean {
   return true;
 }
 
-async function connectRelay(mode: "create" | "join", requestedRoomId?: string): Promise<void> {
+function cancelReconnect(): void {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = undefined;
+}
+
+function scheduleReconnect(roomId: string, attempt: number): void {
+  cancelReconnect();
+  if (attempt > 5) {
+    logConnection("reconnect.exhausted", { roomId });
+    relayStatus.value = "连接已断开";
+    notice.value = "自动重连未成功。房间可能已失效；请用房间号手动重试，或返回主页新建房间。";
+    return;
+  }
+  const delay = [800, 1_600, 3_000, 5_000, 8_000][attempt - 1]!;
+  logConnection("reconnect.scheduled", { roomId, attempt, delayMs: delay });
+  relayStatus.value = "连接已断开";
+  notice.value = `连接中断，${Math.ceil(delay / 1_000)} 秒后自动重连（${attempt}/5）…`;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = undefined;
+    if (relayRoom || page.value !== "rooms") return;
+    void connectRelay("join", roomId, attempt);
+  }, delay);
+}
+
+async function connectRelay(mode: "create" | "join", requestedRoomId?: string, reconnectAttempt = 0): Promise<void> {
   if (relayRoom) return;
+  cancelReconnect();
   const attempt = ++connectionAttempt;
   relayEndpoint = resolveRelayEndpoint();
+  logConnection("connect.begin", { mode, roomId: requestedRoomId ?? null, retry: reconnectAttempt, endpoint: relayEndpointForLog(relayEndpoint) });
   relayStatus.value = "连接中…";
   lobbyError.value = "";
   try {
     const client = new Client(relayEndpoint);
     const options = {
       name: playerName.value,
-      accountId: relayAccountKey
+      accountId: relayAccountKey,
+      installedModIds: installedTerrainMods.map((mod) => mod.id)
     };
     const room = mode === "join" && requestedRoomId
       ? await client.joinById(requestedRoomId, options)
@@ -301,6 +429,8 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string): 
       return;
     }
     relayRoom = room;
+    cancelReconnect();
+    logConnection("connect.joined", { roomId: room.roomId, retry: reconnectAttempt });
     relaySessionId.value = room.sessionId;
     relayRoomId.value = room.roomId;
     roomIdInput.value = room.roomId;
@@ -312,29 +442,43 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string): 
       relayPlayerId.value = payload.playerId ?? null;
       relayAccountId.value = payload.accountId ?? null;
       relayIsHost.value = Boolean(payload.isHost);
+      logConnection("room.role", { host: payload.isHost, playerId: payload.playerId ?? null, seat: payload.seat });
     });
     room.onMessage("room-state", (payload: LobbyRoomState) => {
+      const wasPlaying = lobbyState.value.phase === "playing";
       lobbyState.value = payload;
+      logConnection("room.state", { phase: payload.phase, members: payload.members.length, map: payload.mapName });
       lobbyError.value = "";
       if (payload.phase === "lobby") {
         hasLiveSnapshot.value = false;
         pendingRemoteAction = undefined;
+        matchClock.value = null;
+        expiredStepSequence = null;
+        lastSnapshotSyncAt = 0;
+        notation.value = [];
+        clearReinforcementHold();
         clearSelectionSilently();
-        notice.value = "选择参战位置并准备；只要参战玩家全部准备即可开始。";
+        notice.value = wasPlaying
+          ? "房主已结束对局，全员返回准备房间。请重新准备。"
+          : "选择参战位置并准备；只要参战玩家全部准备即可开始。";
       }
     });
     room.onMessage("lobby-error", (payload: { message?: string }) => {
       lobbyError.value = payload.message ?? "房间设置没有生效。";
       notice.value = lobbyError.value;
+      logConnection("room.error", { message: lobbyError.value.slice(0, 250) });
     });
     room.onMessage("match-start", (payload: MatchStartPayload) => {
+      logConnection("match.start", { assignments: payload.assignments.length, roomId: room.roomId });
       startLobbyMatch(payload);
     });
     room.onMessage("snapshot-request", () => {
+      logConnection("snapshot.requested", { host: relayIsHost.value, sequence: game.value.sequence });
       if (relayIsHost.value) broadcastSnapshot();
     });
     room.onMessage("room-host", (payload: { sessionId?: string }) => {
       relayIsHost.value = payload.sessionId === room.sessionId;
+      logConnection("room.host", { selfIsHost: relayIsHost.value, hasSnapshot: hasLiveSnapshot.value });
       if (relayIsHost.value && lobbyState.value.phase === "playing") broadcastSnapshot();
     });
     room.onMessage("player-intent", (payload: { playerId?: string; command?: GameCommand }) => {
@@ -354,10 +498,29 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string): 
       resolvedCommandId?: string;
       continuation?: NonNullable<ActionOutcome["continuation"]>;
       errorMessage?: string;
+      handoff?: boolean;
     }) => {
-      if (relayIsHost.value || !payload.state) return;
+      if (!payload.state || (relayIsHost.value && payload.handoff !== true)) return;
+      if (missingLocalModIds.value.length > 0) {
+        logConnection("snapshot.missing-mods", { missingModIds: missingLocalModIds.value });
+        notice.value = `当前设备缺少地块 Mod：${missingLocalModIds.value.join("、")}。安装后才能进入对局。`;
+        return;
+      }
+      logConnection("snapshot.received", {
+        sequence: payload.state.sequence,
+        handoff: payload.handoff === true,
+        selfIsHost: relayIsHost.value,
+        previousSequence: game.value.sequence
+      });
+      // A promoted/reconnected host must adopt the server's last accepted
+      // snapshot before it starts broadcasting. Ordinary echoes are ignored.
+      if (payload.handoff && hasLiveSnapshot.value && payload.state.sequence < game.value.sequence) {
+        if (relayIsHost.value) broadcastSnapshot();
+        return;
+      }
       game.value = payload.state;
       hasLiveSnapshot.value = true;
+      lastSnapshotSyncAt = 0;
       const receivedAt = Date.now();
       matchClock.value = payload.clock
         ? typeof payload.serverSentAtEpochMs === "number"
@@ -381,9 +544,16 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string): 
         clearSelectionSilently();
         notice.value = "已收到房主的最新棋盘。";
       }
+      if (payload.handoff && relayIsHost.value) broadcastSnapshot();
     });
-    room.onLeave(() => {
+    room.onLeave((code) => {
       if (relayRoom !== room) return;
+      logConnection("socket.closed", {
+        code, roomId: room.roomId, phase: lobbyState.value.phase,
+        selfIsHost: relayIsHost.value, sequence: game.value.sequence,
+        online: navigator.onLine, visibility: document.visibilityState
+      });
+      console.warn("PvP room socket closed", { code, roomId: room.roomId });
       relayStatus.value = "连接已断开";
       relayRoom = undefined;
       relayRoomId.value = "";
@@ -393,14 +563,25 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string): 
       relayIsHost.value = false;
       hasLiveSnapshot.value = false;
       pendingRemoteAction = undefined;
+      scheduleReconnect(room.roomId, 1);
+    });
+    room.onError((code, message) => {
+      logConnection("socket.error", { code, message: String(message).slice(0, 250), roomId: room.roomId });
     });
     // onJoin can emit identity before browser handlers are installed. This
     // explicit handshake makes first load, late spectating and refresh safe.
+    logConnection("snapshot.sync-request", { roomId: room.roomId, initial: true });
     room.send("room-sync", {});
+    lastSnapshotSyncAt = Date.now();
   } catch (error) {
     if (attempt !== connectionAttempt) return;
+    logConnection("connect.failed", {
+      mode, roomId: requestedRoomId ?? null, retry: reconnectAttempt,
+      error: error instanceof Error ? error.message.slice(0, 250) : String(error).slice(0, 250)
+    });
     relayStatus.value = "连接失败";
     notice.value = `PvP 房间连接失败：${error instanceof Error ? error.message : "请检查后端地址"}`;
+    if (reconnectAttempt > 0 && requestedRoomId) scheduleReconnect(requestedRoomId, reconnectAttempt + 1);
   }
 }
 
@@ -419,6 +600,86 @@ function updatePlayerName(value: string): void {
 
 function openMapLibrary(): void {
   page.value = "maps";
+}
+
+function openWorkshop(): void {
+  page.value = "workshop";
+  if (!workshopClient) {
+    workshopClient = new WorkshopClient(resolveRelayEndpoint(), {
+      catalog: (catalog) => {
+        remoteMapWorks.value = catalog.maps.map((entry) => ({ ...entry }));
+        const installedIds = new Set(installedTerrainMods.map((mod) => mod.id));
+        remoteTerrainMods.value = catalog.terrainMods.map((entry) => ({
+          ...entry,
+          installed: installedIds.has(entry.modId)
+        }));
+      },
+      detail: (detail) => {
+        if (detail.kind === "map") {
+          remoteMapWorks.value = remoteMapWorks.value.map((entry) => entry.id === detail.entry.id
+            ? { ...entry, ...detail.entry } : entry);
+        } else {
+          remoteTerrainMods.value = remoteTerrainMods.value.map((entry) => entry.id === detail.entry.id
+            ? { ...entry, ...detail.entry } : entry);
+        }
+      },
+      published: (published) => {
+        workshopWorking.value = false;
+        workshopActionError.value = false;
+        workshopActionMessage.value = published.kind === "map" ? "地图码已发布到创意工坊。" : "地块 Mod 已发布供其他玩家预览。";
+        workshopClient?.requestList();
+      },
+      error: (message) => {
+        workshopWorking.value = false;
+        workshopActionError.value = true;
+        workshopActionMessage.value = message;
+      },
+      status: (status) => { workshopStatus.value = status; }
+    });
+  }
+  const name = playerName.value.trim().slice(0, 24) || randomPlayerName();
+  void workshopClient.connect({ name });
+}
+
+function selectWorkshopMap(id: string): void {
+  if (id === builtInMapWork.id) return;
+  const entry = remoteMapWorks.value.find((candidate) => candidate.id === id);
+  if (entry && !entry.code) workshopClient?.requestDetail("map", id);
+}
+
+function selectWorkshopTerrainMod(id: string): void {
+  if (id === builtInTerrainMod.id) return;
+  const entry = remoteTerrainMods.value.find((candidate) => candidate.id === id);
+  if (entry && !entry.sourceFiles) workshopClient?.requestDetail("terrain-mod", id);
+}
+
+function saveWorkshopMap(code: string): void {
+  try {
+    const next = addMapToLibrary(configuredMaps.value, code);
+    configuredMaps.value = next;
+    selectedMapLibraryId.value = next.at(-1)?.definition.id ?? DEFAULT_MAP_DEFINITION.id;
+    workshopActionError.value = false;
+    workshopActionMessage.value = `「${next.at(-1)?.definition.name ?? "地图"}」已保存到我的地图配置。`;
+  } catch (error) {
+    workshopActionError.value = true;
+    workshopActionMessage.value = error instanceof Error ? error.message : "地图码无法保存。";
+  }
+}
+
+function publishWorkshopMap(entry: MapSubmission): void {
+  if (!workshopPublishingEnabled) return;
+  if (!workshopClient?.publishMap(entry)) return;
+  workshopWorking.value = true;
+  workshopActionMessage.value = "正在发布地图码…";
+  workshopActionError.value = false;
+}
+
+function publishWorkshopTerrainMod(entry: TerrainModSubmission): void {
+  if (!workshopPublishingEnabled) return;
+  if (!workshopClient?.publishTerrainMod(entry)) return;
+  workshopWorking.value = true;
+  workshopActionMessage.value = "正在发布地块 Mod…";
+  workshopActionError.value = false;
 }
 
 function addConfiguredMap(rawCode: string): void {
@@ -454,8 +715,12 @@ function requestHome(): void {
 async function leaveToHome(): Promise<void> {
   leaveDialogOpen.value = false;
   connectionAttempt += 1;
+  cancelReconnect();
+  if (relayRoom) logConnection("room.left-by-user", { roomId: relayRoom.roomId });
   const room = relayRoom;
   relayRoom = undefined;
+  const workshop = workshopClient;
+  workshopClient = undefined;
   page.value = "home";
   relayStatus.value = "未连接";
   relayRoomId.value = "";
@@ -465,6 +730,7 @@ async function leaveToHome(): Promise<void> {
   relaySessionId.value = null;
   relayIsHost.value = false;
   hasLiveSnapshot.value = false;
+  lastSnapshotSyncAt = 0;
   lobbyError.value = "";
   pendingRemoteAction = undefined;
   matchClock.value = null;
@@ -476,6 +742,8 @@ async function leaveToHome(): Promise<void> {
     mapPlayerCount: initialMapPlayerCount,
     mapCode: DEFAULT_MAP_CODE,
     mapName: DEFAULT_MAP_DEFINITION.name,
+    requiredTerrainModIds: DEFAULT_MAP_DEFINITION.requiredTerrainModIds,
+    roomModSettings: {},
     settings: { ...DEFAULT_LOBBY_SETTINGS },
     members: []
   };
@@ -485,6 +753,7 @@ async function leaveToHome(): Promise<void> {
   if (room) {
     try { await room.leave(); } catch { /* The local page has already left. */ }
   }
+  if (workshop) await workshop.leave();
 }
 
 function createRoom(): void {
@@ -504,10 +773,27 @@ function startLobbyMatch(payload: MatchStartPayload): void {
   pendingRemoteAction = undefined;
   const assignment = payload.assignments.find((candidate) => candidate.sessionId === relaySessionId.value);
   relayPlayerId.value = assignment?.playerId ?? null;
-  game.value = createMatchFromMapCode(payload.mapCode, {
+  if (missingLocalModIds.value.length > 0) {
+    hasLiveSnapshot.value = false;
+    notice.value = `当前设备缺少地块 Mod：${missingLocalModIds.value.join("、")}。安装后才能进入对局。`;
+    logConnection("match.missing-mods", { missingModIds: missingLocalModIds.value });
+    return;
+  }
+  try { game.value = createMatchFromMapCode(payload.mapCode, {
+    ...installedMapCatalogs,
     activePlayerIds: payload.assignments.map((candidate) => candidate.playerId as PlayerId),
-    friendlyFire: payload.settings.friendlyFire
-  });
+    playerDisplayNames: Object.fromEntries(payload.assignments.map((candidate) => [
+      candidate.playerId,
+      candidate.displayName ?? lobbyState.value.members.find((member) => member.sessionId === candidate.sessionId)?.displayName ?? `玩家 ${candidate.seat}`
+    ])),
+    friendlyFire: payload.settings.friendlyFire,
+    roomModSettings: payload.roomModSettings ?? {}
+  }); } catch (error) {
+    hasLiveSnapshot.value = false;
+    notice.value = error instanceof Error ? error.message : "当前地图内容无法加载。";
+    logConnection("match.load-failed", { message: notice.value });
+    return;
+  }
   hasLiveSnapshot.value = true;
   matchClock.value = startMatchClocks(game.value, payload.settings, Date.now());
   expiredStepSequence = null;
@@ -533,6 +819,10 @@ function sendLobbyParticipation(participating: boolean): void {
 
 function sendLobbySettings(settings: Record<string, boolean | number>): void {
   relayRoom?.send("lobby-settings", settings);
+}
+
+function sendLobbyModSettings(modSettings: LobbyModSettings): void {
+  relayRoom?.send("lobby-mod-settings", { modSettings });
 }
 
 function sendLobbyAssignment(payload: { sessionId: string; seat?: number | null; participating?: boolean }): void {
@@ -745,8 +1035,13 @@ function endReinforcementPhase(): void {
 }
 
 function resetMatch(): void {
-  if (relayRoom && !relayIsHost.value) {
-    notice.value = "只有房主可以重置联网对局。";
+  if (relayRoom) {
+    if (!requestReturnToLobby(relayRoom, relayIsHost.value)) {
+      notice.value = "只有房主可以结束联网对局。";
+      return;
+    }
+    logConnection("match.return-to-lobby.requested", { roomId: relayRoom.roomId });
+    notice.value = "正在等待房间返回准备阶段…";
     return;
   }
   clearReinforcementHold();
@@ -755,8 +1050,13 @@ function resetMatch(): void {
     .filter((member) => member.participating && member.seat !== null)
     .map((member) => `player-${member.seat}` as PlayerId);
   game.value = createMatchFromMapCode(lobbyState.value.mapCode, {
+    ...installedMapCatalogs,
     ...(activePlayerIds.length > 0 ? { activePlayerIds } : {}),
-    friendlyFire: lobbyState.value.settings.friendlyFire
+    playerDisplayNames: Object.fromEntries(lobbyState.value.members
+      .filter((member) => member.participating && member.seat !== null)
+      .map((member) => [`player-${member.seat}`, member.displayName])),
+    friendlyFire: lobbyState.value.settings.friendlyFire,
+    roomModSettings: lobbyState.value.roomModSettings
   });
   matchClock.value = startMatchClocks(game.value, lobbyState.value.settings, Date.now());
   expiredStepSequence = null;
@@ -877,6 +1177,14 @@ function expireCurrentPhase(phase: "action" | "reinforcement"): boolean {
 
 function tickClocks(): void {
   clockNow.value = Date.now();
+  // A late joiner must not wait forever when its first snapshot request raced
+  // with a host handoff or an empty server cache.
+  if (relayRoom && lobbyState.value.phase === "playing" && !hasLiveSnapshot.value
+    && clockNow.value - lastSnapshotSyncAt >= 2_000) {
+    logConnection("snapshot.sync-request", { roomId: relayRoom.roomId, initial: false, sequence: game.value.sequence });
+    relayRoom.send("room-sync", {});
+    lastSnapshotSyncAt = clockNow.value;
+  }
   if (!relayRoom || !relayIsHost.value || lobbyState.value.phase !== "playing" || isMatchFinished.value) return;
   const expiration = clockExpiration(matchClock.value, game.value.turn.phase, lobbyState.value.settings, clockNow.value);
   if (!expiration || expiredStepSequence === game.value.sequence) return;
@@ -894,7 +1202,26 @@ function tickClocks(): void {
     : "步时用尽，已自动结束加点并轮到下一位玩家。";
 }
 
+function logBrowserConnectionState(): void {
+  logConnection("browser.connection", { online: navigator.onLine, visibility: document.visibilityState });
+}
+
+function logBrowserError(event: ErrorEvent): void {
+  logConnection("browser.error", { message: event.message.slice(0, 250) });
+}
+
+function logUnhandledRejection(event: PromiseRejectionEvent): void {
+  const message = event.reason instanceof Error ? event.reason.message : String(event.reason);
+  logConnection("browser.unhandled-rejection", { message: message.slice(0, 250) });
+}
+
 onMounted(() => {
+  logConnection("page.loaded", { path: window.location.pathname, invitedRoom: Boolean(invitedRoomId), online: navigator.onLine });
+  window.addEventListener("online", logBrowserConnectionState);
+  window.addEventListener("offline", logBrowserConnectionState);
+  document.addEventListener("visibilitychange", logBrowserConnectionState);
+  window.addEventListener("error", logBrowserError);
+  window.addEventListener("unhandledrejection", logUnhandledRejection);
   clockTimer = setInterval(tickClocks, 250);
   if (invitedRoomId) {
     roomIdInput.value = invitedRoomId;
@@ -903,8 +1230,15 @@ onMounted(() => {
 });
 onBeforeUnmount(() => {
   clearReinforcementHold();
+  cancelReconnect();
+  window.removeEventListener("online", logBrowserConnectionState);
+  window.removeEventListener("offline", logBrowserConnectionState);
+  document.removeEventListener("visibilitychange", logBrowserConnectionState);
+  window.removeEventListener("error", logBrowserError);
+  window.removeEventListener("unhandledrejection", logUnhandledRejection);
   if (clockTimer) clearInterval(clockTimer);
   relayRoom?.leave();
+  void workshopClient?.leave();
 });
 </script>
 
@@ -912,18 +1246,20 @@ onBeforeUnmount(() => {
   <main class="app-shell">
     <header class="topbar">
       <div class="brand-block">
-        <button v-if="!showHome && !showMaps" class="topbar-back" @click="requestHome"><span aria-hidden="true">←</span> 返回主页</button>
+        <button v-if="!showHome && !showMaps && !showWorkshop" class="topbar-back" @click="requestHome"><span aria-hidden="true">←</span> 返回主页</button>
         <p class="eyebrow">NUMERAL LORD · EARLY ACCESS</p><h1>Numeral Lord</h1>
       </div>
       <div class="topbar-meta">
         <div v-if="showHome" class="turn-pill"><span class="turn-dot" />选择入口，开启对局</div>
         <div v-else-if="showMaps" class="turn-pill"><span class="turn-dot" />地图配置 · {{ configuredMaps.length }} 张可用</div>
+        <div v-else-if="showWorkshop" class="turn-pill"><span class="turn-dot" />创意工坊 · {{ workshopStatus === 'connected' ? '已连接' : workshopStatus === 'connecting' ? '连接中' : '离线预览' }}</div>
         <div v-else-if="showRoomEntry" class="turn-pill"><span class="turn-dot" />创建房间或用房间号加入</div>
         <div v-else-if="relayStatus === '连接中…'" class="turn-pill"><span class="turn-dot" />正在连接 PvP 房间…</div>
         <div v-else-if="showLobby" class="turn-pill"><span class="turn-dot" />准备房间 · 地图 {{ lobbyState.mapPlayerCount }} 个玩家位</div>
         <div v-else-if="showGameLoading" class="turn-pill"><span class="turn-dot" />正在同步对局棋盘…</div>
         <div v-else class="turn-pill" :style="{ '--player-color': currentPlayer?.color }"><span class="turn-dot" />第 {{ game.turn.round }} 回合 · {{ currentPlayer?.displayName }} · {{ phaseLabel }} · 步 {{ stepClockLabel }} · 局 {{ matchClockLabel }}</div>
-        <div v-if="!showHome && !showMaps" class="network-pill" :class="{ connected: relayStatus === '已连接' }">PvP {{ relayStatus }}<span v-if="relayRoomId"> · 房间 {{ relayRoomId }}</span><span v-if="relayIsHost"> · 房主</span><span v-else-if="isSpectator"> · 观战</span><span v-else-if="relayPlayerId"> · {{ relayPlayerId }}</span></div>
+        <div v-if="!showHome && !showMaps && !showWorkshop" class="network-pill" :class="{ connected: relayStatus === '已连接' }">PvP {{ relayStatus }}<span v-if="relayRoomId"> · 房间 {{ relayRoomId }}</span><span v-if="relayIsHost"> · 房主</span><span v-else-if="isSpectator"> · 观战</span><span v-else-if="relayPlayerId"> · {{ relayPlayerId }}</span></div>
+        <button v-if="!showHome && !showMaps && !showWorkshop" class="connection-log-trigger" type="button" @click="connectionLogCopyMessage = ''; connectionLogDialogOpen = true">连接日志</button>
       </div>
     </header>
 
@@ -933,6 +1269,7 @@ onBeforeUnmount(() => {
       @update:name="updatePlayerName"
       @start="startFromHome"
       @maps="openMapLibrary"
+      @workshop="openWorkshop"
     />
 
     <MapLibrary
@@ -946,6 +1283,23 @@ onBeforeUnmount(() => {
       @select="selectedMapLibraryId = $event"
       @add="addConfiguredMap"
       @remove="removeConfiguredMap"
+    />
+
+    <WorkshopPanel
+      v-else-if="showWorkshop"
+      :terrain-mods="workshopTerrainMods"
+      :map-entries="workshopMapWorks"
+      :saved-map-ids="configuredMaps.map((map) => map.definition.id)"
+      :action-message="workshopActionMessage"
+      :action-error="workshopActionError"
+      :working="workshopWorking"
+      :publishing-enabled="workshopPublishingEnabled"
+      @back="requestHome"
+      @select-map="selectWorkshopMap"
+      @select-terrain-mod="selectWorkshopTerrainMod"
+      @save-map="saveWorkshopMap"
+      @publish-map="publishWorkshopMap"
+      @publish-terrain-mod="publishWorkshopTerrainMod"
     />
 
     <section v-else-if="showRoomEntry" class="room-hub">
@@ -979,11 +1333,12 @@ onBeforeUnmount(() => {
       @seat="sendLobbySeat"
       @participation="sendLobbyParticipation"
       @settings="sendLobbySettings"
+      @mod-settings="sendLobbyModSettings"
       @assign="sendLobbyAssignment"
       @map="sendLobbyMap"
     />
 
-    <section v-if="showGameLoading" class="sync-panel" role="status"><span class="sync-spinner" /><h2>正在同步棋盘</h2><p>正在从房间获取当前地图和最新对局状态，请稍候。</p></section>
+    <section v-if="showGameLoading" class="sync-panel" role="status"><span v-if="missingLocalModIds.length === 0" class="sync-spinner" /><h2>{{ missingLocalModIds.length ? '当前设备缺少地块 Mod' : '正在同步棋盘' }}</h2><p>{{ missingLocalModIds.length ? `此地图需要 ${missingLocalModIds.join('、')}。安装后才能进入对局。` : '正在从房间获取当前地图和最新对局状态；若房主刚断线，系统会自动重试。' }}</p></section>
 
     <section v-if="showGame && isMatchFinished" class="match-result" role="status" aria-live="polite">
       <div>
@@ -991,7 +1346,7 @@ onBeforeUnmount(() => {
         <h2>{{ matchResultTitle }}</h2>
         <p>{{ matchResultMessage }}</p>
       </div>
-      <button v-if="relayStatus !== '已连接' || relayIsHost" class="primary" @click="resetMatch">重新开始演示对局</button>
+      <button v-if="relayStatus !== '已连接' || relayIsHost" class="primary" @click="resetMatch">{{ relayRoomId ? '返回准备房间' : '重新开始演示对局' }}</button>
     </section>
 
     <section v-if="showGame" class="play-layout">
@@ -1030,7 +1385,7 @@ onBeforeUnmount(() => {
         </div>
         <button v-if="isActionPhase" class="secondary" :disabled="!canActCurrentPlayer" @click="endActionPhase">结束行动，进入加点</button>
         <button v-else-if="isReinforcementPhase" class="primary" :disabled="!canActCurrentPlayer" @click="endReinforcementPhase">结束加点，轮到下一位</button>
-        <button v-if="relayStatus !== '已连接' || relayIsHost" class="ghost" @click="resetMatch">重置演示对局</button>
+        <button v-if="relayStatus !== '已连接' || relayIsHost" class="ghost" @click="resetMatch">{{ relayRoomId ? '返回准备房间' : '重置演示对局' }}</button>
         <button class="ghost notation-trigger" @click="openNotationDialog">查看 / 复制本地棋谱</button>
       </aside>
     </section>
@@ -1057,6 +1412,16 @@ onBeforeUnmount(() => {
           <button class="primary" @click="copyNotation">复制当前棋谱</button>
           <button class="ghost" @click="notationDialogOpen = false">关闭</button>
         </div>
+      </section>
+    </div>
+
+    <div v-if="connectionLogDialogOpen" class="notation-backdrop" @click.self="connectionLogDialogOpen = false">
+      <section class="connection-log-dialog" role="dialog" aria-modal="true" aria-labelledby="connection-log-title">
+        <div class="panel-heading"><span id="connection-log-title">连接日志</span><small>当前标签页 · 最近 120 条</small></div>
+        <p>记录连接、断线码、房主切换和棋盘同步；刷新本标签页后仍会保留。遇到掉线时复制发给我。</p>
+        <textarea readonly :value="connectionLogText" aria-label="连接诊断日志" @focus="($event.target as HTMLTextAreaElement).select()" />
+        <p v-if="connectionLogCopyMessage" class="copy-status" role="status">{{ connectionLogCopyMessage }}</p>
+        <div class="connection-log-actions"><button class="primary" type="button" @click="copyConnectionLog">复制日志</button><button class="ghost" type="button" @click="connectionLogDialogOpen = false">关闭</button></div>
       </section>
     </div>
   </main>

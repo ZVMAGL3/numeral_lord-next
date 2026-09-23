@@ -25,7 +25,9 @@ corepack pnpm --filter @numeral-lord/server start
 corepack pnpm dev:web
 ```
 
-打开 `http://127.0.0.1:5173/`。主页仅有玩家名字和“联机大厅 / 地图配置”两个同级菜单入口，不显示地图预览。首次访问会自动生成名字并写入 `localStorage`；“地图配置”用于导入、预览和复制地图码。第一个标签选择“联机大厅”后再点击“创建新房间”，其余标签输入房间号，或直接打开邀请链接。带 `room` 参数的邀请链接直接加入房间，并使用本机保存的名字。远程中继可用 `?relay=ws://服务器地址:2567` 指定；`room` 与 `relay` 查询参数可以同时保留。HTTPS 页面必须使用 `wss://`。
+打开 `http://127.0.0.1:5173/`。主页有“联机大厅 / 地图配置 / 创意工坊”三个同级入口，不显示地图预览。首次访问会自动生成名字并写入 `localStorage`；临时房间身份在每个标签页的 `sessionStorage` 中独立保存，刷新同一标签页可恢复座位。选择“联机大厅”后点击“创建新房间”，其余玩家输入房间号，或直接打开邀请链接。远程中继可用 `?relay=ws://服务器地址:2567` 指定；`room` 与 `relay` 查询参数可以同时保留。HTTPS 页面必须使用 `wss://`。
+
+房间页右上角有“连接日志”。若玩家突然掉线或卡在“正在同步棋盘”，先在两个玩家的标签页分别复制日志；刷新当前标签页后日志仍会保留。日志中的 `socket.closed.code`、`connect.failed`、`room.host` 和 `snapshot.received` 可区分连接关闭与接管后的同步失败。再让服务器管理员提供相同时间段的 `journalctl -u numeral-lord.service --since '时间' --no-pager`；若服务重启，当前内存房间号会失效，无法仅靠客户端重连恢复。
 
 ## 准备房间验收
 
@@ -100,6 +102,23 @@ corepack pnpm dev:web
 - 所选完整地图码由房间同步，访客无需先导入；所有客户端仍须具备该地图所用的核心目录和 Mod catalog。中继不安装 Mod，也不执行 Mod 规则。
 - 本地开发时贴图地址为 `/legacy/…`。执行 `corepack pnpm --filter @numeral-lord/web build:deploy` 后，Vite `BASE_URL` 为 `/numeral-lord-play/`，贴图应请求 `/numeral-lord-play/legacy/TS0.png` 等子路径，而不是站点根目录 `/legacy/…`。
 - 即使可选贴图加载失败，棋盘仍应显示基础色并可操作；控制台可以给出资源警告，但不能让规则棋盘消失。
+- 新房间状态包含所选地图的 `requiredTerrainModIds`、每位成员的 `missingModIds`，以及房主的 `roomModSettings`；缺少 Mod 的参战者不能准备，服务端也不会让其开局。
+- 油田 `incomePerTurn` 默认 2，地图作者可在地图码 `modSettings` 中改为 0～20，房主可在准备房间的“地块 Mod 设置”覆盖。修改会清除准备状态，换地图清空房主覆盖值；返回准备房间后保留本房间覆盖值。
+- 公网工坊目前只读；社区地块 Mod 的源码归档可以预览/下载，但不会自动安装或执行。保存地图码不代表依赖已安装。
+
+## 独立公网测试入口
+
+当前测试页为 `http://39.107.250.161/numeral-lord-play-stage/`，与原公网入口使用不同的服务进程、端口和网页目录。更新测试页只会重启 `numeral-lord-staging.service`；正式 `numeral-lord.service` 不受影响。测试页的工坊可以列出作品，但暂不接受匿名发布。
+
+从仓库根目录可运行下面两个只创建临时房间的检查：
+
+```powershell
+$env:PVP_SMOKE_CHECK_RESET = '1'
+pnpm --filter @numeral-lord/web exec node scripts/public-pvp-smoke.mjs
+pnpm --filter @numeral-lord/web exec node scripts/public-workshop-smoke.mjs
+```
+
+第一个脚本验证缺失 Mod 不能准备、报告已安装后可准备、房主油田参数同步到双方、超过旧 4 KiB 限制的快照能传输，以及房主结束对局后双方回准备房间。第二个脚本验证工坊房间可连接、列表格式正确且匿名发布被拒。真人双端的行动、刷新重连、房主移交和视觉效果仍需继续验收。
 
 ## 建议回归命令
 

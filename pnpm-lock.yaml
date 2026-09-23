@@ -184,6 +184,9 @@ importers:
       '@numeral-lord/game-sdk':
         specifier: workspace:*
         version: link:../../packages/game-sdk
+      '@numeral-lord/oil-field-mod':
+        specifier: workspace:*
+        version: link:../../packages/oil-field-mod
       colyseus:
         specifier: 0.18.7
         version: 0.18.7(@colyseus/auth@0.18.2)(@colyseus/better-call@1.3.3(zod@4.6.5))(@colyseus/core@0.18.14)(@colyseus/redis-driver@0.18.2(@colyseus/auth@0.18.2)(@colyseus/better-call@1.3.3(zod@4.6.5))(@colyseus/schema@5.0.33(typescript@5.9.3))(@colyseus/ws-transport@0.18.2)(@pm2/io@6.1.0)(express@5.2.1)(zod@4.6.5))(@colyseus/redis-presence@0.18.4(@colyseus/auth@0.18.2)(@colyseus/better-call@1.3.3(zod@4.6.5))(@colyseus/schema@5.0.33(typescript@5.9.3))(@colyseus/ws-transport@0.18.2)(@pm2/io@6.1.0)(express@5.2.1)(zod@4.6.5))(@colyseus/schema@5.0.33(typescript@5.9.3))(@colyseus/uwebsockets-transport@0.18.3(@colyseus/core@0.18.14))(@colyseus/ws-transport@0.18.2)(@pm2/io@6.1.0)(express@5.2.1)(vite@8.3.0(@types/node@26.6.2)(esbuild@0.28.2)(tsx@4.23.15))(zod@4.6.5)
@@ -228,6 +231,9 @@ importers:
       vite:
         specifier: 8.3.0
         version: 8.3.0(@types/node@26.6.2)(esbuild@0.28.2)(tsx@4.23.15)
+      vitest:
+        specifier: 5.0.1
+        version: 5.0.1(@types/node@26.6.2)(vite@8.3.0(@types/node@26.6.2)(esbuild@0.28.2)(tsx@4.23.15))
       vue-tsc:
         specifier: 3.3.11
         version: 3.3.11(typescript@5.9.3)
@@ -250,9 +256,6 @@ importers:
       '@numeral-lord/game-sdk':
         specifier: workspace:*
         version: link:../game-sdk
-      '@numeral-lord/oil-field-mod':
-        specifier: workspace:*
-        version: link:../oil-field-mod
     devDependencies:
       typescript:
         specifier: 5.9.3

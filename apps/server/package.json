@@ -15,6 +15,7 @@
     "@numeral-lord/core-content": "workspace:*",
     "@numeral-lord/game-core": "workspace:*",
     "@numeral-lord/game-sdk": "workspace:*",
+    "@numeral-lord/oil-field-mod": "workspace:*",
     "colyseus": "0.18.7"
   },
   "devDependencies": {

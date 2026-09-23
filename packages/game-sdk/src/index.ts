@@ -19,6 +19,30 @@ export interface CapabilityBinding {
   readonly config?: Readonly<Record<string, unknown>>;
 }
 
+/** Serializable options a map author may set and a room host may override. */
+export type ModSettingValue = number | boolean | string;
+
+interface ModSettingBase {
+  /** Stable key within the Mod package, e.g. `incomePerTurn`. */
+  readonly id: string;
+  readonly displayName: string;
+  readonly description?: string;
+  /** The public capability field this option configures at runtime. */
+  readonly target: {
+    readonly terrainId: string;
+    readonly capabilityId: string;
+    readonly configKey: string;
+  };
+}
+
+export type ModSettingDefinition = ModSettingBase & (
+  | { readonly kind: "integer"; readonly defaultValue: number; readonly min: number; readonly max: number }
+  | { readonly kind: "boolean"; readonly defaultValue: boolean }
+  | { readonly kind: "choice"; readonly defaultValue: string; readonly options: readonly string[] }
+);
+
+export type ModSettings = Readonly<Record<string, Readonly<Record<string, ModSettingValue>>>>;
+
 export interface TerrainDefinition {
   /** 地形的稳定 id，地图保存时记录它，不使用可翻译的显示名称。 */
   readonly id: string;
@@ -68,6 +92,8 @@ export interface ModDefinition {
   readonly id: string;
   readonly version: string;
   readonly capabilities: readonly CapabilityDefinition[];
+  /** Optional, schema-validated map/room options; never arbitrary executable code. */
+  readonly settings?: readonly ModSettingDefinition[];
   readonly terrains: readonly TerrainDefinition[];
   readonly units: readonly UnitDefinition[];
   readonly commandRules: readonly CommandRule[];

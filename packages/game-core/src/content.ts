@@ -75,6 +75,19 @@ export function getTerrainCapability(
   return terrain.capabilities.find((capability) => capability.id === capabilityId);
 }
 
+/** A match may pin Mod-authored capability values without changing global content. */
+export function getMatchTerrainCapability(
+  state: GameState,
+  terrain: TerrainSpec,
+  capabilityId: string
+): TerrainCapability | undefined {
+  const binding = getTerrainCapability(terrain, capabilityId);
+  if (!binding) return undefined;
+  const override = state.settings.terrainCapabilityOverrides?.[terrain.id]?.[capabilityId];
+  if (!override) return binding;
+  return { ...binding, config: { ...binding.config, ...override } };
+}
+
 export function hasUnitCapability(unit: UnitSpec, capabilityId: string): boolean {
   return unit.capabilities.some((capability) => capability.id === capabilityId);
 }

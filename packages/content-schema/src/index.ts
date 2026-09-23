@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+export * from "./workshop.js";
+
 export const modManifestSchema = z.object({
   id: z.string().regex(/^[a-z0-9-]+$/),
   version: z.string(),

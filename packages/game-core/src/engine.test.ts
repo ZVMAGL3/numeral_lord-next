@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { coreMatchConditionCatalog } from "../../core-content/src/match-conditions.js";
+import { coreTerrainCatalog } from "../../core-content/src/terrains.js";
+import { oilFieldTerrainCatalog } from "../../oil-field-mod/src/index.js";
 import { applyCommand, finishMatch, getActionableUnitIds, getLegalActionDestinationIds, getPoweredUnitIds, startMatch } from "./engine.js";
 import { applyIntent, getLegalIntents } from "./simulation.js";
 import type { TerrainCatalog, UnitCatalog } from "./content.js";
@@ -615,15 +617,161 @@ describe("core turn rules", () => {
     expect(result.events.map((event) => event.type)).toContain("unit-counterattacked");
   });
 
-  it("splits a powered unit and exhausts it after entering an enemy stronghold zone", () => {
+  it.each([
+    ["plain", coreTerrainCatalog["core/plain"], 1],
+    ["ocean", coreTerrainCatalog["core/ocean"], 1],
+    ["stronghold", coreTerrainCatalog["core/stronghold"], 2],
+    ["oilfield", oilFieldTerrainCatalog["mod/oil-field"], 0]
+  ] as const)("uses %s terrain's counterattack limit across two attacks in the same turn", (
+    terrainId, terrain, expectedCounterattacks
+  ) => {
+    expect(terrain).toBeDefined();
+    const defendingCellId = toCellId({ column: 3, row: 1 });
+    const secondCannonCellId = toCellId({ column: 2, row: 0 });
+    const secondCannonId = id("p1-second-cannon");
+    const defenderId = id("p2-home");
     const state = fixture();
+    const attackCatalog: UnitCatalog = {
+      ...unitCatalog,
+      cannon: {
+        id: "cannon",
+        displayName: "测试炮",
+        capabilities: [
+          { id: "core/attack", config: { movesIntoTarget: false } },
+          { id: "core/attack-range", config: { min: 1, max: 5 } }
+        ]
+      }
+    };
+    const battleState: GameState = {
+      ...state,
+      cells: {
+        ...state.cells,
+        [defendingCellId]: { ...state.cells[defendingCellId]!, terrainId },
+        [secondCannonCellId]: { ...state.cells[secondCannonCellId]!, unitId: secondCannonId }
+      },
+      units: {
+        ...state.units,
+        [id("p1-scout")]: { ...state.units[id("p1-scout")]!, definitionId: "cannon", strength: 3 },
+        [secondCannonId]: {
+          id: secondCannonId,
+          definitionId: "cannon",
+          ownerId: p1,
+          cellId: secondCannonCellId,
+          strength: 3
+        },
+        [defenderId]: { ...state.units[defenderId]!, strength: 20 }
+      }
+    };
+    const battleTerrains: TerrainCatalog = { ...terrains, [terrainId]: terrain! };
+    const first = applyCommand(battleState, {
+      type: "attack-unit", commandId: `${terrainId}-first`, actorId: p1, expectedSequence: 0,
+      unitId: id("p1-scout"), targetId: defendingCellId
+    }, battleTerrains, attackCatalog);
+    expect(first.accepted).toBe(true);
+    if (!first.accepted) return;
+    const second = applyCommand(first.state, {
+      type: "attack-unit", commandId: `${terrainId}-second`, actorId: p1, expectedSequence: first.state.sequence,
+      unitId: secondCannonId, targetId: defendingCellId
+    }, battleTerrains, attackCatalog);
+    expect(second.accepted).toBe(true);
+    if (!second.accepted) return;
+
+    const reactions = [...first.events, ...second.events]
+      .filter((event) => event.type === "unit-counterattacked");
+    expect(reactions).toHaveLength(expectedCounterattacks);
+    expect(second.state.turn.counterattacksUsed[defenderId] ?? 0).toBe(expectedCounterattacks);
+    // The defender survives both low-strength attacks. On plain/ocean, the
+    // first cannon baits its reaction and the second is not counterattacked.
+    expect(second.state.units[defenderId]?.strength).toBe(14);
+    expect(second.state.units[secondCannonId] !== undefined).toBe(expectedCounterattacks < 2);
+  });
+
+  it("does not grant counterattack to a unit that lacks the unit capability", () => {
+    const state = fixture();
+    const defenderId = id("p2-home");
+    const attackerId = id("p1-scout");
+    const noCounterUnitCatalog: UnitCatalog = {
+      ...unitCatalog,
+      peaceful: { id: "peaceful", displayName: "无反击兵", capabilities: [] },
+      cannon: {
+        id: "cannon",
+        displayName: "测试炮",
+        capabilities: [
+          { id: "core/attack", config: { movesIntoTarget: false } },
+          { id: "core/attack-range", config: { min: 1, max: 5 } }
+        ]
+      }
+    };
+    const battleState: GameState = {
+      ...state,
+      units: {
+        ...state.units,
+        [attackerId]: { ...state.units[attackerId]!, definitionId: "cannon" },
+        [defenderId]: { ...state.units[defenderId]!, definitionId: "peaceful" }
+      }
+    };
+    const result = applyCommand(battleState, {
+      type: "attack-unit", commandId: "peaceful-defender", actorId: p1, expectedSequence: 0,
+      unitId: attackerId, targetId: toCellId({ column: 3, row: 1 })
+    }, { ...terrains, stronghold: coreTerrainCatalog["core/stronghold"]! }, noCounterUnitCatalog);
+    expect(result.accepted).toBe(true);
+    if (!result.accepted) return;
+    expect(result.events.some((event) => event.type === "unit-counterattacked")).toBe(false);
+    expect(result.state.turn.counterattacksUsed[defenderId]).toBeUndefined();
+  });
+
+  it("resets counterattack usage when the next player's action phase starts", () => {
+    const defenderId = id("p2-home");
+    const base = fixture();
+    const state: GameState = {
+      ...base,
+      turn: { ...base.turn, counterattacksUsed: { [defenderId]: 1 } }
+    };
+    const actionEnd = applyCommand(state, {
+      type: "end-action-phase", commandId: "p1-action-end", actorId: p1, expectedSequence: 0
+    }, terrains, unitCatalog);
+    expect(actionEnd.accepted).toBe(true);
+    if (!actionEnd.accepted) return;
+    // Point allocation still belongs to the same turn: do not replenish the
+    // defender's reaction before the attacking player has finished.
+    expect(actionEnd.state.turn.counterattacksUsed[defenderId]).toBe(1);
+    const reinforcementEnd = applyCommand(actionEnd.state, {
+      type: "end-reinforcement-phase", commandId: "p1-reinforcement-end", actorId: p1,
+      expectedSequence: actionEnd.state.sequence
+    }, terrains, unitCatalog);
+    expect(reinforcementEnd.accepted).toBe(true);
+    if (!reinforcementEnd.accepted) return;
+    expect(reinforcementEnd.state.turn.currentPlayerId).toBe(p2);
+    expect(reinforcementEnd.state.turn.phase).toBe("action");
+    expect(reinforcementEnd.state.turn.counterattacksUsed).toEqual({});
+  });
+
+  it("splits a powered unit and exhausts it after entering an enemy stronghold zone", () => {
+    const homeCellId = toCellId({ column: 3, row: 1 });
+    const arrivalCellId = toCellId({ column: 2, row: 1 });
+    const state: GameState = {
+      ...fixture(),
+      // Runtime rule lookup consumes the map-compiled incoming relation rather
+      // than recalculating the six-neighbour geometry on every movement.
+      cellTriggers: {
+        [arrivalCellId]: {
+          enter: [
+            // Same-team and empty/non-source targets are no-ops, but must not
+            // hide a later hostile linked stronghold.
+            { relatedCellId: toCellId({ column: 0, row: 1 }), relationId: "core/adjacent-hostile-exhaustion" },
+            { relatedCellId: homeCellId, relationId: "core/adjacent-hostile-exhaustion" }
+          ],
+          leave: []
+        }
+      }
+    };
     const result = applyCommand(state, {
       type: "move-unit", commandId: "move-1", actorId: p1, expectedSequence: 0,
-      unitId: id("p1-scout"), destinationId: toCellId({ column: 2, row: 1 })
+      unitId: id("p1-scout"), destinationId: arrivalCellId
     }, terrains, unitCatalog);
     expect(result.accepted).toBe(true);
     if (!result.accepted) return;
-    const arriving = result.state.cells[toCellId({ column: 2, row: 1 })]?.unitId;
+    const arriving = result.state.cells[arrivalCellId]?.unitId;
     expect(arriving).toBeDefined();
     expect(result.state.units[id("p1-scout")]?.strength).toBe(1);
     expect(result.state.turn.exhaustedUnitIds).toEqual([arriving]);

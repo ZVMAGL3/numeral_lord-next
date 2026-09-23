@@ -1,6 +1,9 @@
 /** Lifecycle of an online room before and after the map starts. */
 export type LobbyPhase = "lobby" | "playing";
 
+/** Transport-safe values; the SDK checks each field against its Mod schema. */
+export type LobbyModSettings = Readonly<Record<string, Readonly<Record<string, number | boolean | string>>>>;
+
 /**
  * Room options are transport-level match setup, not UI state.  The selected
  * map remains responsible for declaring how many playable seats it contains.
@@ -26,6 +29,10 @@ export interface LobbyMember {
   /** False means spectator, regardless of whether a seat has been assigned. */
   readonly participating: boolean;
   readonly ready: boolean;
+  /** Content available to this browser for constructing the selected match. */
+  readonly installedModIds: readonly string[];
+  /** Selected map dependencies absent from this browser. Empty means playable. */
+  readonly missingModIds: readonly string[];
 }
 
 export interface LobbyRoomState {
@@ -34,6 +41,10 @@ export interface LobbyRoomState {
   readonly mapCode: string;
   readonly mapName: string;
   readonly mapPlayerCount: number;
+  /** Required executable terrain Mod package IDs from the selected map code. */
+  readonly requiredTerrainModIds: readonly string[];
+  /** Room-host overrides; map-authored values and Mod defaults remain in the map/SDK. */
+  readonly roomModSettings: LobbyModSettings;
   readonly settings: LobbySettings;
   readonly members: readonly LobbyMember[];
   readonly startedAtEpochMs?: number;
@@ -48,12 +59,16 @@ export interface MatchPlayerAssignment {
   readonly sessionId: string;
   readonly seat: number;
   readonly playerId: string;
+  /** Name shown on the game board; optional for older relay messages. */
+  readonly displayName?: string;
 }
 
 export interface MatchStartPayload {
   /** Start all clients from the same map definition. */
   readonly mapCode: string;
   readonly settings: LobbySettings;
+  /** Exact same validated host overrides used by each browser's shared core. */
+  readonly roomModSettings: LobbyModSettings;
   readonly assignments: readonly MatchPlayerAssignment[];
   /** Server timestamp used to start every client's visible clocks together. */
   readonly startedAtEpochMs: number;

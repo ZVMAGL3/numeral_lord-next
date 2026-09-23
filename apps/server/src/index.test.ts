@@ -1,8 +1,15 @@
-import type { Client, MessageContext } from "colyseus";
+import { getMessageBytes, Protocol, type Client, type MessageContext } from "colyseus";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LobbyRoomState, MatchStartPayload } from "@numeral-lord/game-core/node";
-import { DEFAULT_MAP_CODE, DEFAULT_MAP_DEFINITION, serializeMapCode } from "@numeral-lord/core-content";
-import { PvpRelayRoom } from "./index.js";
+import { DEFAULT_MAP_CODE, DEFAULT_MAP_DEFINITION, coreTerrainCatalog, createMatchFromMapCode, serializeMapCode } from "@numeral-lord/core-content";
+import { oilFieldMod, oilFieldTerrainCatalog } from "@numeral-lord/oil-field-mod";
+import { MAX_CLIENT_MESSAGE_BYTES, PvpRelayRoom, createGameServer } from "./index.js";
+
+const installedMapCatalogs = {
+  terrains: { ...coreTerrainCatalog, ...oilFieldTerrainCatalog },
+  terrainModIds: Object.fromEntries(oilFieldMod.terrains.map((terrain) => [terrain.id, oilFieldMod.id])),
+  mods: { [oilFieldMod.id]: oilFieldMod }
+};
 
 interface SentMessage {
   readonly type: string | number;
@@ -92,14 +99,25 @@ function mapCodeForSeats(seats: number): string {
     name: `测试地图 ${seats} 人`,
     players: seats,
     teams: Array.from({ length: seats }, (_, index) => index + 1)
-  });
+  }, installedMapCatalogs);
 }
 
-function join(room: TestPvpRelayRoom, sessionId: string, name = sessionId, accountId = `account-${sessionId}`): FakeClient {
+function join(
+  room: TestPvpRelayRoom,
+  sessionId: string,
+  name = sessionId,
+  accountId = `account-${sessionId}`,
+  installedModIds: readonly string[] = [oilFieldMod.id]
+): FakeClient {
   const client = fakeClient(sessionId);
   room.clients.push(client);
-  room.onJoin(client, { accountId, name });
+  room.onJoin(client, { accountId, name, installedModIds });
   return client;
+}
+
+function dropSocket(room: TestPvpRelayRoom, client: FakeClient): void {
+  const index = room.clients.indexOf(client);
+  if (index !== -1) room.clients.splice(index, 1);
 }
 
 function lastBroadcast<T>(room: TestPvpRelayRoom, type: string): T {
@@ -113,6 +131,21 @@ function lastSent<T>(client: FakeClient, type: string): T {
   if (!event) throw new Error(`No ${type} message was sent to ${client.sessionId}`);
   return event.payload as T;
 }
+
+it("accepts an initial host snapshot beyond Colyseus' 4 KiB transport default", () => {
+  const state = createMatchFromMapCode(DEFAULT_MAP_CODE, installedMapCatalogs);
+  const frame = getMessageBytes.raw(Protocol.ROOM_DATA, "host-snapshot", {
+    state,
+    clock: {},
+    hostSentAtEpochMs: Date.now()
+  });
+  expect(frame.byteLength).toBeGreaterThan(4 * 1024);
+
+  const server = createGameServer();
+  const transport = server.transport as unknown as { wss: { options: { maxPayload: number } } };
+  expect(transport.wss.options.maxPayload).toBe(MAX_CLIENT_MESSAGE_BYTES);
+  expect(transport.wss.options.maxPayload).toBeGreaterThan(frame.byteLength);
+});
 
 describe("PvpRelayRoom lobby contract", () => {
   beforeEach(() => {
@@ -140,14 +173,14 @@ describe("PvpRelayRoom lobby contract", () => {
 
   it("starts a fixed-position map with only the occupied seats assigned", () => {
     const room = createRoom(4);
-    const host = join(room, "host");
+    const host = join(room, "host", "房主名字");
 
     room.receive("lobby-seat", host, { seat: 3 });
     room.receive("lobby-ready", host, { ready: true });
 
     const start = lastBroadcast<MatchStartPayload>(room, "match-start");
     expect(start.assignments).toEqual([
-      { sessionId: "host", seat: 3, playerId: "player-3" }
+      { sessionId: "host", seat: 3, playerId: "player-3", displayName: "房主名字" }
     ]);
     expect(start.mapCode).toBe(mapCodeForSeats(4));
     expect(start.assignments).toHaveLength(1);
@@ -355,6 +388,137 @@ describe("PvpRelayRoom lobby contract", () => {
     expect(room.broadcasts.some((message) => message.type === "match-start")).toBe(false);
   });
 
+  it("shows missing map Mods and refuses readiness until the client reports installation", () => {
+    const room = createRoom(2);
+    const host = join(room, "host", "未安装者", "account-host", []);
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state")).toMatchObject({
+      requiredTerrainModIds: [oilFieldMod.id],
+      members: [{ sessionId: "host", installedModIds: [], missingModIds: [oilFieldMod.id] }]
+    });
+
+    room.receive("lobby-ready", host, { ready: true });
+    expect(lastSent<{ message: string }>(host, "lobby-error").message).toContain(oilFieldMod.id);
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").members[0]?.ready).toBe(false);
+    expect(room.broadcasts.some((message) => message.type === "match-start")).toBe(false);
+
+    room.receive("lobby-installed-mods", host, { installedModIds: [oilFieldMod.id] });
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").members[0]?.missingModIds).toEqual([]);
+    room.receive("lobby-ready", host, { ready: true });
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").phase).toBe("playing");
+  });
+
+  it("accepts only host Mod overrides declared by the map and preserves them across rematch", () => {
+    const room = createRoom(2);
+    const host = join(room, "host");
+    const peer = join(room, "peer");
+    room.receive("lobby-mod-settings", peer, { modSettings: { [oilFieldMod.id]: { incomePerTurn: 9 } } });
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").roomModSettings).toEqual({});
+
+    room.receive("lobby-mod-settings", host, { modSettings: { [oilFieldMod.id]: { incomePerTurn: 7 } } });
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").roomModSettings[oilFieldMod.id]?.incomePerTurn).toBe(7);
+    room.receive("lobby-mod-settings", host, { modSettings: { [oilFieldMod.id]: { incomePerTurn: 21 } } });
+    expect(lastSent<{ message: string }>(host, "lobby-error").message).toContain("0～20");
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").roomModSettings[oilFieldMod.id]?.incomePerTurn).toBe(7);
+    room.receive("lobby-mod-settings", host, { modSettings: { "mod-undeclared": { incomePerTurn: 4 } } });
+    expect(lastSent<{ message: string }>(host, "lobby-error").message).toContain("配置无效");
+
+    room.receive("lobby-ready", host, { ready: true });
+    room.receive("lobby-ready", peer, { ready: true });
+    expect(lastBroadcast<MatchStartPayload>(room, "match-start").roomModSettings[oilFieldMod.id]?.incomePerTurn).toBe(7);
+    room.receive("match-return-to-lobby", host);
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").roomModSettings[oilFieldMod.id]?.incomePerTurn).toBe(7);
+  });
+
+  it("clears Mod overrides and dependency gating when the host switches maps", () => {
+    const room = createRoom(2);
+    const host = join(room, "host", "无 Mod 玩家", "account-host", []);
+    room.receive("lobby-mod-settings", host, { modSettings: { [oilFieldMod.id]: { incomePerTurn: 8 } } });
+    const plainCode = serializeMapCode({
+      ...DEFAULT_MAP_DEFINITION,
+      id: "plain-room-map",
+      terrain: DEFAULT_MAP_DEFINITION.terrain.replaceAll("F", "M"),
+      requiredTerrainModIds: []
+    }, { terrains: coreTerrainCatalog });
+    room.receive("lobby-map", host, { mapCode: plainCode });
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state")).toMatchObject({
+      requiredTerrainModIds: [],
+      roomModSettings: {},
+      members: [{ sessionId: "host", missingModIds: [] }]
+    });
+    room.receive("lobby-ready", host, { ready: true });
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").phase).toBe("playing");
+  });
+
+  it("returns every player to the same ready room and discards the old match snapshot", () => {
+    const room = createRoom(2);
+    const host = join(room, "host", "房主");
+    const peer = join(room, "peer", "对手");
+    room.receive("lobby-settings", host, { friendlyFire: true, turnTimeSeconds: 45 });
+    room.receive("lobby-ready", host, { ready: true });
+    room.receive("lobby-ready", peer, { ready: true });
+    room.receive("host-snapshot", host, { state: { sequence: 8 } });
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").phase).toBe("playing");
+
+    room.receive("match-return-to-lobby", host);
+
+    const readyRoom = lastBroadcast<LobbyRoomState>(room, "room-state");
+    expect(readyRoom).toMatchObject({
+      phase: "lobby",
+      mapCode: DEFAULT_MAP_CODE,
+      settings: { friendlyFire: true, turnTimeSeconds: 45 }
+    });
+    expect(readyRoom).not.toHaveProperty("startedAtEpochMs");
+    expect(readyRoom.members.map((member) => [member.sessionId, member.seat, member.ready]))
+      .toEqual([["host", 1, false], ["peer", 2, false]]);
+    expect(lastSent<LobbyRoomState>(peer, "room-state").phase).toBe("lobby");
+
+    // A delayed upload from the old match may not bring its board back.
+    room.receive("host-snapshot", host, { state: { sequence: 9 } });
+    const late = join(room, "late");
+    late.sent.length = 0;
+    room.receive("room-sync", late);
+    expect(lastSent<LobbyRoomState>(late, "room-state").phase).toBe("lobby");
+    expect(late.sent.some((message) => message.type === "host-snapshot" || message.type === "match-start"
+      || message.type === "snapshot-request")).toBe(false);
+
+    room.receive("lobby-ready", host, { ready: true });
+    room.receive("lobby-ready", peer, { ready: true });
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").phase).toBe("playing");
+    expect(lastBroadcast<MatchStartPayload>(room, "match-start").assignments).toHaveLength(2);
+  });
+
+  it("rejects a non-host request to return the match to the lobby", () => {
+    const room = createRoom(2);
+    const host = join(room, "host");
+    const peer = join(room, "peer");
+    room.receive("lobby-ready", host, { ready: true });
+    room.receive("lobby-ready", peer, { ready: true });
+    const broadcastsBefore = room.broadcasts.length;
+
+    room.receive("match-return-to-lobby", peer);
+
+    expect(lastSent<{ message: string }>(peer, "lobby-error").message).toContain("只有房主");
+    expect(room.broadcasts).toHaveLength(broadcastsBefore);
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").phase).toBe("playing");
+  });
+
+  it("clears randomized seats before preparing the next match", () => {
+    const room = createRoom(2);
+    const host = join(room, "host");
+    const peer = join(room, "peer");
+    room.receive("lobby-settings", host, { randomizePositions: true });
+    room.receive("lobby-ready", host, { ready: true });
+    room.receive("lobby-ready", peer, { ready: true });
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").members.every((member) => member.seat !== null)).toBe(true);
+
+    room.receive("match-return-to-lobby", host);
+
+    const readyRoom = lastBroadcast<LobbyRoomState>(room, "room-state");
+    expect(readyRoom.phase).toBe("lobby");
+    expect(readyRoom.settings.randomizePositions).toBe(true);
+    expect(readyRoom.members.every((member) => member.participating && member.seat === null && !member.ready)).toBe(true);
+  });
+
   it("keeps the earliest participants when a random-position map shrinks", () => {
     const room = createRoom(4);
     const host = join(room, "host");
@@ -406,5 +570,133 @@ describe("PvpRelayRoom lobby contract", () => {
       turnTimeSeconds: 120,
       randomizePositions: true
     });
+  });
+
+  it("hands the cached board to a connected player before announcing the new host", async () => {
+    const room = createRoom(2);
+    const host = join(room, "host");
+    const peer = join(room, "peer");
+    room.receive("lobby-ready", host, { ready: true });
+    room.receive("lobby-ready", peer, { ready: true });
+    room.receive("host-snapshot", host, { state: { sequence: 7 } });
+    peer.sent.length = 0;
+
+    dropSocket(room, host);
+    await room.onLeave(host, 1000);
+
+    const handoffIndex = peer.sent.findIndex((message) => message.type === "host-snapshot"
+      && (message.payload as { handoff?: boolean }).handoff === true);
+    const hostIndex = peer.sent.findIndex((message) => message.type === "room-host");
+    expect(handoffIndex).toBeGreaterThanOrEqual(0);
+    expect(hostIndex).toBeGreaterThan(handoffIndex);
+    expect(lastSent<{ sessionId: string }>(peer, "room-host").sessionId).toBe("peer");
+
+    room.receive("host-snapshot", peer, { state: { sequence: 8 } });
+    const late = join(room, "late");
+    room.receive("room-sync", late);
+    expect(lastSent<{ state: { sequence: number }; handoff?: boolean }>(late, "host-snapshot"))
+      .toMatchObject({ state: { sequence: 8 } });
+    expect(lastSent<{ handoff?: boolean }>(late, "host-snapshot").handoff).not.toBe(true);
+  });
+
+  it("recovers when the first host drops before sending any board snapshot", async () => {
+    const room = createRoom(2);
+    const host = join(room, "host");
+    const peer = join(room, "peer");
+    room.receive("lobby-ready", host, { ready: true });
+    room.receive("lobby-ready", peer, { ready: true });
+    peer.sent.length = 0;
+
+    dropSocket(room, host);
+    await room.onLeave(host, 1000);
+
+    const startIndex = peer.sent.findIndex((message) => message.type === "match-start");
+    const hostIndex = peer.sent.findIndex((message) => message.type === "room-host");
+    expect(startIndex).toBeGreaterThanOrEqual(0);
+    expect(hostIndex).toBeGreaterThan(startIndex);
+    room.receive("room-sync", peer);
+    expect(lastSent<{ sessionId: string }>(peer, "room-host").sessionId).toBe("peer");
+    expect(peer.sent.some((message) => message.type === "snapshot-request")).toBe(true);
+
+    room.receive("host-snapshot", peer, { state: { sequence: 0 } });
+    const late = join(room, "late");
+    room.receive("room-sync", late);
+    expect(lastSent<{ state: { sequence: number } }>(late, "host-snapshot").state.sequence).toBe(0);
+  });
+
+  it("lets a departed player reclaim their seat and bootstrap an empty-cache room", async () => {
+    const room = createRoom(2);
+    const host = join(room, "old", "棋手", "stable-account");
+    room.receive("lobby-ready", host, { ready: true });
+
+    dropSocket(room, host);
+    await room.onLeave(host, 1000);
+    const replacement = join(room, "new", "棋手", "stable-account");
+    replacement.sent.length = 0;
+    room.receive("room-sync", replacement);
+
+    expect(replacement.sent.map((message) => message.type).slice(0, 4))
+      .toEqual(["match-start", "room-role", "room-state", "room-host"]);
+    expect(lastSent<Record<string, unknown>>(replacement, "room-role"))
+      .toMatchObject({ seat: 1, participating: true, isHost: true, playerId: "player-1" });
+    room.receive("host-snapshot", replacement, { state: { sequence: 0 } });
+    const spectator = join(room, "spectator");
+    room.receive("room-sync", spectator);
+    expect(lastSent<{ state: { sequence: number } }>(spectator, "host-snapshot").state.sequence).toBe(0);
+  });
+
+  it("does not revoke a replacement host when the old socket's leave finishes later", async () => {
+    const room = createRoom(2);
+    const original = join(room, "old", "棋手", "stable-account");
+    room.receive("lobby-ready", original, { ready: true });
+    room.allowReconnectionTime = 30;
+    let finishLeave!: () => void;
+    const pendingReconnection = new Promise<Client>((_, reject) => {
+      finishLeave = () => reject(new Error("old socket expired"));
+    });
+    vi.spyOn(room, "allowReconnection").mockReturnValue(
+      pendingReconnection as unknown as ReturnType<typeof room.allowReconnection>
+    );
+
+    dropSocket(room, original);
+    const leaving = room.onLeave(original, 1006);
+    const replacement = join(room, "new", "棋手", "stable-account");
+    room.receive("room-sync", replacement);
+    room.receive("host-snapshot", replacement, { state: { sequence: 1 } });
+    finishLeave();
+    await leaving;
+
+    expect(lastSent<{ sessionId: string }>(replacement, "room-host").sessionId).toBe("new");
+    const late = join(room, "late");
+    room.receive("room-sync", late);
+    expect(lastSent<{ state: { sequence: number } }>(late, "host-snapshot").state.sequence).toBe(1);
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").members.filter(
+      (member) => member.accountId === "stable-account"
+    )).toHaveLength(1);
+  });
+
+  it("replays a trusted handoff to a refreshed host and rejects stale snapshots", () => {
+    const room = createRoom(2);
+    const original = join(room, "old", "棋手", "stable-account");
+    room.receive("lobby-ready", original, { ready: true });
+    room.receive("host-snapshot", original, { state: { sequence: 5 } });
+
+    const replacement = join(room, "new", "棋手", "stable-account");
+    replacement.sent.length = 0;
+    // onJoin's role message can race browser handler registration; the explicit
+    // room-sync handshake must recover the cached board before host authority.
+    room.receive("host-snapshot", original, { state: { sequence: 6 } });
+    room.receive("room-sync", replacement);
+    expect(replacement.sent.map((message) => message.type).slice(0, 4))
+      .toEqual(["host-snapshot", "room-role", "room-state", "room-host"]);
+    expect(lastSent<{ handoff?: boolean; state: { sequence: number } }>(replacement, "host-snapshot"))
+      .toMatchObject({ handoff: true, state: { sequence: 5 } });
+
+    room.receive("host-snapshot", replacement, { state: { sequence: 4 } });
+    const late = join(room, "late");
+    room.receive("room-sync", late);
+    expect(lastSent<{ state: { sequence: number } }>(late, "host-snapshot").state.sequence).toBe(5);
+    room.receive("host-snapshot", replacement, { state: { sequence: 6 } });
+    expect(lastSent<{ state: { sequence: number } }>(late, "host-snapshot").state.sequence).toBe(6);
   });
 });

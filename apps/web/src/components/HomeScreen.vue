@@ -7,6 +7,7 @@ const emit = defineEmits<{
   "update:name": [name: string];
   start: [];
   maps: [];
+  workshop: [];
 }>();
 </script>
 
@@ -58,6 +59,19 @@ const emit = defineEmits<{
           </span>
           <span class="card-bottom"><span><strong>地图配置</strong><small>导入地图码 · 管理地图</small></span><span class="card-enter" aria-hidden="true">→</span></span>
         </button>
+
+        <button class="menu-card workshop-card" type="button" @click="emit('workshop')">
+          <span class="card-top"><span>03 / WORKSHOP</span><span class="card-mark" aria-hidden="true">↗</span></span>
+          <span class="card-art" aria-hidden="true">
+            <svg viewBox="0 0 260 150" fill="none" role="presentation">
+              <path d="m130 14 39 22v45l-39 22-39-22V36l39-22Z" />
+              <path d="m130 14 39 22-39 23-39-23m39 23v44" />
+              <path d="m52 79 26 15v30l-26 15-26-15V94l26-15Zm156 0 26 15v30l-26 15-26-15V94l26-15Z" />
+              <path d="m91 82-15 10m93-10 15 10M130 104v25" />
+            </svg>
+          </span>
+          <span class="card-bottom"><span><strong>创意工坊</strong><small>地块 Mod · 地图作品</small></span><span class="card-enter" aria-hidden="true">→</span></span>
+        </button>
       </div>
     </div>
   </section>
@@ -73,9 +87,10 @@ const emit = defineEmits<{
 .player-name { display: grid; width: min(252px,100%); gap: 7px; color: #aac0d0; font-size: 11px; font-weight: 750; }
 .player-name input { width: 100%; height: 45px; padding: 0 13px; border: 1px solid rgba(135,176,202,.38); border-radius: 10px; outline: none; background: rgba(7,21,33,.8); color: #f5faff; font-size: 14px; }
 .player-name input:focus-visible { border-color: #83e9d8; box-shadow: 0 0 0 3px rgba(131,233,216,.14); }
-.menu-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: clamp(13px,2vw,22px); }
+.menu-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: clamp(13px,2vw,22px); }
 .menu-card { --accent: #7fe4d8; position: relative; display: flex; min-width: 0; min-height: 315px; flex-direction: column; justify-content: space-between; margin: 0; padding: clamp(18px,2.5vw,28px); overflow: hidden; border: 1px solid rgba(129,172,194,.28); border-radius: 20px; background: linear-gradient(155deg,rgba(27,55,73,.88),rgba(14,32,48,.96)); color: #f4f9ff; text-align: left; transition: border-color .18s ease,transform .18s ease,box-shadow .18s ease; }
 .map-card { --accent: #afc5ee; background: linear-gradient(155deg,rgba(33,50,77,.89),rgba(17,31,50,.96)); }
+.workshop-card { --accent: #f3c77e; background: linear-gradient(155deg,rgba(64,49,44,.88),rgba(27,31,43,.96)); }
 .menu-card::before { position: absolute; inset: auto -12% -58% -12%; height: 90%; content: ""; border-radius: 50%; background: var(--accent); filter: blur(82px); opacity: .08; pointer-events: none; }
 .menu-card:hover { transform: translateY(-4px); border-color: var(--accent); box-shadow: 0 16px 40px rgba(3,11,22,.28); }
 .menu-card:focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; }
@@ -85,13 +100,14 @@ const emit = defineEmits<{
 .card-art { position: relative; z-index: 1; display: grid; min-height: 167px; place-items: center; color: var(--accent); }
 .card-art svg { width: min(100%,285px); height: 150px; opacity: .83; filter: drop-shadow(0 0 22px rgba(110,222,217,.16)); stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
 .map-card .card-art svg { filter: drop-shadow(0 0 22px rgba(153,183,235,.17)); }
+.workshop-card .card-art svg { filter: drop-shadow(0 0 22px rgba(243,199,126,.17)); }
 .card-bottom { align-items: end; border-top: 1px solid rgba(166,194,216,.17); padding-top: 18px; }
 .card-bottom strong,.card-bottom small { display: block; }
 .card-bottom strong { font-size: clamp(21px,2.4vw,28px); line-height: 1.2; }
 .card-bottom small { margin-top: 7px; color: #9db5c8; font-size: 11px; font-weight: 500; }
 .card-enter { color: var(--accent); font-size: 29px; font-weight: 300; line-height: 1; transition: transform .18s ease; }
 .menu-card:hover .card-enter { transform: translateX(4px); }
-@media (max-width:700px) { .home-screen { min-height: 0; }.menu-heading { align-items: stretch; flex-direction: column; }.player-name { width: 100%; }.menu-card { min-height: 280px; }.card-art { min-height: 138px; }.card-art svg { height: 130px; } }
+@media (max-width:800px) { .menu-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }.home-screen { min-height: 0; }.menu-heading { align-items: stretch; flex-direction: column; }.player-name { width: 100%; }.menu-card { min-height: 280px; }.card-art { min-height: 138px; }.card-art svg { height: 130px; } }
 @media (max-width:560px) { .home-screen { padding: 21px 15px; border-radius: 20px; }.menu-grid { grid-template-columns: 1fr; }.menu-heading { gap: 17px; margin-bottom: 20px; }.menu-card { min-height: 207px; padding: 17px 19px; }.card-art { position: absolute; top: 32px; right: -30px; width: 52%; min-height: 0; opacity: .45; }.card-art svg { height: 126px; }.card-bottom { margin-top: 110px; }.card-bottom strong { font-size: 22px; } }
 @media (prefers-reduced-motion:reduce) { .menu-card,.card-enter { transition: none; }.menu-card:hover,.menu-card:hover .card-enter { transform: none; } }
 </style>

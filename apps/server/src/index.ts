@@ -4,11 +4,13 @@ import {
   applyIntent,
   getLegalIntents
 } from "@numeral-lord/game-core/node";
-import { DEFAULT_MAP_CODE, parseMapCode } from "@numeral-lord/core-content";
+import { DEFAULT_MAP_CODE, coreTerrainCatalog, parseMapCode, validateModSettings } from "@numeral-lord/core-content";
+import { oilFieldMod, oilFieldTerrainCatalog } from "@numeral-lord/oil-field-mod";
 import type {
   GameIntent,
   GameState,
   LobbyMember,
+  LobbyModSettings,
   LobbyRoomState,
   LobbySettings,
   MatchStartPayload,
@@ -18,8 +20,25 @@ import type {
 } from "@numeral-lord/game-core/node";
 import { RelayRoom, Server, WebSocketTransport, type Client } from "colyseus";
 import { pathToFileURL } from "node:url";
+import { WorkshopRoom } from "./workshop.js";
+
+/** The relay accepts only terrain content the deployed client currently ships. */
+const installedMapCatalogs = {
+  terrains: { ...coreTerrainCatalog, ...oilFieldTerrainCatalog },
+  terrainModIds: Object.fromEntries(oilFieldMod.terrains.map((terrain) => [terrain.id, oilFieldMod.id])),
+  mods: { [oilFieldMod.id]: oilFieldMod }
+};
 
 export { getLegalIntents };
+
+/**
+ * Colyseus' ws transport defaults to only 4 KiB for messages sent by clients.
+ * Even the built-in 81-cell board takes about 6.5 KiB as a host-snapshot, so
+ * that default closes the host socket with WebSocket code 1009 on the first
+ * sync. Keep an explicit bounded limit for larger user maps and workshop
+ * uploads rather than disabling the receiver's size protection.
+ */
+export const MAX_CLIENT_MESSAGE_BYTES = 1024 * 1024;
 
 interface MutableLobbyMember {
   sessionId: string;
@@ -29,6 +48,7 @@ interface MutableLobbyMember {
   seat: number | null;
   participating: boolean;
   ready: boolean;
+  installedModIds: readonly string[];
   joinOrder: number;
 }
 
@@ -61,17 +81,23 @@ export class PvpRelayRoom extends RelayRoom {
   private mapPlayerCount = 2;
   private mapCode = DEFAULT_MAP_CODE;
   private mapName = "昏晓";
+  private requiredTerrainModIds: readonly string[] = [];
+  private roomModSettings: LobbyModSettings = {};
   private settings: LobbySettings = DEFAULT_LOBBY_SETTINGS;
   private matchStartedAtEpochMs: number | null = null;
   private nextJoinOrder = 0;
   private latestHostSnapshot: CachedHostSnapshot | undefined;
+  /** Re-sendable initial state seed if the first host disappears before its first snapshot. */
+  private matchStartPayload: MatchStartPayload | undefined;
 
   override onCreate(options: RoomCreateOptions): void {
     const initialMapCode = options.mapCode ?? DEFAULT_MAP_CODE;
-    const initialMap = parseMapCode(initialMapCode);
+    const initialMap = parseMapCode(initialMapCode, installedMapCatalogs);
     this.mapCode = initialMapCode;
     this.mapName = initialMap.name;
     this.mapPlayerCount = initialMap.players;
+    this.requiredTerrainModIds = initialMap.requiredTerrainModIds;
+    this.roomModSettings = {};
     this.settings = { ...DEFAULT_LOBBY_SETTINGS };
     this.maxClients = MAX_ROOM_CAPACITY;
     if (options.allowReconnectionTime) {
@@ -110,9 +136,26 @@ export class PvpRelayRoom extends RelayRoom {
     this.onMessage("lobby-ready", (client, payload: Record<string, unknown> = {}) => {
       const member = this.members.get(client.sessionId);
       if (this.phase !== "lobby" || !member?.participating) return;
+      if (payload.ready === true && this.missingModIds(member).length > 0) {
+        this.sendError(client, `请先安装地图需要的地块 Mod：${this.missingModIds(member).join("、")}`);
+        return;
+      }
       member.ready = payload.ready === true;
       this.broadcastRoomState();
       this.startWhenReady();
+    });
+    this.onMessage("lobby-installed-mods", (client, payload: Record<string, unknown> = {}) => {
+      if (this.phase !== "lobby") return;
+      const member = this.members.get(client.sessionId);
+      if (!member) return;
+      const ids = parseInstalledModIds(payload.installedModIds);
+      if (!ids) {
+        this.sendError(client, "已安装 Mod 列表格式不正确。");
+        return;
+      }
+      member.installedModIds = ids;
+      member.ready = false;
+      this.broadcastRoomState();
     });
     this.onMessage("lobby-settings", (client, payload: Record<string, unknown> = {}) => {
       if (this.phase !== "lobby" || client.sessionId !== this.hostSessionId) return;
@@ -121,6 +164,10 @@ export class PvpRelayRoom extends RelayRoom {
     this.onMessage("lobby-map", (client, payload: Record<string, unknown> = {}) => {
       if (this.phase !== "lobby" || client.sessionId !== this.hostSessionId) return;
       this.selectMap(client, payload.mapCode);
+    });
+    this.onMessage("lobby-mod-settings", (client, payload: Record<string, unknown> = {}) => {
+      if (this.phase !== "lobby" || client.sessionId !== this.hostSessionId) return;
+      this.updateModSettings(client, payload.modSettings);
     });
     this.onMessage("lobby-seat", (client, payload: Record<string, unknown> = {}) => {
       if (this.phase !== "lobby") return;
@@ -138,6 +185,14 @@ export class PvpRelayRoom extends RelayRoom {
       if (this.phase !== "lobby" || client.sessionId !== this.hostSessionId) return;
       this.assignMember(client, payload);
     });
+    this.onMessage("match-return-to-lobby", (client) => {
+      if (this.phase !== "playing") return;
+      if (client.sessionId !== this.hostSessionId || !this.members.has(client.sessionId)) {
+        this.sendError(client, "只有房主可以结束对局并返回准备房间。");
+        return;
+      }
+      this.returnToLobby();
+    });
     this.onMessage("room-sync", (client) => {
       if (!this.members.has(client.sessionId)) return;
       const now = Date.now();
@@ -145,17 +200,26 @@ export class PvpRelayRoom extends RelayRoom {
       if (lastSyncAt !== undefined && now - lastSyncAt < PvpRelayRoom.ROOM_SYNC_COOLDOWN_MS) return;
       this.lastRoomSyncAtBySession.set(client.sessionId, now);
 
-      // During host takeover the snapshot must be delivered before room-role
-      // tells the browser it may act as host. WebSocket message ordering then
-      // makes the handoff deterministic without any broadcast request storm.
+      // A replacement host first needs the last accepted board. If the first
+      // host vanished before sending one, replay match-start so it can build
+      // the same initial board. Only then may it become authoritative.
       if (this.phase === "playing" && client.sessionId === this.hostSessionId
         && client.sessionId !== this.authoritativeHostSessionId) {
-        if (!this.sendCachedSnapshot(client)) return;
-        this.authoritativeHostSessionId = client.sessionId;
+        if (this.sendCachedSnapshot(client, true) || this.sendMatchStart(client)) {
+          this.authoritativeHostSessionId = client.sessionId;
+        }
       }
       this.sendClientContext(client);
-      if (this.phase === "playing" && client.sessionId !== this.hostSessionId) {
-        if (!this.sendCachedSnapshot(client)) this.requestHostSnapshot(client.sessionId);
+      if (this.phase === "playing") {
+        if (client.sessionId === this.hostSessionId) {
+          // Room-host normally triggers the upload. This explicit request also
+          // recovers if that earlier event was missed before handlers existed.
+          if (!this.latestHostSnapshot && client.sessionId === this.authoritativeHostSessionId) {
+            client.send("snapshot-request", { sessionId: client.sessionId });
+          }
+        } else if (!this.sendCachedSnapshot(client)) {
+          this.requestHostSnapshot(client.sessionId);
+        }
       }
     });
   }
@@ -170,18 +234,27 @@ export class PvpRelayRoom extends RelayRoom {
       ? receivedAtEpochMs - hostSentAtEpochMs
       : 0;
     const clock = isRecord(payload.clock) ? payload.clock : undefined;
+    // `handoff` is a server-only delivery marker, never supplied by the host.
+    const { handoff: _ignoredHandoff, ...cleanPayload } = payload;
     return {
-      payload: clock ? { ...payload, clock: rebaseClockEpochs(clock, offset) } : payload,
+      payload: clock ? { ...cleanPayload, clock: rebaseClockEpochs(clock, offset) } : cleanPayload,
       sequence
     };
   }
 
-  private sendCachedSnapshot(client: Client): boolean {
+  private sendCachedSnapshot(client: Client, handoff = false): boolean {
     if (!this.latestHostSnapshot) return false;
     client.send("host-snapshot", {
       ...this.latestHostSnapshot.payload,
+      ...(handoff ? { handoff: true } : {}),
       serverSentAtEpochMs: Date.now()
     });
+    return true;
+  }
+
+  private sendMatchStart(client: Client): boolean {
+    if (!this.matchStartPayload) return false;
+    client.send("match-start", this.matchStartPayload);
     return true;
   }
 
@@ -207,13 +280,17 @@ export class PvpRelayRoom extends RelayRoom {
         isHost: member.sessionId === this.hostSessionId,
         seat: member.seat,
         participating: member.participating,
-        ready: member.ready
+        ready: member.ready,
+        installedModIds: member.installedModIds,
+        missingModIds: this.missingModIds(member)
       }));
     return {
       phase: this.phase,
       mapCode: this.mapCode,
       mapName: this.mapName,
       mapPlayerCount: this.mapPlayerCount,
+      requiredTerrainModIds: this.requiredTerrainModIds,
+      roomModSettings: this.roomModSettings,
       settings: this.settings,
       members,
       ...(this.matchStartedAtEpochMs === null ? {} : { startedAtEpochMs: this.matchStartedAtEpochMs })
@@ -251,14 +328,22 @@ export class PvpRelayRoom extends RelayRoom {
       isHost: member.sessionId === this.hostSessionId,
       seat: member.seat,
       participating: member.participating,
-      ready: member.ready
+      ready: member.ready,
+      installedModIds: member.installedModIds,
+      missingModIds: this.missingModIds(member)
     };
+  }
+
+  private missingModIds(member: MutableLobbyMember): string[] {
+    const installed = new Set(member.installedModIds);
+    return this.requiredTerrainModIds.filter((id) => !installed.has(id));
   }
 
   override onJoin(client: Client, options: Record<string, unknown> = {}): void {
     super.onJoin(client, options);
     const requestedAccountId = typeof options.accountId === "string" ? options.accountId.trim() : "";
     const requestedName = typeof options.name === "string" ? options.name.trim() : "";
+    const installedModIds = parseInstalledModIds(options.installedModIds) ?? [];
     const previous = requestedAccountId
       ? [...this.members.values()].find((member) => member.accountId === requestedAccountId)
       : undefined;
@@ -269,8 +354,10 @@ export class PvpRelayRoom extends RelayRoom {
       previous.sessionId = client.sessionId;
       previous.displayName = requestedName || previous.displayName;
       previous.connected = true;
+      previous.installedModIds = installedModIds;
+      if (this.phase === "lobby" && this.missingModIds(previous).length > 0) previous.ready = false;
       this.members.set(client.sessionId, previous);
-      if (this.hostSessionId === oldSessionId) {
+      if (this.hostSessionId === oldSessionId || !this.hostSessionId) {
         this.hostSessionId = client.sessionId;
         // The replacement host first receives the last accepted board.
         // Until then it cannot submit a new authoritative snapshot.
@@ -293,6 +380,7 @@ export class PvpRelayRoom extends RelayRoom {
       seat: canParticipate ? defaultSeat : null,
       participating: canParticipate,
       ready: false,
+      installedModIds,
       joinOrder: this.nextJoinOrder++
     };
     this.members.set(client.sessionId, member);
@@ -303,37 +391,58 @@ export class PvpRelayRoom extends RelayRoom {
 
   override async onLeave(client: Client, code: number): Promise<void> {
     const member = this.members.get(client.sessionId);
-    const wasHost = client.sessionId === this.hostSessionId;
     if (member) {
+      console.info("PvP socket left", {
+        roomId: this.roomId,
+        sessionId: client.sessionId,
+        closeCode: code,
+        phase: this.phase,
+        wasHost: client.sessionId === this.hostSessionId
+      });
       member.connected = false;
       member.ready = false;
+      // Do not leave the match without an authority for the entire Colyseus
+      // reconnection grace period. A returning player keeps their seat, but
+      // the connected successor remains host for this handoff.
+      if (client.sessionId === this.hostSessionId) this.promoteConnectedHost(client.sessionId);
       this.broadcastRoomState();
     }
     await super.onLeave(client, code);
+    // A new socket using the same account may have replaced this member while
+    // allowReconnection was pending. Never remove or demote that new session.
+    if (!member || this.members.get(client.sessionId) !== member) return;
     const reconnected = this.clients.some((candidate) => candidate.sessionId === client.sessionId);
     if (reconnected && member) {
       member.connected = true;
       this.broadcastRoomState();
       return;
     }
-    this.members.delete(client.sessionId);
+    if (this.phase === "lobby") this.members.delete(client.sessionId);
     this.lastRoomSyncAtBySession.delete(client.sessionId);
-    if (wasHost) {
-      this.hostSessionId = [...this.members.values()]
-        .filter((candidate) => candidate.connected)
-        .sort((left, right) => left.joinOrder - right.joinOrder)[0]?.sessionId;
-      this.authoritativeHostSessionId = undefined;
-      const nextHost = this.clients.find((candidate) => candidate.sessionId === this.hostSessionId);
-      if (nextHost && this.sendCachedSnapshot(nextHost)) {
-        this.authoritativeHostSessionId = nextHost.sessionId;
-      }
-      this.broadcast("room-host", { sessionId: this.hostSessionId });
-    }
+    if (client.sessionId === this.hostSessionId) this.promoteConnectedHost(client.sessionId);
     this.broadcastRoomState();
     // A disconnected participant may have been the only member preventing
     // the remaining ready participants from starting. Once their reconnect
     // window expires, re-evaluate the lobby with the smaller participant set.
     this.startWhenReady();
+  }
+
+  private promoteConnectedHost(excludeSessionId: string): void {
+    // Prefer an active player who received match-start. A spectator can still
+    // take over from a cached board if every active player is disconnected.
+    const successor = [...this.members.values()]
+      .filter((candidate) => candidate.connected && candidate.sessionId !== excludeSessionId)
+      .sort((left, right) => Number(right.participating) - Number(left.participating)
+        || left.joinOrder - right.joinOrder)[0];
+    this.hostSessionId = successor?.sessionId;
+    this.authoritativeHostSessionId = undefined;
+    const nextClient = this.clients.find((candidate) => candidate.sessionId === successor?.sessionId);
+    if (nextClient && (this.phase !== "playing"
+      || this.sendCachedSnapshot(nextClient, true)
+      || this.sendMatchStart(nextClient))) {
+      this.authoritativeHostSessionId = nextClient.sessionId;
+    }
+    this.broadcast("room-host", { sessionId: this.hostSessionId });
   }
 
   private updateSettings(client: Client, payload: Record<string, unknown>): void {
@@ -370,7 +479,7 @@ export class PvpRelayRoom extends RelayRoom {
     }
     let selectedMap: ReturnType<typeof parseMapCode>;
     try {
-      selectedMap = parseMapCode(requestedCode);
+      selectedMap = parseMapCode(requestedCode, installedMapCatalogs);
     } catch {
       this.sendError(client, "地图码无法读取，请检查内容后重试。 ");
       return;
@@ -380,6 +489,8 @@ export class PvpRelayRoom extends RelayRoom {
     this.mapCode = requestedCode;
     this.mapName = selectedMap.name;
     this.mapPlayerCount = selectedMap.players;
+    this.requiredTerrainModIds = selectedMap.requiredTerrainModIds;
+    this.roomModSettings = {};
     if (this.settings.randomizePositions) {
       const participants = [...this.members.values()]
         .filter((member) => member.participating)
@@ -403,6 +514,24 @@ export class PvpRelayRoom extends RelayRoom {
       mapName: this.mapName,
       mapPlayerCount: this.mapPlayerCount
     });
+    this.broadcastRoomState();
+  }
+
+  private updateModSettings(client: Client, rawSettings: unknown): void {
+    try {
+      // The message replaces the entire room override. Unknown Mod IDs,
+      // undeclared fields and out-of-range values never enter room state.
+      this.roomModSettings = validateModSettings(
+        rawSettings,
+        this.requiredTerrainModIds,
+        installedMapCatalogs.mods,
+        false
+      ) ?? {};
+    } catch (error) {
+      this.sendError(client, error instanceof Error ? error.message : "Mod 设置无效。");
+      return;
+    }
+    this.resetReady();
     this.broadcastRoomState();
   }
 
@@ -503,7 +632,7 @@ export class PvpRelayRoom extends RelayRoom {
     let participants = [...this.members.values()]
       .filter((member) => member.participating);
     if (participants.length === 0 || participants.length > this.mapPlayerCount
-      || participants.some((member) => !member.connected || !member.ready)) return;
+      || participants.some((member) => !member.connected || !member.ready || this.missingModIds(member).length > 0)) return;
 
     if (this.settings.randomizePositions) {
       participants = shuffle(participants);
@@ -522,15 +651,35 @@ export class PvpRelayRoom extends RelayRoom {
     const payload: MatchStartPayload = {
       mapCode: this.mapCode,
       settings: this.settings,
+      roomModSettings: this.roomModSettings,
       startedAtEpochMs: this.matchStartedAtEpochMs,
       assignments: participants.map((member) => ({
         sessionId: member.sessionId,
         seat: member.seat!,
-        playerId: playerIdForSeat(member.seat!)
+        playerId: playerIdForSeat(member.seat!),
+        displayName: member.displayName
       }))
     };
+    this.matchStartPayload = payload;
     this.broadcastRoomState();
     this.broadcast("match-start", payload);
+  }
+
+  /** End the current online match for every member, not just the host's local board. */
+  private returnToLobby(): void {
+    this.phase = "lobby";
+    this.matchStartedAtEpochMs = null;
+    this.latestHostSnapshot = undefined;
+    this.matchStartPayload = undefined;
+    this.authoritativeHostSessionId = this.hostSessionId;
+    this.lastRoomSyncAtBySession.clear();
+    this.resetReady();
+    // Random seats were only assigned for the finished match. Participants
+    // choose participate/spectate again in the lobby, not those old seats.
+    if (this.settings.randomizePositions) {
+      for (const member of this.members.values()) member.seat = null;
+    }
+    this.broadcastRoomState();
   }
 
   private firstOpenSeat(): number | null {
@@ -584,7 +733,7 @@ export function validateIntent(
  */
 export function createGameServer(): Server {
   const gameServer = new Server({
-    transport: new WebSocketTransport()
+    transport: new WebSocketTransport({ maxPayload: MAX_CLIENT_MESSAGE_BYTES })
   });
 
   gameServer.define("pvp", PvpRelayRoom, {
@@ -595,6 +744,12 @@ export function createGameServer(): Server {
       version: "0.2.0"
     }
   });
+  // Public PvP staging must not expose anonymous source/map publishing. Keep
+  // the workshop available during local development; production opts in.
+  if (process.env.WORKSHOP_ENABLED === "1"
+    || (process.env.NODE_ENV !== "production" && process.env.WORKSHOP_ENABLED !== "0")) {
+    gameServer.define("workshop", WorkshopRoom);
+  }
   return gameServer;
 }
 
@@ -617,6 +772,13 @@ function playerIdForSeat(seat: number): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/** Bound and sanitize the client capability declaration used for lobby checks. */
+function parseInstalledModIds(value: unknown): readonly string[] | undefined {
+  if (!Array.isArray(value) || value.length > 64) return undefined;
+  if (!value.every((id) => typeof id === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,79}$/.test(id))) return undefined;
+  return [...new Set(value as string[])];
 }
 
 /** Keep the cached clock in server time; each delivery receives a fresh stamp. */

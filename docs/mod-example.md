@@ -1,6 +1,6 @@
 # 油田 Mod 示例
 
-油田现在不是原生地形。它位于 `packages/oil-field-mod/`，作为一个可以被地图显式安装的可选内容包。核心包只提供公共能力和原生地形；地图是否出现油田，由地图装配时是否合并这个 Mod 的目录决定。
+油田不是原生地形。它位于独立的 `packages/oil-field-mod/`；`core-content` 不导入油田包。地图码只声明它需要 `mod-oil-field`，实际运行时由客户端/服务器的内容装配层决定是否安装该地块 Mod。
 
 ## 目录结构
 
@@ -19,20 +19,23 @@ packages/oil-field-mod/
 
 油田自身只组合公共能力：可占据、占据时收益 2 点、离开时留下 1 点游兵。它没有 `power-conductor`，所以油田收益和供电是两条独立规则。
 
-## 地图如何安装 Mod
+## 地图如何声明依赖、运行时如何装配
 
-演示地图在 `packages/core-content/src/demo-match.ts` 中显式安装：
+地图码的 `terrainLegend` 将字符 `F` 指向 `mod/oil-field`，`requiredTerrainModIds` 包含 `mod-oil-field`。这是地块依赖，不是 `matchConditionIds` 胜负条件。网页端在 `apps/web/src/installed-content.ts` 合并已安装的地形目录：
 
 ```ts
-const terrainCatalog = {
+import { oilFieldMod, oilFieldTerrainCatalog } from "@numeral-lord/oil-field-mod";
+
+const installedTerrainCatalog = {
   ...coreTerrainCatalog,
   ...oilFieldTerrainCatalog
 };
-
-return startMatch(initialState, terrainCatalog, coreUnitCatalog, coreMatchConditionCatalog).state;
+const terrainModIds = Object.fromEntries(
+  oilFieldMod.terrains.map((terrain) => [terrain.id, oilFieldMod.id])
+);
 ```
 
-要做一张不含油田的地图，只使用 `coreTerrainCatalog`，并且不要在地图字符串中写 `F`。要让地图使用油田，需要同时满足两点：地图码把格子写成 `F`，装配器把 `oilFieldTerrainCatalog` 合并进运行时目录。
+没安装依赖时，`parseMapCode(code, { allowUnknownTerrainMods: true })` 仍可校验并收藏地图码；真正开局的 `createMatchFromMapCode` 永远要求完整已安装目录。创意工坊中发布的地块源码目前只能预览，不能直接安装执行。
 
 ## 新增一个 Mod 的最小步骤
 

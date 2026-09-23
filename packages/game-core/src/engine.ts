@@ -1,6 +1,7 @@
 import type { GameCommand } from "./commands.js";
 import {
   getTerrainCapability,
+  getMatchTerrainCapability,
   getUnitCapability,
   hasTerrainCapability,
   hasUnitCapability,
@@ -109,7 +110,8 @@ const CAPABILITY = {
   income: "core/income-source",
   departureExhaustion: "core/exhaust-on-departure",
   hostileExhaustion: "core/adjacent-hostile-exhaustion",
-  departureGarrison: "core/departure-garrison"
+  departureGarrison: "core/departure-garrison",
+  counterattackTerrainLimit: "core/counterattack-terrain-limit"
 } as const;
 
 const UNIT_CAPABILITY = {
@@ -395,7 +397,9 @@ export function getLegalActionDestinationIds(
 
   const sourceCell = state.cells[unit.cellId];
   if (!sourceCell) return [];
-  const departureGarrison = getDepartureGarrison(requireTerrain(terrains, sourceCell.terrainId));
+  const sourceTerrain = requireTerrain(terrains, sourceCell.terrainId);
+  const departureGarrison = hasCellTrigger(state, sourceCell.id, "leave", CAPABILITY.departureGarrison, sourceTerrain)
+    ? getDepartureGarrison(sourceTerrain) : undefined;
   const canLeaveSource = !departureGarrison || unit.strength > departureGarrison.strength;
   const unitDefinition = units[unit.definitionId];
   if (!unitDefinition) return [];
@@ -462,7 +466,9 @@ function moveUnit(
   }
   const unitDefinition = units[unit.definitionId];
   if (!unitDefinition) return fail(state, "invalid-unit-definition", "单位没有可用的兵种定义。");
-  const departureGarrison = getDepartureGarrison(requireTerrain(terrains, sourceCell.terrainId));
+  const sourceTerrain = requireTerrain(terrains, sourceCell.terrainId);
+  const departureGarrison = hasCellTrigger(state, sourceCell.id, "leave", CAPABILITY.departureGarrison, sourceTerrain)
+    ? getDepartureGarrison(sourceTerrain) : undefined;
   if (departureGarrison && unit.strength <= departureGarrison.strength) {
     return fail(state, "insufficient-strength", "该地形需要留下 1 点留守游兵，至少需要 2 点才能离开。");
   }
@@ -511,6 +517,7 @@ function moveUnit(
   applyDepartureExhaustion(
     draft,
     continuationUnitId,
+    sourceCell.id,
     requireTerrain(terrains, sourceCell.terrainId),
     destinationTerrain,
     events
@@ -558,8 +565,10 @@ function attackUnit(
   }
 
   const movesIntoTarget = attackCapability.config?.movesIntoTarget !== false;
+  const sourceTerrain = requireTerrain(terrains, sourceCell.terrainId);
   const departureGarrison = movesIntoTarget
-    ? getDepartureGarrison(requireTerrain(terrains, sourceCell.terrainId))
+    && hasCellTrigger(state, sourceCell.id, "leave", CAPABILITY.departureGarrison, sourceTerrain)
+    ? getDepartureGarrison(sourceTerrain)
     : undefined;
   if (departureGarrison && attacker.strength <= departureGarrison.strength) {
     return fail(state, "insufficient-strength", "该地形需要留下 1 点留守游兵，至少需要 2 点才能离开。");
@@ -584,7 +593,7 @@ function attackUnit(
   if (departureGarrison) {
     leaveDepartureGarrison(draft, sourceCell.id, attacker, departureGarrison, units, events);
   }
-  applyCounterattack(draft, defender.id, continuationUnitId, units, events);
+  applyCounterattack(draft, defender.id, continuationUnitId, terrains, units, events);
   if (continuationUnitId && !draft.units[continuationUnitId]) continuationUnitId = undefined;
 
   // Melee already incorporates the action strength into its casualty result.
@@ -764,6 +773,7 @@ function applyCounterattack(
   draft: Draft,
   defenderId: UnitId,
   attackerId: UnitId | undefined,
+  terrains: TerrainCatalog,
   units: UnitCatalog,
   events: GameEvent[]
 ): void {
@@ -775,7 +785,12 @@ function applyCounterattack(
   if (!definition || !hasUnitCapability(definition, UNIT_CAPABILITY.counterattack)) return;
 
   const used = draft.turn.counterattacksUsed[defender.id] ?? 0;
-  const limit = getConfiguredMax(definition, UNIT_CAPABILITY.counterattackLimit, "maxPerActionPhase") ?? 1;
+  const defendingCell = draft.cells[defender.cellId];
+  if (!defendingCell) return;
+  const terrain = requireTerrain(terrains, defendingCell.terrainId);
+  // Terrain can suppress or extend the unit's reaction, but cannot grant
+  // counterattack to a unit without the corresponding unit capability.
+  const limit = getCounterattackLimit(terrain, definition);
   if (used >= limit) return;
 
   draft.turn = {
@@ -795,6 +810,14 @@ function applyCounterattack(
   events.push({ type: "unit-counterattacked", message: "防守单位发动反击，进攻单位被消灭。" });
 }
 
+/** A terrain's reaction limit overrides the unit's ordinary fallback limit. */
+function getCounterattackLimit(terrain: TerrainSpec, unit: UnitSpec): number {
+  const configured = getTerrainCapability(terrain, CAPABILITY.counterattackTerrainLimit)?.config?.maxPerActionPhase;
+  if (configured === "unlimited") return Number.POSITIVE_INFINITY;
+  if (typeof configured === "number" && Number.isInteger(configured) && configured >= 0) return configured;
+  return getConfiguredMax(unit, UNIT_CAPABILITY.counterattackLimit, "maxPerActionPhase") ?? 1;
+}
+
 function applyAdjacentHostileExhaustion(
   draft: Draft,
   arrivingUnit: UnitState,
@@ -804,9 +827,19 @@ function applyAdjacentHostileExhaustion(
   const cell = draft.cells[arrivingUnit.cellId];
   if (!cell) return;
 
-  for (const neighbour of getHexNeighbours(cell.coordinate, draft.state.board)) {
-    const neighbourId = toCellId(neighbour);
-    const strongholdCell = draft.cells[neighbourId];
+  // Maps loaded by core-content carry a precompiled inbound-link index, so a
+  // move reads only relationships attached to the arrival cell. The geometric
+  // fallback supports older snapshots and hand-built states which predate the
+  // index; it can be removed once those snapshots are no longer accepted.
+  const links = draft.state.cellTriggers?.[cell.id]?.enter
+    ?? getHexNeighbours(cell.coordinate, draft.state.board).map((neighbour) => ({
+      relatedCellId: toCellId(neighbour),
+      relationId: CAPABILITY.hostileExhaustion
+    }));
+  for (const link of links) {
+    if (link.relationId !== CAPABILITY.hostileExhaustion) continue;
+    if (!link.relatedCellId) continue;
+    const strongholdCell = draft.cells[link.relatedCellId];
     const owner = strongholdCell?.unitId ? draft.units[strongholdCell.unitId] : undefined;
     if (!strongholdCell || !owner || areSameTeam(draft.state, arrivingUnit.ownerId, owner.ownerId)) {
       continue;
@@ -817,7 +850,6 @@ function applyAdjacentHostileExhaustion(
     if (exhaustUnitForCurrentPhase(draft, arrivingUnit.id)) {
       events.push({ type: "unit-exhausted", message: "单位进入敌方据点封锁区，本回合失去行动力。" });
     }
-    return;
   }
 }
 
@@ -825,11 +857,13 @@ function applyAdjacentHostileExhaustion(
 function applyDepartureExhaustion(
   draft: Draft,
   unitId: UnitId | undefined,
+  sourceCellId: CellId,
   sourceTerrain: TerrainSpec,
   destinationTerrain: TerrainSpec,
   events: GameEvent[]
 ): void {
   if (!unitId || !draft.units[unitId]) return;
+  if (!hasCellTrigger(draft.state, sourceCellId, "leave", CAPABILITY.departureExhaustion, sourceTerrain)) return;
   const capability = getTerrainCapability(sourceTerrain, CAPABILITY.departureExhaustion);
   if (!capability) return;
   const destinationTerrainIdNot = capability.config?.destinationTerrainIdNot;
@@ -907,6 +941,24 @@ function getDepartureGarrison(terrain: TerrainSpec): DepartureGarrison | undefin
 }
 
 /**
+ * Mod/map triggers are precompiled per cell by the map loader. Older manually
+ * constructed states have no trigger index, so they retain capability-based
+ * behavior until their snapshot is refreshed from map code.
+ */
+function hasCellTrigger(
+  state: GameState,
+  cellId: CellId,
+  phase: "enter" | "leave",
+  relationId: string,
+  fallbackTerrain?: TerrainSpec
+): boolean {
+  if (state.cellTriggers) {
+    return state.cellTriggers[cellId]?.[phase].some((trigger) => trigger.relationId === relationId) ?? false;
+  }
+  return fallbackTerrain ? hasTerrainCapability(fallbackTerrain, relationId) : false;
+}
+
+/**
  * Called only after a move or moving attack has vacated the source cell. The
  * generated resident is immediately exhausted, so it visibly occupies the
  * terrain but cannot be selected for another action in this action phase.
@@ -964,7 +1016,7 @@ function grantReinforcementIncome(
       income += poweredIncome;
     }
     const terrain = requireTerrain(terrains, cell.terrainId);
-    const source = getTerrainCapability(terrain, CAPABILITY.income);
+    const source = getMatchTerrainCapability(draftState, terrain, CAPABILITY.income);
     if (!source?.config) continue;
     const amount = source.config.amount;
     const requires = source.config.requires;

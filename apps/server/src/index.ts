@@ -48,10 +48,10 @@ export class PvpRelayRoom extends RelayRoom {
     const wasHost = client.sessionId === this.hostSessionId;
     this.accounts.delete(client.sessionId);
     await super.onLeave(client, code);
-    if (wasHost && !this.hostSessionId) {
+    if (wasHost) {
       const nextHost = this.clients[0];
+      this.hostSessionId = nextHost?.sessionId;
       if (nextHost) {
-        this.hostSessionId = nextHost.sessionId;
         this.broadcast("room-host", { sessionId: this.hostSessionId });
       }
     }

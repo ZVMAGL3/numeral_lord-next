@@ -203,6 +203,9 @@ importers:
       '@numeral-lord/game-core':
         specifier: workspace:*
         version: link:../../packages/game-core
+      '@numeral-lord/oil-field-mod':
+        specifier: workspace:*
+        version: link:../../packages/oil-field-mod
       pixi.js:
         specifier: 8.21.0
         version: 8.21.0

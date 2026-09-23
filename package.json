@@ -1,0 +1,20 @@
+{
+  "name": "numeral-lord-next",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@12.5.1",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "pnpm --parallel --stream dev",
+    "dev:web": "pnpm --filter @numeral-lord/web dev",
+    "dev:server": "pnpm --filter @numeral-lord/server dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

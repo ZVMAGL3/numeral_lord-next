@@ -14,32 +14,48 @@ export { getLegalIntents };
 /** Relay metadata used by the browser to keep player ownership deterministic. */
 export class PvpRelayRoom extends RelayRoom {
   private hostSessionId: string | undefined;
-  private readonly playerIds = new Map<string, string>();
+  private readonly accounts = new Map<string, { accountId: string; playerId: string; displayName: string }>();
+
+  private broadcastMembers(): void {
+    this.broadcast("room-members", {
+      members: [...this.accounts.entries()].map(([sessionId, account]) => ({ sessionId, ...account }))
+    });
+  }
 
   override onJoin(client: Client, options: Record<string, unknown> = {}): void {
     super.onJoin(client, options);
     const seat = this.clients.findIndex((candidate) => candidate.sessionId === client.sessionId);
     const playerId = `player-${Math.max(1, seat + 1)}`;
-    this.playerIds.set(client.sessionId, playerId);
+    const requestedAccountId = typeof options.accountId === "string" ? options.accountId.trim() : "";
+    const requestedName = typeof options.name === "string" ? options.name.trim() : "";
+    const account = {
+      accountId: requestedAccountId || `guest-${playerId}`,
+      playerId,
+      displayName: requestedName || `玩家 ${seat + 1}`
+    };
+    this.accounts.set(client.sessionId, account);
     if (!this.hostSessionId) this.hostSessionId = client.sessionId;
 
     client.send("room-role", {
-      playerId,
+      ...account,
       isHost: client.sessionId === this.hostSessionId
     });
     this.broadcast("room-host", { sessionId: this.hostSessionId });
+    this.broadcastMembers();
   }
 
   override async onLeave(client: Client, code: number): Promise<void> {
     const wasHost = client.sessionId === this.hostSessionId;
-    this.playerIds.delete(client.sessionId);
+    this.accounts.delete(client.sessionId);
     await super.onLeave(client, code);
-    if (!wasHost || this.hostSessionId) return;
-    const nextHost = this.clients[0];
-    if (nextHost) {
-      this.hostSessionId = nextHost.sessionId;
-      this.broadcast("room-host", { sessionId: this.hostSessionId });
+    if (wasHost && !this.hostSessionId) {
+      const nextHost = this.clients[0];
+      if (nextHost) {
+        this.hostSessionId = nextHost.sessionId;
+        this.broadcast("room-host", { sessionId: this.hostSessionId });
+      }
     }
+    this.broadcastMembers();
   }
 }
 

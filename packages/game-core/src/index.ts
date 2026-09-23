@@ -2,6 +2,7 @@ export * from "./commands.js";
 export * from "./content.js";
 export * from "./engine.js";
 export * from "./hex.js";
+export * from "./lobby.js";
 export * from "./notation.js";
 export * from "./simulation.js";
 export * from "./state.js";

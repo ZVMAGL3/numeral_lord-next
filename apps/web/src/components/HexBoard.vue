@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Application, Assets, Graphics, Rectangle, Sprite, Text } from "pixi.js";
+import { Application, Assets, Graphics, Rectangle, Sprite, Text, type Texture } from "pixi.js";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { CellId, GameState, UnitId } from "@numeral-lord/game-core";
 
@@ -9,6 +9,8 @@ const props = defineProps<{
   legalActionCellIds: readonly CellId[];
   actionableUnitIds: readonly UnitId[];
   poweredUnitIds: readonly UnitId[];
+  /** Read-only compact rendering used by the lobby map preview. */
+  preview?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -39,13 +41,15 @@ const terrainColors: Record<string, number> = {
   "core/plain": 0x63985d, "core/stronghold": 0x63985d, "mod/oil-field": 0x9a6338
 };
 /** Original project artwork, kept as separate terrain / unit / stronghold layers. */
+const legacyAssetUrl = (fileName: string): string => `${import.meta.env.BASE_URL}legacy/${fileName}`;
 const legacyTextureUrls = {
-  plain: "/legacy/TS0.png",
-  water: "/legacy/TS_Water.png",
-  mountain: "/legacy/TS_Mountain.png",
-  stronghold: "/legacy/TS_Stronghold.png",
-  oilField: "/legacy/TSF.png"
+  plain: legacyAssetUrl("TS0.png"),
+  water: legacyAssetUrl("TS_Water.png"),
+  mountain: legacyAssetUrl("TS_Mountain.png"),
+  stronghold: legacyAssetUrl("TS_Stronghold.png"),
+  oilField: legacyAssetUrl("TSF.png")
 } as const;
+const loadedLegacyTextures = new Map<string, Texture>();
 const oilFieldTerrainId = "mod/oil-field";
 
 onMounted(async () => {
@@ -64,13 +68,18 @@ onMounted(async () => {
   // promise. Do not continue touching an instance already disposed below.
   if (app !== instance || !canvasHost.value) return;
   instance.stage.sortableChildren = true;
-  instance.stage.eventMode = "static";
+  instance.stage.eventMode = props.preview ? "none" : "static";
   instance.stage.hitArea = instance.screen;
-  instance.stage.on("pointertap", onBoardBackgroundTap);
+  if (!props.preview) instance.stage.on("pointertap", onBoardBackgroundTap);
   host.appendChild(instance.canvas);
-  // Preload before drawing. Sprite.from() then reuses Pixi's cache on every state update.
+  // Keep the resolved Texture objects: repeated redraws must not ask Pixi to
+  // resolve the same URL again (which also avoids noisy cache-miss warnings).
   try {
-    await Assets.load(Object.values(legacyTextureUrls));
+    const loaded = await Promise.all(Object.values(legacyTextureUrls).map(async (url) => [
+      url,
+      await Assets.load<Texture>(url)
+    ] as const));
+    for (const [url, texture] of loaded) loadedLegacyTextures.set(url, texture);
   } catch (error) {
     // A missing optional sprite must not remove the rule board. The terrain
     // fills are drawn below the artwork, so the board remains usable while a
@@ -80,8 +89,10 @@ onMounted(async () => {
   if (app !== instance || !canvasHost.value) return;
   observer = new ResizeObserver(() => draw());
   observer.observe(host);
-  pulseTick = () => updateActionPulses(performance.now());
-  instance.ticker.add(pulseTick);
+  if (!props.preview) {
+    pulseTick = () => updateActionPulses(performance.now());
+    instance.ticker.add(pulseTick);
+  }
   draw();
 });
 onBeforeUnmount(() => {
@@ -116,7 +127,9 @@ function draw(): void {
   app.stage.hitArea = new Rectangle(0, 0, width, height);
   const { columns, rows } = props.state.board;
   const horizontalUnit = Math.sqrt(3);
-  const radius = Math.max(21, Math.min((width - 44) / (horizontalUnit * (columns + 0.5)), (height - 44) / (1.5 * (rows - 1) + 2)));
+  const padding = props.preview ? 14 : 44;
+  const minimumRadius = props.preview ? 5 : 21;
+  const radius = Math.max(minimumRadius, Math.min((width - padding) / (horizontalUnit * (columns + 0.5)), (height - padding) / (1.5 * (rows - 1) + 2)));
   const boardWidth = horizontalUnit * radius * (columns + 0.5);
   const boardHeight = 2 * radius + 1.5 * radius * (rows - 1);
   const offsetX = (width - boardWidth) / 2 + horizontalUnit * radius / 2;
@@ -139,7 +152,8 @@ function draw(): void {
     const tile = new Graphics().poly(hexagon(x, y, radius * 0.98))
       .fill({ color: 0xffffff, alpha: 0.001 })
       .stroke({ color: legalActions.value.has(cell.id) ? 0x67e8f9 : 0x8ba2c1, width: legalActions.value.has(cell.id) ? 3 : 1, alpha: legalActions.value.has(cell.id) ? 1 : 0.45 });
-    bindCellInteraction(tile, cell.id);
+    if (props.preview) tile.eventMode = "none";
+    else bindCellInteraction(tile, cell.id);
     app.stage.addChild(tile);
 
     const unit = cell.unitId ? props.state.units[cell.unitId] : undefined;
@@ -163,7 +177,7 @@ function draw(): void {
       addLegacySprite(legacyTextureUrls.stronghold, x, y, radius, 0.98);
     }
 
-    if (unit && actionableUnits.value.has(unit.id)) {
+    if (!props.preview && unit && actionableUnits.value.has(unit.id)) {
       const pulse = new Graphics();
       pulse.eventMode = "none";
       // Overlay the whole board: later cells must not cover an expanding ring.
@@ -263,7 +277,8 @@ function addLegacySprite(
   tint?: number,
   alpha = 1
 ): Sprite {
-  const sprite = Sprite.from(textureUrl);
+  const texture = loadedLegacyTextures.get(textureUrl);
+  const sprite = texture ? new Sprite({ texture }) : Sprite.from(textureUrl);
   sprite.anchor.set(0.5);
   sprite.width = Math.sqrt(3) * radius * scale;
   sprite.height = 2 * radius * scale;
@@ -315,9 +330,10 @@ function hexagon(centerX: number, centerY: number, radius: number): number[] {
 }
 </script>
 
-<template><div ref="canvasHost" class="board-canvas" aria-label="本地战棋演示地图" /></template>
+<template><div ref="canvasHost" class="board-canvas" :class="{ preview }" :aria-label="preview ? '当前地图预览' : '本地战棋演示地图'" /></template>
 
 <style scoped>
 .board-canvas { width: 100%; height: 100%; min-height: 390px; overflow: hidden; border: 1px solid rgba(160, 191, 223, .42); border-radius: 20px; background: #182638; }
+.board-canvas.preview { min-height: 0; border-radius: 12px; pointer-events: none; }
 .board-canvas :deep(canvas) { display: block; width: 100%; height: 100%; }
 </style>

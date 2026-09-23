@@ -42,7 +42,13 @@ function terrainFromLegacyCode(code: string): string {
  * A data-only fixture for manual preview, rule tests, and headless agents.
  * It deliberately imports no browser, Vue, or Pixi code.
  */
-export function createDemoMatch(): GameState {
+export interface DemoMatchOptions {
+  /** Map player ids that actually entered from the room; omitted seats start dead. */
+  readonly activePlayerIds?: readonly PlayerId[];
+  readonly friendlyFire?: boolean;
+}
+
+export function createDemoMatch(options: DemoMatchOptions = {}): GameState {
   // This map explicitly installs the optional oil-field Mod alongside the
   // native terrain pack. Other maps can omit it and never know this terrain.
   const terrainCatalog = { ...coreTerrainCatalog, ...oilFieldTerrainCatalog };
@@ -63,12 +69,16 @@ export function createDemoMatch(): GameState {
   }
 
   const legacyPlayers = [playerOne, playerTwo] as const;
+  const activePlayerIds = new Set(options.activePlayerIds ?? legacyPlayers);
   const units: Record<UnitId, NonNullable<GameState["units"][UnitId]>> = {};
   for (const [index, legacyPlayer, strength] of legacyDemoMap.soldiers) {
     const row = Math.floor(index / columns);
     const column = index % columns;
     const ownerId = legacyPlayers[legacyPlayer];
     if (!ownerId) throw new Error(`Legacy demo map has unknown player number: ${legacyPlayer}`);
+    // The map slot remains addressable, but an unassigned room slot starts
+    // with no army and is therefore already eliminated for rule purposes.
+    if (!activePlayerIds.has(ownerId)) continue;
     const id = unitId(`${legacyPlayer === 0 ? "red" : "blue"}-${index}`);
     units[id] = {
       id,
@@ -88,11 +98,17 @@ export function createDemoMatch(): GameState {
     sequence: 0,
     board: { columns, rows },
     settings: {
-      friendlyFire: false,
+      friendlyFire: options.friendlyFire ?? false,
       // 地图显式选择模块；这不是前端 if，也不是据点的硬编码继承逻辑。
       matchConditionIds: ["core/lose-all-survival-anchors", "core/last-team-standing"]
     },
-    turn: { phase: "action", currentPlayerId: playerOne, round: 1, exhaustedUnitIds: [], counterattacksUsed: {} },
+    turn: {
+      phase: "action",
+      currentPlayerId: legacyPlayers.find((playerId) => activePlayerIds.has(playerId)) ?? playerOne,
+      round: 1,
+      exhaustedUnitIds: [],
+      counterattacksUsed: {}
+    },
     cells,
     units,
     players: {

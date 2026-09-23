@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { coreMatchConditionCatalog } from "../../core-content/src/match-conditions.js";
-import { applyCommand, getActionableUnitIds, getLegalActionDestinationIds, getPoweredUnitIds, startMatch } from "./engine.js";
+import { applyCommand, finishMatch, getActionableUnitIds, getLegalActionDestinationIds, getPoweredUnitIds, startMatch } from "./engine.js";
 import { applyIntent, getLegalIntents } from "./simulation.js";
 import type { TerrainCatalog, UnitCatalog } from "./content.js";
 import { toCellId } from "./hex.js";
@@ -130,6 +130,39 @@ describe("core turn rules", () => {
     type: "attack-unit" as const, commandId: "siege", actorId: p2, expectedSequence: 0,
     unitId: id("p2-home"), targetId: toCellId({ column: 0, row: 1 })
   };
+
+  it("rejects unknown command types instead of returning undefined", () => {
+    const state = fixture();
+    const result = applyCommand(state, {
+      type: "install-mod-at-runtime",
+      commandId: "unknown-command",
+      actorId: p1,
+      expectedSequence: state.sequence
+    }, terrains, unitCatalog);
+
+    expect(result).toEqual({
+      accepted: false,
+      state,
+      error: {
+        code: "unknown-command",
+        message: "无法识别操作类型：install-mod-at-runtime"
+      }
+    });
+  });
+
+  it.each([
+    null,
+    [],
+    { type: "move-unit", commandId: "missing-fields", actorId: p1, expectedSequence: 0 },
+    { type: "end-action-phase", commandId: "bad-sequence", actorId: p1, expectedSequence: "0" }
+  ])("rejects malformed runtime command %# without throwing", malformedCommand => {
+    const state = fixture();
+    const result = applyCommand(state, malformedCommand, terrains, unitCatalog);
+
+    expect(result.accepted).toBe(false);
+    expect(result.state).toBe(state);
+    if (!result.accepted) expect(result.error.code).toBe("invalid-command");
+  });
 
   it("deducts power-loss strength immediately and only once", () => {
     const state = siegeState(3);
@@ -673,5 +706,15 @@ describe("core turn rules", () => {
     expect(result.events.map((event) => event.type)).toEqual(expect.arrayContaining([
       "unit-reinforced", "reinforcement-phase-ended", "turn-started"
     ]));
+  });
+
+  it("lets an external room clock finish a match through the headless core", () => {
+    const state = fixture();
+    const finished = finishMatch(state, "局时耗尽，本局结束。");
+
+    expect(finished.sequence).toBe(state.sequence + 1);
+    expect(finished.turn.phase).toBe("finished");
+    expect(finished.result).toEqual({ winningTeamIds: [], message: "局时耗尽，本局结束。" });
+    expect(finishMatch(finished, "不能覆盖")).toBe(finished);
   });
 });

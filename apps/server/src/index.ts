@@ -1,7 +1,16 @@
-import { applyIntent, getLegalIntents } from "@numeral-lord/game-core/node";
+import {
+  DEFAULT_LOBBY_SETTINGS,
+  MAX_ROOM_CAPACITY,
+  applyIntent,
+  getLegalIntents
+} from "@numeral-lord/game-core/node";
 import type {
   GameIntent,
   GameState,
+  LobbyMember,
+  LobbyRoomState,
+  LobbySettings,
+  MatchStartPayload,
   MatchConditionCatalog,
   TerrainCatalog,
   UnitCatalog
@@ -11,76 +20,457 @@ import { pathToFileURL } from "node:url";
 
 export { getLegalIntents };
 
+interface MutableLobbyMember {
+  sessionId: string;
+  accountId: string;
+  displayName: string;
+  connected: boolean;
+  seat: number | null;
+  participating: boolean;
+  ready: boolean;
+  joinOrder: number;
+}
+
+interface CachedHostSnapshot {
+  readonly payload: Record<string, unknown>;
+  readonly sequence: number;
+}
+
+interface RoomCreateOptions {
+  allowReconnectionTime?: number;
+  mapPlayerCount?: number;
+  maxClients?: number;
+  metadata?: unknown;
+}
+
 /** Relay metadata used by the browser to keep player ownership deterministic. */
 export class PvpRelayRoom extends RelayRoom {
-  private hostSessionId: string | undefined;
-  private readonly accounts = new Map<string, { accountId: string; playerId: string; displayName: string }>();
+  private static readonly ROOM_SYNC_COOLDOWN_MS = 750;
 
-  override onCreate(options: {
-    maxClients?: number;
-    allowReconnectionTime?: number;
-    metadata?: unknown;
-  }): void {
-    if (options.maxClients) this.maxClients = options.maxClients;
+  private hostSessionId: string | undefined;
+  /**
+   * A newly elected host is only authoritative after the server has queued
+   * the cached board state to that socket. This prevents a stale local board
+   * from winning the host-migration race.
+   */
+  private authoritativeHostSessionId: string | undefined;
+  private readonly members = new Map<string, MutableLobbyMember>();
+  private readonly lastRoomSyncAtBySession = new Map<string, number>();
+  private phase: LobbyRoomState["phase"] = "lobby";
+  private mapPlayerCount = 2;
+  private settings: LobbySettings = DEFAULT_LOBBY_SETTINGS;
+  private matchStartedAtEpochMs: number | null = null;
+  private nextJoinOrder = 0;
+  private latestHostSnapshot: CachedHostSnapshot | undefined;
+
+  override onCreate(options: RoomCreateOptions): void {
+    this.mapPlayerCount = clampInteger(options.mapPlayerCount, 1, MAX_ROOM_CAPACITY, 2);
+    this.settings = { ...DEFAULT_LOBBY_SETTINGS };
+    this.maxClients = MAX_ROOM_CAPACITY;
     if (options.allowReconnectionTime) {
       this.allowReconnectionTime = Math.min(options.allowReconnectionTime, 40);
     }
-    if (options.metadata) this.setMetadata(options.metadata);
+    this.setMetadata({
+      ...(typeof options.metadata === "object" && options.metadata ? options.metadata : {}),
+      mapPlayerCount: this.mapPlayerCount
+    });
 
-    // Only the two game transport messages are relayed. The server does not
-    // interpret game rules, but it does bind a command to the sender's seat
-    // and rejects snapshots from anyone other than the current host.
+    // The server owns room membership and setup, while game-core remains the
+    // authority for board rules in the host client.
     this.onMessage("player-intent", (client, payload: Record<string, unknown> = {}) => {
-      const account = this.accounts.get(client.sessionId);
-      if (!account) return;
-      this.broadcast("player-intent", { ...payload, playerId: account.playerId }, { except: client });
+      const member = this.members.get(client.sessionId);
+      if (this.phase !== "playing" || this.authoritativeHostSessionId !== this.hostSessionId
+        || !member?.participating || member.seat === null) return;
+      const playerId = playerIdForSeat(member.seat);
+      const command = isRecord(payload.command)
+        ? { ...payload.command, actorId: playerId }
+        : payload.command;
+      this.broadcast("player-intent", { ...payload, command, playerId }, { except: client });
     });
     this.onMessage("host-snapshot", (client, payload: Record<string, unknown> = {}) => {
-      if (client.sessionId !== this.hostSessionId) return;
+      if (this.phase !== "playing" || client.sessionId !== this.hostSessionId
+        || client.sessionId !== this.authoritativeHostSessionId) return;
+      const snapshot = this.validateSnapshot(payload);
+      if (!snapshot) return;
+      this.latestHostSnapshot = snapshot;
       this.broadcast("host-snapshot", payload, { except: client });
+    });
+    this.onMessage("lobby-ready", (client, payload: Record<string, unknown> = {}) => {
+      const member = this.members.get(client.sessionId);
+      if (this.phase !== "lobby" || !member?.participating) return;
+      member.ready = payload.ready === true;
+      this.broadcastRoomState();
+      this.startWhenReady();
+    });
+    this.onMessage("lobby-settings", (client, payload: Record<string, unknown> = {}) => {
+      if (this.phase !== "lobby" || client.sessionId !== this.hostSessionId) return;
+      this.updateSettings(client, payload);
+    });
+    this.onMessage("lobby-seat", (client, payload: Record<string, unknown> = {}) => {
+      if (this.phase !== "lobby") return;
+      const member = this.members.get(client.sessionId);
+      if (!member) return;
+      this.chooseSeat(client, member, payload.seat);
+    });
+    this.onMessage("lobby-participation", (client, payload: Record<string, unknown> = {}) => {
+      if (this.phase !== "lobby") return;
+      const member = this.members.get(client.sessionId);
+      if (!member) return;
+      this.chooseParticipation(client, member, payload.participating === true);
+    });
+    this.onMessage("lobby-assign", (client, payload: Record<string, unknown> = {}) => {
+      if (this.phase !== "lobby" || client.sessionId !== this.hostSessionId) return;
+      this.assignMember(client, payload);
+    });
+    this.onMessage("room-sync", (client) => {
+      if (!this.members.has(client.sessionId)) return;
+      const now = Date.now();
+      const lastSyncAt = this.lastRoomSyncAtBySession.get(client.sessionId);
+      if (lastSyncAt !== undefined && now - lastSyncAt < PvpRelayRoom.ROOM_SYNC_COOLDOWN_MS) return;
+      this.lastRoomSyncAtBySession.set(client.sessionId, now);
+
+      // During host takeover the snapshot must be delivered before room-role
+      // tells the browser it may act as host. WebSocket message ordering then
+      // makes the handoff deterministic without any broadcast request storm.
+      if (this.phase === "playing" && client.sessionId === this.hostSessionId
+        && client.sessionId !== this.authoritativeHostSessionId) {
+        if (!this.sendCachedSnapshot(client)) return;
+        this.authoritativeHostSessionId = client.sessionId;
+      }
+      this.sendClientContext(client);
+      if (this.phase === "playing" && client.sessionId !== this.hostSessionId) {
+        if (!this.sendCachedSnapshot(client)) this.requestHostSnapshot(client.sessionId);
+      }
     });
   }
 
-  private broadcastMembers(): void {
-    this.broadcast("room-members", {
-      members: [...this.accounts.entries()].map(([sessionId, account]) => ({ sessionId, ...account }))
+  private validateSnapshot(payload: Record<string, unknown>): CachedHostSnapshot | undefined {
+    const state = payload.state;
+    const sequence = isRecord(state) ? state.sequence : undefined;
+    if (typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence < 0) return;
+    if (this.latestHostSnapshot && sequence < this.latestHostSnapshot.sequence) return;
+    return { payload, sequence };
+  }
+
+  private sendCachedSnapshot(client: Client): boolean {
+    if (!this.latestHostSnapshot) return false;
+    client.send("host-snapshot", this.latestHostSnapshot.payload);
+    return true;
+  }
+
+  private requestHostSnapshot(sessionId: string): void {
+    const host = this.clients.find((candidate) => candidate.sessionId === this.hostSessionId);
+    if (host) host.send("snapshot-request", { sessionId });
+  }
+
+  private roomState(): LobbyRoomState {
+    const members = [...this.members.values()]
+      .sort((left, right) => {
+        if (left.participating !== right.participating) return left.participating ? -1 : 1;
+        if (left.participating && !this.settings.randomizePositions && left.seat !== right.seat) {
+          return (left.seat ?? Number.MAX_SAFE_INTEGER) - (right.seat ?? Number.MAX_SAFE_INTEGER);
+        }
+        return left.joinOrder - right.joinOrder;
+      })
+      .map((member): LobbyMember => ({
+        sessionId: member.sessionId,
+        accountId: member.accountId,
+        displayName: member.displayName,
+        connected: member.connected,
+        isHost: member.sessionId === this.hostSessionId,
+        seat: member.seat,
+        participating: member.participating,
+        ready: member.ready
+      }));
+    return {
+      phase: this.phase,
+      mapPlayerCount: this.mapPlayerCount,
+      settings: this.settings,
+      members,
+      ...(this.matchStartedAtEpochMs === null ? {} : { startedAtEpochMs: this.matchStartedAtEpochMs })
+    };
+  }
+
+  private broadcastRoomState(): void {
+    for (const client of this.clients) {
+      this.sendClientRole(client);
+    }
+    this.broadcast("room-state", this.roomState());
+  }
+
+  private sendClientContext(client: Client): void {
+    this.sendClientRole(client);
+    client.send("room-state", this.roomState());
+    client.send("room-host", { sessionId: this.hostSessionId });
+  }
+
+  private sendClientRole(client: Client): void {
+    const member = this.members.get(client.sessionId);
+    if (!member) return;
+    client.send("room-role", {
+      ...this.publicMember(member),
+      ...(member.seat === null ? {} : { playerId: playerIdForSeat(member.seat) })
     });
+  }
+
+  private publicMember(member: MutableLobbyMember): LobbyMember {
+    return {
+      sessionId: member.sessionId,
+      accountId: member.accountId,
+      displayName: member.displayName,
+      connected: member.connected,
+      isHost: member.sessionId === this.hostSessionId,
+      seat: member.seat,
+      participating: member.participating,
+      ready: member.ready
+    };
   }
 
   override onJoin(client: Client, options: Record<string, unknown> = {}): void {
     super.onJoin(client, options);
-    const seat = this.clients.findIndex((candidate) => candidate.sessionId === client.sessionId);
-    const playerId = `player-${Math.max(1, seat + 1)}`;
     const requestedAccountId = typeof options.accountId === "string" ? options.accountId.trim() : "";
     const requestedName = typeof options.name === "string" ? options.name.trim() : "";
-    const account = {
-      accountId: requestedAccountId || `guest-${playerId}`,
-      playerId,
-      displayName: requestedName || `玩家 ${seat + 1}`
+    const previous = requestedAccountId
+      ? [...this.members.values()].find((member) => member.accountId === requestedAccountId)
+      : undefined;
+    if (previous) {
+      const oldSessionId = previous.sessionId;
+      this.members.delete(oldSessionId);
+      this.lastRoomSyncAtBySession.delete(oldSessionId);
+      previous.sessionId = client.sessionId;
+      previous.displayName = requestedName || previous.displayName;
+      previous.connected = true;
+      this.members.set(client.sessionId, previous);
+      if (this.hostSessionId === oldSessionId) {
+        this.hostSessionId = client.sessionId;
+        // The replacement host first receives the last accepted board.
+        // Until then it cannot submit a new authoritative snapshot.
+        this.authoritativeHostSessionId = this.phase === "playing" ? undefined : client.sessionId;
+      }
+      this.broadcastRoomState();
+      this.broadcast("room-host", { sessionId: this.hostSessionId });
+      return;
+    }
+    const defaultSeat = this.phase === "lobby" && !this.settings.randomizePositions
+      ? this.firstOpenSeat()
+      : null;
+    const canParticipate = this.phase === "lobby"
+      && (this.settings.randomizePositions ? this.participantCount() < this.mapPlayerCount : defaultSeat !== null);
+    const member: MutableLobbyMember = {
+      sessionId: client.sessionId,
+      accountId: requestedAccountId || `guest-${client.sessionId.slice(0, 6)}`,
+      displayName: requestedName || `玩家 ${this.nextJoinOrder + 1}`,
+      connected: true,
+      seat: canParticipate ? defaultSeat : null,
+      participating: canParticipate,
+      ready: false,
+      joinOrder: this.nextJoinOrder++
     };
-    this.accounts.set(client.sessionId, account);
+    this.members.set(client.sessionId, member);
     if (!this.hostSessionId) this.hostSessionId = client.sessionId;
-
-    client.send("room-role", {
-      ...account,
-      isHost: client.sessionId === this.hostSessionId
-    });
+    this.broadcastRoomState();
     this.broadcast("room-host", { sessionId: this.hostSessionId });
-    this.broadcastMembers();
   }
 
   override async onLeave(client: Client, code: number): Promise<void> {
+    const member = this.members.get(client.sessionId);
     const wasHost = client.sessionId === this.hostSessionId;
-    this.accounts.delete(client.sessionId);
-    await super.onLeave(client, code);
-    if (wasHost) {
-      const nextHost = this.clients[0];
-      this.hostSessionId = nextHost?.sessionId;
-      if (nextHost) {
-        this.broadcast("room-host", { sessionId: this.hostSessionId });
-      }
+    if (member) {
+      member.connected = false;
+      member.ready = false;
+      this.broadcastRoomState();
     }
-    this.broadcastMembers();
+    await super.onLeave(client, code);
+    const reconnected = this.clients.some((candidate) => candidate.sessionId === client.sessionId);
+    if (reconnected && member) {
+      member.connected = true;
+      this.broadcastRoomState();
+      return;
+    }
+    this.members.delete(client.sessionId);
+    this.lastRoomSyncAtBySession.delete(client.sessionId);
+    if (wasHost) {
+      this.hostSessionId = [...this.members.values()]
+        .filter((candidate) => candidate.connected)
+        .sort((left, right) => left.joinOrder - right.joinOrder)[0]?.sessionId;
+      this.authoritativeHostSessionId = undefined;
+      const nextHost = this.clients.find((candidate) => candidate.sessionId === this.hostSessionId);
+      if (nextHost && this.sendCachedSnapshot(nextHost)) {
+        this.authoritativeHostSessionId = nextHost.sessionId;
+      }
+      this.broadcast("room-host", { sessionId: this.hostSessionId });
+    }
+    this.broadcastRoomState();
+    // A disconnected participant may have been the only member preventing
+    // the remaining ready participants from starting. Once their reconnect
+    // window expires, re-evaluate the lobby with the smaller participant set.
+    this.startWhenReady();
+  }
+
+  private updateSettings(client: Client, payload: Record<string, unknown>): void {
+    const wasRandom = this.settings.randomizePositions;
+    this.settings = {
+      friendlyFire: typeof payload.friendlyFire === "boolean" ? payload.friendlyFire : this.settings.friendlyFire,
+      turnTimeSeconds: clampTimer(payload.turnTimeSeconds, 10, 300, this.settings.turnTimeSeconds),
+      matchTimeMinutes: clampTimer(payload.matchTimeMinutes, 5, 180, this.settings.matchTimeMinutes),
+      randomizePositions: typeof payload.randomizePositions === "boolean"
+        ? payload.randomizePositions
+        : this.settings.randomizePositions
+    };
+    if (wasRandom !== this.settings.randomizePositions) this.convertPositionMode();
+    this.resetReady();
+    this.setMetadata({
+      protocol: "host-authoritative-relay",
+      version: "0.2.0",
+      mapPlayerCount: this.mapPlayerCount
+    });
+    this.broadcastRoomState();
+  }
+
+  private convertPositionMode(): void {
+    const participants = [...this.members.values()]
+      .filter((member) => member.participating)
+      .sort((left, right) => left.joinOrder - right.joinOrder)
+      .slice(0, this.mapPlayerCount);
+    const selected = new Set(participants.map((member) => member.sessionId));
+    for (const member of this.members.values()) {
+      member.participating = selected.has(member.sessionId);
+      member.seat = this.settings.randomizePositions || !member.participating
+        ? null
+        : participants.findIndex((candidate) => candidate.sessionId === member.sessionId) + 1;
+    }
+  }
+
+  private chooseSeat(client: Client, member: MutableLobbyMember, requestedSeat: unknown): void {
+    if (this.settings.randomizePositions) {
+      this.sendError(client, "随机位置模式只能选择参战或观战。 ");
+      return;
+    }
+    if (requestedSeat === null) {
+      member.seat = null;
+      member.participating = false;
+      member.ready = false;
+      this.broadcastRoomState();
+      return;
+    }
+    const seat = Number(requestedSeat);
+    if (!Number.isInteger(seat) || seat < 1 || seat > this.mapPlayerCount) {
+      this.sendError(client, "该地图没有这个玩家位。 ");
+      return;
+    }
+    const occupied = [...this.members.values()].some((candidate) => candidate !== member && candidate.seat === seat);
+    if (occupied) {
+      this.sendError(client, `${seat} 号位已经有人。`);
+      return;
+    }
+    member.seat = seat;
+    member.participating = true;
+    member.ready = false;
+    this.broadcastRoomState();
+  }
+
+  private chooseParticipation(client: Client, member: MutableLobbyMember, participating: boolean): void {
+    if (!this.settings.randomizePositions) {
+      this.sendError(client, "固定位置模式请直接选择具体座位。 ");
+      return;
+    }
+    if (participating && !member.participating && this.participantCount() >= this.mapPlayerCount) {
+      this.sendError(client, "参战名额已满，可以先进入观战位。 ");
+      return;
+    }
+    member.participating = participating;
+    member.seat = null;
+    member.ready = false;
+    this.broadcastRoomState();
+  }
+
+  private assignMember(client: Client, payload: Record<string, unknown>): void {
+    const target = typeof payload.sessionId === "string" ? this.members.get(payload.sessionId) : undefined;
+    if (!target) {
+      this.sendError(client, "找不到要调整的房间成员。 ");
+      return;
+    }
+    if (this.settings.randomizePositions) {
+      this.chooseParticipation(client, target, payload.participating === true);
+      return;
+    }
+    if (payload.seat === null) {
+      target.seat = null;
+      target.participating = false;
+      target.ready = false;
+      this.broadcastRoomState();
+      return;
+    }
+    const seat = Number(payload.seat);
+    if (!Number.isInteger(seat) || seat < 1 || seat > this.mapPlayerCount) {
+      this.sendError(client, "该地图没有这个玩家位。 ");
+      return;
+    }
+    const previousSeat = target.seat;
+    const occupant = [...this.members.values()].find((candidate) => candidate !== target && candidate.seat === seat);
+    if (occupant) {
+      occupant.seat = previousSeat;
+      occupant.participating = previousSeat !== null;
+      occupant.ready = false;
+    }
+    target.seat = seat;
+    target.participating = true;
+    target.ready = false;
+    this.broadcastRoomState();
+  }
+
+  private startWhenReady(): void {
+    if (this.phase !== "lobby") return;
+    let participants = [...this.members.values()]
+      .filter((member) => member.participating);
+    if (participants.length === 0 || participants.length > this.mapPlayerCount
+      || participants.some((member) => !member.connected || !member.ready)) return;
+
+    if (this.settings.randomizePositions) {
+      participants = shuffle(participants);
+      const randomizedSeats = shuffle(Array.from({ length: this.mapPlayerCount }, (_, index) => index + 1));
+      participants.forEach((member, index) => { member.seat = randomizedSeats[index]!; });
+    } else {
+      const seats = new Set(participants.map((member) => member.seat));
+      if (seats.size !== participants.length || [...seats].some((seat) => seat === null)) return;
+      participants.sort((left, right) => (left.seat ?? 0) - (right.seat ?? 0));
+    }
+
+    this.phase = "playing";
+    this.matchStartedAtEpochMs = Date.now();
+    this.authoritativeHostSessionId = this.hostSessionId;
+    this.latestHostSnapshot = undefined;
+    const payload: MatchStartPayload = {
+      settings: this.settings,
+      startedAtEpochMs: this.matchStartedAtEpochMs,
+      assignments: participants.map((member) => ({
+        sessionId: member.sessionId,
+        seat: member.seat!,
+        playerId: playerIdForSeat(member.seat!)
+      }))
+    };
+    this.broadcastRoomState();
+    this.broadcast("match-start", payload);
+  }
+
+  private firstOpenSeat(): number | null {
+    const occupied = new Set([...this.members.values()].map((member) => member.seat));
+    for (let seat = 1; seat <= this.mapPlayerCount; seat += 1) {
+      if (!occupied.has(seat)) return seat;
+    }
+    return null;
+  }
+
+  private participantCount(): number {
+    return [...this.members.values()].filter((member) => member.participating).length;
+  }
+
+  private resetReady(): void {
+    for (const member of this.members.values()) member.ready = false;
+  }
+
+  private sendError(client: Client, message: string): void {
+    client.send("lobby-error", { message });
   }
 }
 
@@ -118,11 +508,12 @@ export function createGameServer(): Server {
   });
 
   gameServer.define("pvp", PvpRelayRoom, {
-    maxClients: 4,
+    maxClients: MAX_ROOM_CAPACITY,
     allowReconnectionTime: 30,
+    mapPlayerCount: 2,
     metadata: {
       protocol: "host-authoritative-relay",
-      version: "0.1.0"
+      version: "0.2.0"
     }
   });
   return gameServer;
@@ -139,4 +530,31 @@ export async function startServer(
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   void startServer();
+}
+
+function playerIdForSeat(seat: number): string {
+  return `player-${seat}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function clampInteger(value: unknown, minimum: number, maximum: number, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? Math.min(maximum, Math.max(minimum, parsed)) : fallback;
+}
+
+function clampTimer(value: unknown, minimum: number, maximum: number, fallback: number): number {
+  if (Number(value) === 0) return 0;
+  return clampInteger(value, minimum, maximum, fallback);
+}
+
+function shuffle<T>(values: readonly T[]): T[] {
+  const result = [...values];
+  for (let index = result.length - 1; index > 0; index -= 1) {
+    const target = Math.floor(Math.random() * (index + 1));
+    [result[index], result[target]] = [result[target]!, result[index]!];
+  }
+  return result;
 }

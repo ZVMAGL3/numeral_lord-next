@@ -63,7 +63,9 @@ export interface CommandFailure {
     | "friendly-target"
     | "insufficient-strength"
     | "insufficient-points"
-    | "unit-not-powered";
+    | "unit-not-powered"
+    | "invalid-command"
+    | "unknown-command";
   readonly message: string;
 }
 
@@ -153,11 +155,20 @@ const DEFAULT_MATCH_CONDITIONS: MatchConditionCatalog = {
 
 export function applyCommand(
   state: GameState,
-  command: GameCommand,
+  command: unknown,
   terrains: TerrainCatalog,
   units: UnitCatalog,
   matchConditions: MatchConditionCatalog = {}
 ): CommandResult {
+  if (!isRecord(command) || typeof command.type !== "string") {
+    return fail(state, "invalid-command", "操作数据格式不正确。");
+  }
+  if (!isKnownCommandType(command.type)) {
+    return fail(state, "unknown-command", `无法识别操作类型：${command.type}`);
+  }
+  if (!isWellFormedGameCommand(command)) {
+    return fail(state, "invalid-command", "操作缺少必需参数或参数类型不正确。");
+  }
   if (state.turn.phase === "finished") {
     return fail(state, "match-finished", "本局游戏已经结束。");
   }
@@ -188,6 +199,46 @@ export function applyCommand(
 }
 
 /**
+ * Commands can arrive from the network as arbitrary JSON even though trusted
+ * TypeScript callers see the GameCommand union. Validate that boundary here so
+ * every runtime input produces a CommandResult instead of throwing or falling
+ * through the switch with `undefined`.
+ */
+function isWellFormedGameCommand(command: unknown): command is GameCommand {
+  if (!isRecord(command)) return false;
+  if (typeof command.commandId !== "string"
+    || typeof command.actorId !== "string"
+    || typeof command.expectedSequence !== "number"
+    || !Number.isSafeInteger(command.expectedSequence)) return false;
+
+  switch (command.type) {
+    case "move-unit":
+      return typeof command.unitId === "string" && typeof command.destinationId === "string";
+    case "attack-unit":
+      return typeof command.unitId === "string" && typeof command.targetId === "string";
+    case "reinforce-unit":
+      return typeof command.unitId === "string";
+    case "end-action-phase":
+    case "end-reinforcement-phase":
+      return true;
+    default:
+      return false;
+  }
+}
+
+function isKnownCommandType(type: string): type is GameCommand["type"] {
+  return type === "move-unit"
+    || type === "attack-unit"
+    || type === "reinforce-unit"
+    || type === "end-action-phase"
+    || type === "end-reinforcement-phase";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
  * Starts an already-created map state without any browser/UI dependency.
  * Map factories should create zero reinforcement points, then call this once.
  */
@@ -205,6 +256,30 @@ export function startMatch(
   events.push({ type: "turn-started", message: `现在轮到 ${current.displayName} 的行动回合。` });
   resolveMatchConditions(draft, terrains, matchConditions, events);
   return { state: asDraftState(draft), events };
+}
+
+/**
+ * External clocks and tournament controllers end a match through game-core
+ * instead of mutating UI state directly.  A wall clock is intentionally not
+ * stored or ticked here, keeping simulations deterministic.
+ */
+export function finishMatch(
+  state: GameState,
+  message: string,
+  winningTeamIds: readonly TeamId[] = []
+): GameState {
+  if (state.turn.phase === "finished") return state;
+  return {
+    ...state,
+    sequence: state.sequence + 1,
+    turn: {
+      ...state.turn,
+      phase: "finished",
+      exhaustedUnitIds: [],
+      counterattacksUsed: {}
+    },
+    result: { winningTeamIds, message }
+  };
 }
 
 /**

@@ -32,6 +32,7 @@ const game = ref(createDemoMatch());
 const relayStatus = ref("未连接");
 const relayRoomId = ref("");
 const relayPlayerId = ref<string | null>(null);
+const relayAccountId = ref<string | null>(null);
 const relayIsHost = ref(false);
 let relayRoom: Room | undefined;
 let relayEndpoint = "";
@@ -120,8 +121,9 @@ async function connectRelay(): Promise<void> {
     relayRoom = room;
     relayRoomId.value = room.roomId;
     relayStatus.value = "已连接";
-    room.onMessage("room-role", (payload: { playerId?: string; isHost?: boolean }) => {
+    room.onMessage("room-role", (payload: { playerId?: string; accountId?: string; isHost?: boolean }) => {
       relayPlayerId.value = payload.playerId ?? null;
+      relayAccountId.value = payload.accountId ?? null;
       relayIsHost.value = Boolean(payload.isHost);
       if (relayIsHost.value) broadcastSnapshot();
     });
@@ -147,6 +149,7 @@ async function connectRelay(): Promise<void> {
       relayRoom = undefined;
       relayRoomId.value = "";
       relayPlayerId.value = null;
+      relayAccountId.value = null;
       relayIsHost.value = false;
     });
   } catch (error) {

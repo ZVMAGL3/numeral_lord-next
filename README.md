@@ -12,6 +12,7 @@
 - `docs`：游戏规则和架构决策。
 
 详细边界见 [架构基线](docs/architecture-baseline.md)。
+当前阿里云中继的目录、服务和测试入口见 [部署说明](docs/deployment.md)。
 
 ## 本地运行
 

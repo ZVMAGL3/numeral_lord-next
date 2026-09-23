@@ -16,6 +16,31 @@ export class PvpRelayRoom extends RelayRoom {
   private hostSessionId: string | undefined;
   private readonly accounts = new Map<string, { accountId: string; playerId: string; displayName: string }>();
 
+  override onCreate(options: {
+    maxClients?: number;
+    allowReconnectionTime?: number;
+    metadata?: unknown;
+  }): void {
+    if (options.maxClients) this.maxClients = options.maxClients;
+    if (options.allowReconnectionTime) {
+      this.allowReconnectionTime = Math.min(options.allowReconnectionTime, 40);
+    }
+    if (options.metadata) this.setMetadata(options.metadata);
+
+    // Only the two game transport messages are relayed. The server does not
+    // interpret game rules, but it does bind a command to the sender's seat
+    // and rejects snapshots from anyone other than the current host.
+    this.onMessage("player-intent", (client, payload: Record<string, unknown> = {}) => {
+      const account = this.accounts.get(client.sessionId);
+      if (!account) return;
+      this.broadcast("player-intent", { ...payload, playerId: account.playerId }, { except: client });
+    });
+    this.onMessage("host-snapshot", (client, payload: Record<string, unknown> = {}) => {
+      if (client.sessionId !== this.hostSessionId) return;
+      this.broadcast("host-snapshot", payload, { except: client });
+    });
+  }
+
   private broadcastMembers(): void {
     this.broadcast("room-members", {
       members: [...this.accounts.entries()].map(([sessionId, account]) => ({ sessionId, ...account }))
@@ -48,10 +73,10 @@ export class PvpRelayRoom extends RelayRoom {
     const wasHost = client.sessionId === this.hostSessionId;
     this.accounts.delete(client.sessionId);
     await super.onLeave(client, code);
-    if (wasHost && !this.hostSessionId) {
+    if (wasHost) {
       const nextHost = this.clients[0];
+      this.hostSessionId = nextHost?.sessionId;
       if (nextHost) {
-        this.hostSessionId = nextHost.sessionId;
         this.broadcast("room-host", { sessionId: this.hostSessionId });
       }
     }
@@ -103,10 +128,13 @@ export function createGameServer(): Server {
   return gameServer;
 }
 
-export async function startServer(port = Number(process.env.PORT ?? 2567)): Promise<void> {
+export async function startServer(
+  port = Number(process.env.PORT ?? 2567),
+  host = process.env.HOST ?? "0.0.0.0"
+): Promise<void> {
   const gameServer = createGameServer();
-  await gameServer.listen(port, "0.0.0.0");
-  console.info(`Numeral Lord relay server listening on :${port}`);
+  await gameServer.listen(port, host);
+  console.info(`Numeral Lord relay server listening on ${host}:${port}`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

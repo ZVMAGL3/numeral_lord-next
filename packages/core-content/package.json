@@ -1,0 +1,21 @@
+{
+  "name": "@numeral-lord/core-content",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@numeral-lord/game-core": "workspace:*",
+    "@numeral-lord/game-sdk": "workspace:*",
+    "@numeral-lord/oil-field-mod": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

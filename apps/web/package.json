@@ -1,0 +1,25 @@
+{
+  "name": "@numeral-lord/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "@colyseus/sdk": "0.18.3",
+    "@numeral-lord/core-content": "workspace:*",
+    "@numeral-lord/game-core": "workspace:*",
+    "@numeral-lord/oil-field-mod": "workspace:*",
+    "pixi.js": "8.21.0",
+    "vue": "3.5.43"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "6.0.9",
+    "typescript": "5.9.3",
+    "vite": "8.3.0",
+    "vue-tsc": "3.3.11"
+  }
+}

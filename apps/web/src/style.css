@@ -1,0 +1,57 @@
+:root { color: #eef4ff; background: #101927; font-family: Inter, "Microsoft YaHei", system-ui, sans-serif; font-synthesis: none; }
+* { box-sizing: border-box; }
+body { min-width: 320px; margin: 0; min-height: 100dvh; }
+button, input { font: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: .45; }
+.app-shell { width: min(1480px, 100%); min-height: 100dvh; margin: 0 auto; padding: 20px clamp(14px, 3vw, 42px) 18px; }
+.topbar { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
+.eyebrow { margin: 0 0 3px; color: #75d5ff; font-size: 11px; font-weight: 800; letter-spacing: .16em; }
+h1 { margin: 0; font-size: clamp(28px, 5vw, 42px); letter-spacing: -.04em; }
+.turn-pill { display: flex; align-items: center; gap: 9px; padding: 10px 14px; border: 1px solid rgba(149,177,219,.24); border-radius: 999px; background: #111b2a; color: #cbd9ed; font-size: 13px; }
+.turn-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--player-color, #75d5ff); box-shadow: 0 0 14px var(--player-color, #75d5ff); }
+.match-result { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 16px; padding: 16px 18px; border: 1px solid rgba(126,231,194,.52); border-radius: 18px; background: linear-gradient(110deg, rgba(31,86,92,.78), rgba(25,47,70,.92)); box-shadow: 0 12px 34px rgba(21, 195, 167, .12); }
+.match-result h2 { margin: 2px 0 5px; color: #f5fffb; font-size: clamp(20px, 3vw, 28px); }
+.match-result p { margin: 0; color: #b9d9d7; font-size: 12px; }
+.match-result .result-kicker { color: #8df5ce; font-size: 10px; font-weight: 900; letter-spacing: .12em; }
+.match-result button { width: auto; min-width: 150px; margin-top: 0; }
+.play-layout { display: grid; grid-template-columns: 240px minmax(0,1fr) 270px; gap: 16px; align-items: start; }
+.panel { border: 1px solid rgba(141,166,204,.28); border-radius: 18px; background: linear-gradient(160deg,#1a2940,#111d2e); padding: 15px; }
+.panel-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 12px; color: #dce9fb; font-size: 14px; font-weight: 800; }
+.panel-heading small { color: #71859f; font-size: 10px; font-weight: 600; }
+.player-card { display: grid; grid-template-columns: 9px 1fr auto; gap: 9px; align-items: center; margin: 7px 0; padding: 10px; border: 1px solid transparent; border-radius: 12px; color: #aebed4; }
+.player-card.active { border-color: rgba(112,219,255,.46); background: rgba(41,93,139,.22); color: white; }
+.player-color { width: 8px; height: 32px; border-radius: 999px; }
+.player-card strong, .selected-info strong { display: block; font-size: 13px; }
+.player-card small { display: block; margin-top: 3px; font-size: 10px; }
+.player-card b { color: #f9d77c; font-size: 13px; white-space: nowrap; }
+.legend { margin-top: 18px; padding-top: 12px; border-top: 1px solid rgba(141,166,204,.14); color: #8fa2bc; font-size: 11px; }
+.legend p { display: flex; align-items: center; gap: 7px; margin: 9px 0; }
+.legend-token { width: 12px; height: 12px; border: 2px solid #172033; border-radius: 50%; background: #8090a5; }
+.legend-token.powered { border-color: #a7f3d0; background: #68a8b1; }
+.legend-token.exhausted { border-color: #fbbf24; background: #8090a5; }
+/* Keep the Pixi viewport independent from growing event and notation sidebars. */
+.board-wrap { display: grid; min-width: 0; grid-template-rows: clamp(390px,38vw,500px) auto; gap: 10px; align-self:start; }
+.notice { min-height: 20px; margin: 0; color: #b8cae3; text-align: center; font-size: 13px; }
+.action-panel { display: flex; flex-direction: column; }
+.selected-info { min-height: 90px; padding: 12px; border-radius: 12px; background: rgba(5,11,19,.38); color: #93a8c2; font-size: 12px; line-height: 1.5; }
+.selected-info small { display: block; color: #6ed5ff; font-size: 10px; font-weight: 800; }
+.selected-info strong { margin: 3px 0; color: #f2f7ff; }
+button { width: 100%; margin-top: 10px; padding: 11px 12px; border: 0; border-radius: 10px; color: #08111e; font-size: 12px; font-weight: 800; transition: transform .15s ease,filter .15s ease; }
+button:not(:disabled):hover { filter: brightness(1.12); transform: translateY(-1px); }
+.primary { background: linear-gradient(135deg,#7ee7c2,#6dc9ef); }
+.secondary { background: linear-gradient(135deg,#fdcc79,#f09079); }
+.ghost { color: #aec1d9; background: transparent; border: 1px solid rgba(145,170,208,.26); }
+.notation-trigger { margin-top: 16px; }
+.notation-backdrop { position: fixed; z-index: 20; inset: 0; display: grid; place-items: center; padding: 18px; background: rgba(5, 11, 19, .68); backdrop-filter: blur(5px); }
+.notation-dialog { width: min(540px, 100%); border: 1px solid rgba(153, 200, 233, .42); border-radius: 18px; background: linear-gradient(150deg, #20334c, #142238); box-shadow: 0 22px 80px rgba(0, 0, 0, .42); padding: 20px; }
+.notation-dialog p { margin: 8px 0; color: #b8cae3; font-size: 12px; line-height: 1.55; }
+.notation-dialog pre { min-height: 90px; max-height: 220px; overflow: auto; margin: 14px 0; padding: 14px; border: 1px solid rgba(154, 223, 252, .22); border-radius: 10px; background: rgba(4, 11, 20, .45); color: #f4f8ff; font: 12px/1.55 ui-monospace, "Cascadia Code", Consolas, monospace; overflow-wrap: anywhere; white-space: pre-wrap; }
+.notation-detail { color: #8fa5c2 !important; }
+.copy-status { color: #87efca !important; font-weight: 700; }
+.notation-actions { display: flex; gap: 10px; margin-top: 16px; }
+.notation-actions button { flex: 1; margin-top: 0; }
+footer { margin-top: 15px; color: #64748b; text-align: center; font-size: 11px; }
+code { color: #9adffc; }
+@media (max-width:1020px) { .play-layout { grid-template-columns:220px minmax(0,1fr); } .action-panel { grid-column:1 / -1; } }
+@media (max-width:680px) { .app-shell { padding:14px 11px; } .topbar { align-items:flex-start; flex-direction:column; gap:10px; } .match-result { align-items:stretch; flex-direction:column; } .match-result button { width:100%; } .play-layout { grid-template-columns:1fr; } .player-panel { order:2; display:grid; grid-template-columns:1fr 1fr; gap:4px; } .player-panel .panel-heading,.player-panel .legend { grid-column:1 / -1; } .player-card { margin:0; } .board-wrap { order:1; grid-template-rows:minmax(260px,36dvh) auto; } .board-canvas { min-height:260px; } .action-panel { grid-column:auto; order:3; } }

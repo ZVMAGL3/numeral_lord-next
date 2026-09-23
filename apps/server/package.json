@@ -1,0 +1,21 @@
+{
+  "name": "@numeral-lord/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter @numeral-lord/game-core build && tsx watch src/index.ts",
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@numeral-lord/content-schema": "workspace:*",
+    "@numeral-lord/game-core": "workspace:*",
+    "@numeral-lord/game-sdk": "workspace:*",
+    "colyseus": "0.18.7"
+  },
+  "devDependencies": {
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
+  }
+}

@@ -40,6 +40,7 @@ export { getLegalIntents };
  * uploads rather than disabling the receiver's size protection.
  */
 export const MAX_CLIENT_MESSAGE_BYTES = 1024 * 1024;
+const REPLACED_BROWSER_SESSION_CLOSE_CODE = 4001;
 
 interface MutableLobbyMember {
   sessionId: string;
@@ -371,6 +372,7 @@ export class PvpRelayRoom extends RelayRoom {
       : undefined;
     if (previous) {
       const oldSessionId = previous.sessionId;
+      const oldClient = this.clients.find((candidate) => candidate.sessionId === oldSessionId);
       this.members.delete(oldSessionId);
       this.lastRoomSyncAtBySession.delete(oldSessionId);
       previous.sessionId = client.sessionId;
@@ -379,6 +381,14 @@ export class PvpRelayRoom extends RelayRoom {
       previous.installedModIds = installedModIds;
       if (this.phase === "lobby" && this.missingModIds(previous).length > 0) previous.ready = false;
       this.members.set(client.sessionId, previous);
+      if (oldClient) {
+        console.info("PvP browser identity moved to a new tab", {
+          roomId: this.roomId,
+          oldSessionId,
+          newSessionId: client.sessionId
+        });
+        oldClient.leave(REPLACED_BROWSER_SESSION_CLOSE_CODE, "This browser identity joined from another tab.");
+      }
       if (this.hostSessionId === oldSessionId || !this.hostSessionId) {
         this.hostSessionId = client.sessionId;
         // The replacement host first receives the last accepted board.

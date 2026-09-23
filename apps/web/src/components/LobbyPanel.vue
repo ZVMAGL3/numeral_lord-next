@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import type { GameState, LobbyMember, LobbyModSettings, LobbyRoomState, UnitId } from "@numeral-lord/game-core";
-import { getPlayerColor, getPlayerColorSprite, PLAYER_COLOR_OPTIONS } from "@numeral-lord/game-core";
+import { getPlayerColorSprite, PLAYER_COLOR_OPTIONS } from "@numeral-lord/game-core";
 import { parseMapCode } from "@numeral-lord/core-content";
 import { missingTerrainMods, type ConfiguredMap } from "../map-library";
 import { installedMapCatalogs, installedTerrainMods } from "../installed-content";
@@ -70,6 +70,7 @@ const maximumTurnSeconds = computed(() => props.room.settings.matchTimeMinutes =
   ? 300
   : Math.min(300, props.room.settings.matchTimeMinutes * 60));
 const copyStatus = ref("");
+const openColorPickerSessionId = ref<string | null>(null);
 const inviteUrl = computed(() => {
   const url = new URL(window.location.href);
   url.searchParams.set("room", props.roomId);
@@ -126,6 +127,15 @@ function colorName(playerColorId: string | null): string {
 function availableColorsFor(member: LobbyMember) {
   return PLAYER_COLOR_OPTIONS.filter((color) => color.id === member.playerColorId
     || !colorIsOccupied(color.id, member.sessionId));
+}
+
+function toggleColorPicker(sessionId: string): void {
+  openColorPickerSessionId.value = openColorPickerSessionId.value === sessionId ? null : sessionId;
+}
+
+function choosePlayerColor(playerColorId: string): void {
+  emit("color", playerColorId);
+  openColorPickerSessionId.value = null;
 }
 
 function onMemberRoleChange(member: LobbyMember, event: Event): void {
@@ -207,7 +217,7 @@ function onModSettingChange(modId: string, setting: ModSetting, event: Event): v
 </script>
 
 <template>
-  <section class="lobby-shell">
+  <section class="lobby-shell" @click="openColorPickerSessionId = null">
     <header class="lobby-header">
       <div>
         <p class="kicker">PVP LOBBY</p>
@@ -276,21 +286,38 @@ function onModSettingChange(modId: string, setting: ModSetting, event: Event): v
             </select>
             <span v-else class="seat-readonly">{{ seatLabel(member) }}</span>
 
-            <select
+            <div
               v-if="member.participating && member.sessionId === selfSessionId"
-              class="color-select"
-              :value="member.playerColorId ?? ''"
-              :style="{ '--swatch-color': getPlayerColor(member.playerColorId) }"
-              aria-label="选择自己的棋子花色"
-              @change="emit('color', ($event.target as HTMLSelectElement).value)"
+              class="color-picker"
+              @click.stop
             >
-              <option v-for="color in availableColorsFor(member)" :key="color.id" :value="color.id">{{ color.name }}</option>
-            </select>
+              <button
+                class="color-preview-button"
+                type="button"
+                :aria-label="`当前花色：${colorName(member.playerColorId)}，点击更换`"
+                :aria-expanded="openColorPickerSessionId === member.sessionId"
+                @click="toggleColorPicker(member.sessionId)"
+              >
+                <img :src="getPlayerColorSprite(member.playerColorId)" alt="" />
+              </button>
+              <div v-if="openColorPickerSessionId === member.sessionId" class="color-picker-menu" role="listbox" aria-label="可选棋子花色">
+                <button
+                  v-for="color in availableColorsFor(member)"
+                  :key="color.id"
+                  type="button"
+                  role="option"
+                  :aria-selected="member.playerColorId === color.id"
+                  :aria-label="`选择${color.name}花色`"
+                  :title="color.name"
+                  @click.stop="choosePlayerColor(color.id)"
+                ><img :src="getPlayerColorSprite(color.id)" alt="" /></button>
+              </div>
+            </div>
             <span
               v-else-if="member.participating && member.playerColorId"
               class="color-readonly"
-              :style="{ '--swatch-color': getPlayerColor(member.playerColorId) }"
-            ><img :src="getPlayerColorSprite(member.playerColorId)" alt="" />{{ colorName(member.playerColorId) }}</span>
+              :title="`${member.displayName}的棋子花色：${colorName(member.playerColorId)}`"
+            ><img :src="getPlayerColorSprite(member.playerColorId)" alt="" /></span>
             <span v-else class="color-readonly spectator-color">—</span>
 
             <span class="ready-state" :class="{ ready: member.ready }">
@@ -411,11 +438,11 @@ function onModSettingChange(modId: string, setting: ModSetting, event: Event): v
 .settings-stack { display: grid; align-content: start; gap: 14px; min-width: 0; }
 .lobby-card { padding: 18px; border: 1px solid rgba(130, 167, 204, .25); border-radius: 18px; background: rgba(8, 21, 34, .67); }
 .section-title { justify-content: space-between; gap: 12px; margin-bottom: 14px; }.section-title h3 { margin: 0; color: #eaf4ff; font-size: 16px; }.section-title span { color: #7892ad; font-size: 11px; }
-.member-list { display: grid; gap: 8px; }.member-row { display: grid; grid-template-columns: minmax(145px, 1fr) minmax(126px, .7fr) minmax(102px, .58fr) 70px; gap: 10px; padding: 10px 12px; border: 1px solid rgba(108, 145, 182, .22); border-radius: 12px; background: rgba(22, 43, 63, .62); }.member-row.disconnected { opacity: .55; }
+.member-list { display: grid; gap: 8px; }.member-row { position: relative; display: grid; grid-template-columns: minmax(145px, 1fr) minmax(126px, .7fr) minmax(72px, .42fr) 70px; gap: 10px; padding: 10px 12px; border: 1px solid rgba(108, 145, 182, .22); border-radius: 12px; background: rgba(22, 43, 63, .62); }.member-row:focus-within { z-index: 4; }.member-row.disconnected { opacity: .55; }
 .member-name { gap: 9px; min-width: 0; }.member-name strong, .member-name small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.member-name strong { color: #f4f8fc; }.member-name small { color: #8fa7bf; font-size: 11px; }.presence { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: #4ade80; box-shadow: 0 0 10px rgba(74, 222, 128, .6); }.disconnected .presence { background: #64748b; box-shadow: none; }
 .member-name .missing-mod-note { margin-top: 3px; color: #fbbf94; }
 .seat-select, .number-grid input { width: 100%; border: 1px solid rgba(129, 168, 207, .35); border-radius: 9px; background: #0d2032; color: #eaf4ff; outline: none; }.seat-select { padding: 7px 9px; }.seat-readonly { color: #bfd0e2; font-size: 12px; }.ready-state { color: #8fa5ba; font-size: 11px; text-align: right; }.ready-state.ready { color: #86efac; font-weight: 800; }
-.color-select { width: 100%; min-width: 0; padding: 7px 8px; border: 1px solid rgba(129,168,207,.35); border-left: 4px solid var(--swatch-color, #42566a); border-radius: 9px; outline: none; background: #0d2032; color: #eef5fb; }.color-readonly { display: flex; align-items: center; gap: 8px; min-width: 0; color: #c3d2df; font-size: 11px; }.color-readonly img { width: 24px; height: 22px; flex: 0 0 auto; object-fit: contain; }.spectator-color { color: #6f8499; }
+.color-picker { position: relative; display: flex; min-width: 0; align-items: center; justify-content: center; }.color-preview-button { display: grid; width: 52px; height: 42px; place-items: center; margin: 0; padding: 2px; border: 1px solid transparent; border-radius: 9px; background: transparent; cursor: pointer; }.color-preview-button:hover, .color-preview-button:focus-visible { border-color: rgba(131,233,216,.55); background: rgba(7,21,33,.55); outline: none; }.color-preview-button img { display: block; width: 44px; height: 38px; object-fit: contain; }.color-picker-menu { position: absolute; z-index: 10; top: calc(100% + 5px); left: 0; display: grid; min-width: 164px; grid-template-columns: repeat(3, 1fr); gap: 5px; padding: 8px; border: 1px solid rgba(131,181,207,.4); border-radius: 11px; background: #091827; box-shadow: 0 12px 28px rgba(0,0,0,.48); }.color-picker-menu button { display: grid; width: 43px; height: 39px; place-items: center; margin: 0; padding: 2px; border: 1px solid transparent; border-radius: 7px; background: transparent; cursor: pointer; }.color-picker-menu button:hover, .color-picker-menu button:focus-visible, .color-picker-menu button[aria-selected="true"] { border-color: rgba(131,233,216,.72); background: rgba(57,119,130,.3); outline: none; }.color-picker-menu img { display: block; width: 36px; height: 32px; object-fit: contain; }.color-readonly { display: flex; min-width: 0; align-items: center; justify-content: center; }.color-readonly img { display: block; width: 42px; height: 36px; object-fit: contain; }.spectator-color { color: #6f8499; }
 .ready-button { width: 100%; margin-top: 14px; padding: 12px; border: 0; border-radius: 11px; background: linear-gradient(90deg, #5eead4, #60a5fa); color: #071626; font-weight: 900; cursor: pointer; }.ready-button.active { background: #223b52; color: #c5d6e7; }.spectator-note, .settings-hint { margin: 13px 0 0; color: #7f98b1; font-size: 11px; line-height: 1.55; }
 .ready-button:disabled { cursor: not-allowed; background: #344a5e; color: #c3d0dd; }
 .dependency-warning { margin: 10px 0 0; padding: 9px 11px; border: 1px solid rgba(251, 191, 146, .4); border-radius: 9px; color: #ffd8ba; background: rgba(109, 60, 39, .24); font-size: 11px; line-height: 1.5; }
@@ -452,6 +479,6 @@ function onModSettingChange(modId: string, setting: ModSetting, event: Event): v
 .mod-setting-controls input:disabled, .mod-setting-controls select:disabled { opacity: .72; }
 .reset-mod-setting { padding: 3px 0; border: 0; background: transparent; color: #8de4ed; font-size: 10px; cursor: pointer; }
 .mod-setting-source { grid-column: 1 / -1; color: #7995aa; font-size: 10px; }
-@media (max-width: 800px) { .lobby-shell { padding: 15px; }.lobby-header { display: grid; }.lobby-header-side { width: 100%; grid-template-columns: minmax(0, 1fr) 130px; align-items: stretch; }.map-preview-board { height: 170px; }.ready-summary { display: grid; align-content: center; }.lobby-grid { grid-template-columns: 1fr; }.member-row { grid-template-columns: minmax(115px, 1fr) minmax(105px, .7fr) minmax(96px, .6fr) 58px; }.number-grid { grid-template-columns: 1fr; } }
-@media (max-width: 520px) { .lobby-header-side { grid-template-columns: 1fr; }.ready-summary { min-width: 0; }.member-row { grid-template-columns: minmax(0, 1fr) 118px; }.color-readonly, .color-select { grid-column: 1; }.ready-state { grid-column: 2; grid-row: 2; text-align: right; }.mod-setting-row { grid-template-columns: minmax(0, 1fr) 105px; } }
+@media (max-width: 800px) { .lobby-shell { padding: 15px; }.lobby-header { display: grid; }.lobby-header-side { width: 100%; grid-template-columns: minmax(0, 1fr) 130px; align-items: stretch; }.map-preview-board { height: 170px; }.ready-summary { display: grid; align-content: center; }.lobby-grid { grid-template-columns: 1fr; }.member-row { grid-template-columns: minmax(115px, 1fr) minmax(105px, .7fr) minmax(58px, .32fr) 58px; }.number-grid { grid-template-columns: 1fr; } }
+@media (max-width: 520px) { .lobby-header-side { grid-template-columns: 1fr; }.ready-summary { min-width: 0; }.member-row { grid-template-columns: minmax(0, 1fr) 118px; }.color-picker, .color-readonly { grid-column: 1; justify-content: flex-start; padding-left: 5px; }.ready-state { grid-column: 2; grid-row: 2; text-align: right; }.color-picker-menu { left: 0; }.mod-setting-row { grid-template-columns: minmax(0, 1fr) 105px; } }
 </style>

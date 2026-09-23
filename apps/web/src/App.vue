@@ -122,13 +122,13 @@ function loadOrCreateLocalValue(key: string, create: () => string): string {
   return value;
 }
 
-function loadOrCreateTabValue(key: string, create: () => string): string {
-  // A temporary PvP identity belongs to one tab. Refresh keeps the seat;
-  // another tab must not silently replace this one's room session.
-  const saved = sessionStorage.getItem(key)?.trim();
+function loadOrCreateBrowserIdentity(key: string): string {
+  const saved = localStorage.getItem(key)?.trim();
   if (saved) return saved;
-  const value = create();
-  sessionStorage.setItem(key, value);
+  // Migrate the earlier per-tab guest identity when upgrading an existing tab.
+  const legacyTabIdentity = sessionStorage.getItem(key)?.trim();
+  const value = legacyTabIdentity || createCommandId();
+  localStorage.setItem(key, value);
   return value;
 }
 
@@ -171,7 +171,9 @@ const workshopActionMessage = ref("");
 const workshopActionError = ref(false);
 const workshopWorking = ref(false);
 let workshopClient: WorkshopClient | undefined;
-const relayAccountKey = loadOrCreateTabValue(ACCOUNT_ID_STORAGE_KEY, createCommandId);
+// One browser profile uses one temporary PvP identity across its tabs. This
+// is only a local guest identity, not a verified account or login credential.
+const relayAccountKey = loadOrCreateBrowserIdentity(ACCOUNT_ID_STORAGE_KEY);
 const invitedRoomId = new URLSearchParams(window.location.search).get("room")?.trim() ?? "";
 // A room link is already an explicit game entry. Only the bare site URL shows
 // the name/start home page; invite links join immediately with the saved (or
@@ -549,9 +551,10 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string, r
     });
     room.onLeave((code) => {
       if (relayRoom !== room) return;
+      const replacedByAnotherTab = code === 4001;
       logConnection("socket.closed", {
         code, roomId: room.roomId, phase: lobbyState.value.phase,
-        selfIsHost: relayIsHost.value, sequence: game.value.sequence,
+        selfIsHost: relayIsHost.value, sequence: game.value.sequence, replacedByAnotherTab,
         online: navigator.onLine, visibility: document.visibilityState
       });
       console.warn("PvP room socket closed", { code, roomId: room.roomId });
@@ -564,6 +567,11 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string, r
       relayIsHost.value = false;
       hasLiveSnapshot.value = false;
       pendingRemoteAction = undefined;
+      if (replacedByAnotherTab) {
+        cancelReconnect();
+        notice.value = "同一浏览器身份已在另一个标签页进入此房间；本标签页已退出。";
+        return;
+      }
       scheduleReconnect(room.roomId, 1);
     });
     room.onError((code, message) => {

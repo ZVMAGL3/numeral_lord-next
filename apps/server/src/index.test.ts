@@ -22,6 +22,7 @@ interface BroadcastMessage extends SentMessage {
 
 interface FakeClient extends Client {
   readonly sent: SentMessage[];
+  readonly leave: (code?: number, data?: string) => void;
 }
 
 type MessageHandler = (client: Client, payload: Record<string, unknown>, context: MessageContext) => unknown;
@@ -81,8 +82,9 @@ function fakeClient(sessionId: string): FakeClient {
     sent,
     send(type: string | number, payload?: unknown) {
       sent.push({ type, payload });
-    }
-  } as FakeClient;
+    },
+    leave: vi.fn<(code?: number, data?: string) => void>()
+  } as unknown as FakeClient;
 }
 
 function createRoom(mapPlayerCount: number): TestPvpRelayRoom {
@@ -169,6 +171,23 @@ describe("PvpRelayRoom lobby contract", () => {
       ["bob", null, false],
       ["dan", null, false]
     ]);
+  });
+
+  it("replaces and disconnects the old tab when a browser identity joins the same room again", () => {
+    const room = createRoom(3);
+    const oldTab = join(room, "old-tab", "ZVMAGL3", "same-browser");
+    join(room, "peer", "对手", "peer-account");
+
+    const newTab = join(room, "new-tab", "ZVMAGL3", "same-browser");
+
+    expect(oldTab.leave).toHaveBeenCalledWith(4001, "This browser identity joined from another tab.");
+    const members = lastBroadcast<LobbyRoomState>(room, "room-state").members;
+    expect(members.filter((member) => member.accountId === "same-browser")).toHaveLength(1);
+    expect(members.find((member) => member.accountId === "same-browser")).toMatchObject({
+      sessionId: newTab.sessionId,
+      seat: 1,
+      participating: true
+    });
   });
 
   it("starts a fixed-position map with only the occupied seats assigned", () => {

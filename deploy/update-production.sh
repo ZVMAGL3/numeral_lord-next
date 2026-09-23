@@ -53,7 +53,7 @@ systemctl daemon-reload
 systemctl start numeral-lord.service
 
 READY=0
-for _ in $(seq 1 40); do
+for _ in $(seq 1 90); do
   if systemctl is-active --quiet numeral-lord.service \
     && curl --fail --silent http://127.0.0.1:2567/ >/dev/null \
     && curl --fail --silent http://127.0.0.1/numeral-lord-play/ >/dev/null; then

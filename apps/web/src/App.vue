@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { Client, type Room } from "@colyseus/sdk";
 import {
   applyCommand,
   getActionableUnitIds,
@@ -9,6 +10,7 @@ import {
   appendPhaseEndNotation,
   appendReinforcementNotation,
   type CellId,
+  type GameCommand,
   type CommandResult,
   type NotationEntry,
   type PlayerState,
@@ -27,6 +29,12 @@ import { createDemoMatch } from "@numeral-lord/core-content";
 // map can keep only `coreTerrainCatalog` and omit this merge entirely.
 const installedTerrainCatalog = { ...coreTerrainCatalog, ...oilFieldTerrainCatalog };
 const game = ref(createDemoMatch());
+const relayStatus = ref("未连接");
+const relayRoomId = ref("");
+const relayPlayerId = ref<string | null>(null);
+const relayIsHost = ref(false);
+let relayRoom: Room | undefined;
+let relayEndpoint = "";
 const selectedUnitId = ref<UnitId | null>(null);
 /** Cell captured at selection time; notation never infers an attacker from a later click. */
 const selectedSourceCellId = ref<CellId | null>(null);
@@ -82,6 +90,71 @@ const legalActionCellIds = computed<readonly CellId[]>(() => selectedUnit.value
   ? getLegalActionDestinationIds(game.value, selectedUnit.value.id, installedTerrainCatalog, coreUnitCatalog)
   : []);
 
+function resolveRelayEndpoint(): string {
+  // A query override keeps the static preview deployable without bundling a
+  // secret or rebuilding the client for each server address: `?relay=ws...`.
+  const configured = new URLSearchParams(window.location.search).get("relay");
+  if (configured) return configured;
+  return `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.hostname}:2567`;
+}
+
+function broadcastSnapshot(): void {
+  if (relayRoom && relayIsHost.value) relayRoom.send("host-snapshot", { state: game.value });
+}
+
+function submitRemoteCommand(command: GameCommand): boolean {
+  if (!relayRoom || relayIsHost.value) return false;
+  relayRoom.send("player-intent", { playerId: relayPlayerId.value, command });
+  notice.value = "操作已发送给房主，等待权威棋盘同步。";
+  clearSelectionSilently();
+  return true;
+}
+
+async function connectRelay(): Promise<void> {
+  if (relayRoom) return;
+  relayEndpoint = resolveRelayEndpoint();
+  relayStatus.value = "连接中…";
+  try {
+    const client = new Client(relayEndpoint);
+    const room = await client.joinOrCreate("pvp", { name: "本地玩家" });
+    relayRoom = room;
+    relayRoomId.value = room.roomId;
+    relayStatus.value = "已连接";
+    room.onMessage("room-role", (payload: { playerId?: string; isHost?: boolean }) => {
+      relayPlayerId.value = payload.playerId ?? null;
+      relayIsHost.value = Boolean(payload.isHost);
+      if (relayIsHost.value) broadcastSnapshot();
+    });
+    room.onMessage("room-host", (payload: { sessionId?: string }) => {
+      relayIsHost.value = payload.sessionId === room.sessionId;
+      if (relayIsHost.value) broadcastSnapshot();
+    });
+    room.onMessage("player-intent", (payload: { playerId?: string; command?: GameCommand }) => {
+      if (!relayIsHost.value || !payload.command) return;
+      const active = currentPlayer.value;
+      if (!active || payload.command.actorId !== active.id) return;
+      const result = applyCommand(game.value, payload.command, installedTerrainCatalog, coreUnitCatalog, coreMatchConditionCatalog);
+      if (applyResult(result)) broadcastSnapshot();
+    });
+    room.onMessage("host-snapshot", (payload: { state?: typeof game.value }) => {
+      if (relayIsHost.value || !payload.state) return;
+      game.value = payload.state;
+      clearSelectionSilently();
+      notice.value = "已收到房主的最新棋盘。";
+    });
+    room.onLeave(() => {
+      relayStatus.value = "连接已断开";
+      relayRoom = undefined;
+      relayRoomId.value = "";
+      relayPlayerId.value = null;
+      relayIsHost.value = false;
+    });
+  } catch (error) {
+    relayStatus.value = "连接失败";
+    notice.value = `PvP 房间连接失败：${error instanceof Error ? error.message : "请检查后端地址"}`;
+  }
+}
+
 function onCellClick(cellId: CellId): void {
   if (isReinforcementPhase.value) return;
   if (!isActionPhase.value) return;
@@ -115,15 +188,17 @@ function onCellClick(cellId: CellId): void {
   const actingUnitId = actingUnit.id;
   const sourceCellId = selectedSourceCellId.value ?? actingUnit.cellId;
   const includeSourceClick = selectedByUser.value;
-  const result = clickedUnit
-    ? applyCommand(game.value, {
+  const command: GameCommand = clickedUnit
+    ? {
       type: "attack-unit", commandId: crypto.randomUUID(), actorId: active.id,
       expectedSequence: game.value.sequence, unitId: actingUnitId, targetId: cellId
-    }, installedTerrainCatalog, coreUnitCatalog, coreMatchConditionCatalog)
-    : applyCommand(game.value, {
+    }
+    : {
       type: "move-unit", commandId: crypto.randomUUID(), actorId: active.id,
       expectedSequence: game.value.sequence, unitId: actingUnitId, destinationId: cellId
-    }, installedTerrainCatalog, coreUnitCatalog, coreMatchConditionCatalog);
+    };
+  if (submitRemoteCommand(command)) return;
+  const result = applyCommand(game.value, command, installedTerrainCatalog, coreUnitCatalog, coreMatchConditionCatalog);
   if (!applyResult(result) || !result.accepted) return;
   recordAction(sourceCellId, cellId, result.outcome?.continuation?.cellId, includeSourceClick);
   continueActionAt(result.outcome?.continuation?.unitId ?? null);
@@ -139,6 +214,10 @@ function clearSelection(): void {
 function selectOwnUnit(unitId: UnitId | null): void {
   const active = currentPlayer.value;
   const unit = unitId ? game.value.units[unitId] : undefined;
+  if (relayRoom && relayPlayerId.value && active && active.id !== relayPlayerId.value) {
+    notice.value = "现在轮到另一位玩家，等待对方行动。";
+    return;
+  }
   if (!active || !unit || unit.ownerId !== active.id) {
     notice.value = "请选择当前玩家自己的单位。";
     return;
@@ -228,10 +307,15 @@ function allocatePointsAt(cellId: CellId, requested: number, quiet = false): num
 
   let completed = 0;
   for (let index = 0; index < requested; index += 1) {
-    const result = applyCommand(game.value, {
+    const command: GameCommand = {
       type: "reinforce-unit", commandId: crypto.randomUUID(), actorId: active.id,
       expectedSequence: game.value.sequence, unitId: unit.id
-    }, installedTerrainCatalog, coreUnitCatalog, coreMatchConditionCatalog);
+    };
+    if (submitRemoteCommand(command)) {
+      completed += 1;
+      break;
+    }
+    const result = applyCommand(game.value, command, installedTerrainCatalog, coreUnitCatalog, coreMatchConditionCatalog);
     if (!applyResult(result, quiet) || !result.accepted) break;
     completed += 1;
   }
@@ -247,10 +331,12 @@ function allocatePointsAt(cellId: CellId, requested: number, quiet = false): num
 function endActionPhase(): void {
   const active = currentPlayer.value;
   if (!active) return;
-  const result = applyCommand(game.value, {
+  const command: GameCommand = {
     type: "end-action-phase", commandId: crypto.randomUUID(), actorId: active.id,
     expectedSequence: game.value.sequence
-  }, installedTerrainCatalog, coreUnitCatalog, coreMatchConditionCatalog);
+  };
+  if (submitRemoteCommand(command)) return;
+  const result = applyCommand(game.value, command, installedTerrainCatalog, coreUnitCatalog, coreMatchConditionCatalog);
   if (applyResult(result) && result.accepted) {
     recordSpecial("action");
     clearSelectionSilently();
@@ -261,10 +347,12 @@ function endReinforcementPhase(): void {
   const active = currentPlayer.value;
   if (!active) return;
   clearReinforcementHold();
-  const result = applyCommand(game.value, {
+  const command: GameCommand = {
     type: "end-reinforcement-phase", commandId: crypto.randomUUID(), actorId: active.id,
     expectedSequence: game.value.sequence
-  }, installedTerrainCatalog, coreUnitCatalog, coreMatchConditionCatalog);
+  };
+  if (submitRemoteCommand(command)) return;
+  const result = applyCommand(game.value, command, installedTerrainCatalog, coreUnitCatalog, coreMatchConditionCatalog);
   if (applyResult(result) && result.accepted) {
     recordSpecial("reinforcement");
     clearSelectionSilently();
@@ -272,8 +360,13 @@ function endReinforcementPhase(): void {
 }
 
 function resetMatch(): void {
+  if (relayRoom && !relayIsHost.value) {
+    notice.value = "只有房主可以重置联网对局。";
+    return;
+  }
   clearReinforcementHold();
   game.value = createDemoMatch();
+  broadcastSnapshot();
   clearSelectionSilently();
   notation.value = [];
   notice.value = "演示地图已重置，赤方先行动。";
@@ -351,18 +444,26 @@ function applyResult(result: CommandResult, quiet = false): boolean {
     return false;
   }
   game.value = result.state;
+  broadcastSnapshot();
   if (!quiet) notice.value = result.events.at(-1)?.message ?? "操作完成。";
   return true;
 }
 
-onBeforeUnmount(clearReinforcementHold);
+onMounted(() => { void connectRelay(); });
+onBeforeUnmount(() => {
+  clearReinforcementHold();
+  relayRoom?.leave();
+});
 </script>
 
 <template>
   <main class="app-shell">
     <header class="topbar">
       <div><p class="eyebrow">LOCAL RULES PROTOTYPE</p><h1>Numeral Lord</h1></div>
-      <div class="turn-pill" :style="{ '--player-color': currentPlayer?.color }"><span class="turn-dot" />第 {{ game.turn.round }} 回合 · {{ currentPlayer?.displayName }} · {{ phaseLabel }}</div>
+      <div class="topbar-meta">
+        <div class="turn-pill" :style="{ '--player-color': currentPlayer?.color }"><span class="turn-dot" />第 {{ game.turn.round }} 回合 · {{ currentPlayer?.displayName }} · {{ phaseLabel }}</div>
+        <div class="network-pill" :class="{ connected: relayStatus === '已连接' }">PvP {{ relayStatus }}<span v-if="relayRoomId"> · 房间 {{ relayRoomId }}</span><span v-if="relayIsHost"> · 房主</span><span v-else-if="relayPlayerId"> · {{ relayPlayerId }}</span></div>
+      </div>
     </header>
 
     <section v-if="isMatchFinished" class="match-result" role="status" aria-live="polite">
@@ -400,7 +501,7 @@ onBeforeUnmount(clearReinforcementHold);
       </section>
 
       <aside class="panel action-panel">
-        <div class="panel-heading"><span>本地操作</span><small>规则立即在浏览器执行</small></div>
+        <div class="panel-heading"><span>对局操作</span><small>规则本地执行 · 房主广播</small></div>
         <div class="selected-info">
           <template v-if="isMatchFinished"><small>结算完成</small><strong>{{ matchResultTitle }}</strong><span>{{ matchResultMessage }}</span></template>
           <template v-else-if="isReinforcementPhase"><small>加点回合</small><strong>剩余 {{ currentPlayer?.reinforcementPoints ?? 0 }} 点</strong><span>点击通电兵加 1 点；长按会逐渐加速，最多 3 秒投入全部点数。</span></template>
@@ -411,9 +512,10 @@ onBeforeUnmount(clearReinforcementHold);
         <button v-else-if="isReinforcementPhase" class="primary" @click="endReinforcementPhase">结束加点，轮到下一位</button>
         <button class="ghost" @click="resetMatch">重置演示对局</button>
         <button class="ghost notation-trigger" @click="openNotationDialog">查看 / 复制本地棋谱</button>
+        <button v-if="relayStatus === '连接失败' || relayStatus === '连接已断开'" class="ghost" @click="connectRelay">重新连接 PvP</button>
       </aside>
     </section>
-    <footer>本地原型：点击即本地预测。联网房间将复用同一套 <code>game-core</code> 规则进行服务端校验。</footer>
+    <footer>规则在客户端运行；联网房间由 Colyseus 负责房间、账户席位和广播，房主快照作为冲突时的权威结果。</footer>
 
     <div v-if="notationDialogOpen" class="notation-backdrop" @click.self="notationDialogOpen = false">
       <section class="notation-dialog" role="dialog" aria-modal="true" aria-labelledby="notation-title">

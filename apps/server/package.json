@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "pnpm --filter @numeral-lord/game-core build && tsx watch src/index.ts",
+    "start": "pnpm --filter @numeral-lord/game-core build && tsx src/index.ts",
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit"
   },

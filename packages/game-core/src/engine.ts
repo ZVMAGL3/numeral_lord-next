@@ -12,6 +12,8 @@ import {
   type UnitSpec
 } from "./content.js";
 import { getHexDistance, getHexNeighbours, toCellId, type HexBounds } from "./hex.js";
+import { selectSpatialPatternUnits, type SpatialPatternDefinition } from "./spatial-pattern.js";
+import { applyModRules } from "./mod-rules.js";
 import type {
   CellId,
   GameState,
@@ -133,6 +135,37 @@ const UNIT_CAPABILITY = {
 // release old snapshots after a command replaces them.
 const poweredCache = new WeakMap<GameState, WeakMap<TerrainCatalog, ReadonlySet<UnitId>>>();
 
+/** The built-in power network is itself a serializable spatial pattern. */
+export const POWER_NETWORK_PATTERN: SpatialPatternDefinition = {
+  id: "core/powered-network",
+  result: { entity: "unit", distinctBy: "id" },
+  role: "core/powered-units",
+  starts: {
+    op: "all",
+    items: [
+      { op: "terrain-has", capabilityId: CAPABILITY.conductor },
+      { op: "terrain-has", capabilityId: CAPABILITY.source },
+      { op: "unit-owner-is", owner: "actor" }
+    ]
+  },
+  expression: {
+    op: "repeat",
+    min: 0,
+    max: 4096,
+    item: {
+      op: "step",
+      relation: "hex-neighbor",
+      where: {
+        op: "all",
+        items: [
+          { op: "terrain-has", capabilityId: CAPABILITY.conductor },
+          { op: "unit-owner-is", owner: "actor" }
+        ]
+      }
+    }
+  }
+};
+
 /** Built-in fallback keeps existing maps playable without a content package. */
 const DEFAULT_MATCH_CONDITIONS: MatchConditionCatalog = {
   "core/last-team-standing": {
@@ -185,19 +218,19 @@ export function applyCommand(
   switch (command.type) {
     case "move-unit":
       if (state.turn.phase !== "action") return fail(state, "wrong-phase", "加点回合不能移动或攻击。");
-      return finalizeCommand(state, moveUnit(state, command, terrains, units), terrains, units, matchConditions);
+      return finalizeCommand(state, moveUnit(state, command, terrains, units), terrains, units, matchConditions, command);
     case "attack-unit":
       if (state.turn.phase !== "action") return fail(state, "wrong-phase", "加点回合不能移动或攻击。");
-      return finalizeCommand(state, attackUnit(state, command, terrains, units), terrains, units, matchConditions);
+      return finalizeCommand(state, attackUnit(state, command, terrains, units), terrains, units, matchConditions, command);
     case "reinforce-unit":
       if (state.turn.phase !== "reinforcement") return fail(state, "wrong-phase", "请先结束行动，进入加点回合。");
-      return finalizeCommand(state, reinforceUnit(state, command, terrains, units), terrains, units, matchConditions);
+      return finalizeCommand(state, reinforceUnit(state, command, terrains, units), terrains, units, matchConditions, command);
     case "end-action-phase":
       if (state.turn.phase !== "action") return fail(state, "wrong-phase", "当前不是行动回合。");
-      return finalizeCommand(state, endActionPhase(state), terrains, units, matchConditions);
+      return finalizeCommand(state, endActionPhase(state), terrains, units, matchConditions, command);
     case "end-reinforcement-phase":
       if (state.turn.phase !== "reinforcement") return fail(state, "wrong-phase", "当前不是加点回合。");
-      return finalizeCommand(state, endReinforcementPhase(state, terrains, units), terrains, units, matchConditions);
+      return finalizeCommand(state, endReinforcementPhase(state, terrains, units), terrains, units, matchConditions, command);
   }
 }
 
@@ -257,8 +290,10 @@ export function startMatch(
   const events: GameEvent[] = [];
   grantReinforcementIncome(draft, current, terrains, units, events);
   events.push({ type: "turn-started", message: `现在轮到 ${current.displayName} 的行动回合。` });
-  resolveMatchConditions(draft, terrains, matchConditions, events);
-  return { state: asDraftState(draft), events };
+  const withRules = applyModRules(state, asDraftState(draft), undefined, terrains, true);
+  const ruledDraft = createDraft(withRules);
+  resolveMatchConditions(ruledDraft, terrains, matchConditions, events);
+  return { state: asDraftState(ruledDraft), events };
 }
 
 /**
@@ -286,28 +321,12 @@ export function finishMatch(
 }
 
 /**
- * Derived, never persisted: a unit is powered only through a friendly chain.
- *
- * Algorithm (breadth-first search / BFS):
- * 1. Run once per player. Power never crosses an owner boundary, even when
- *    two players are teammates or friendly fire is enabled.
- * 2. Seed the queue with that player's units standing on a terrain that has
- *    both `core/power-source` and `core/power-conductor`. In the core pack
- *    this is an occupied stronghold. An empty stronghold cannot be a seed
- *    because only a unit can be added to the queue.
- * 3. Pop one powered unit and inspect the six hex neighbours. A neighbour is
- *    added only when it has a same-owner unit and its terrain has
- *    `core/power-conductor`. The unit itself is the bridge: an empty plain
- *    does not transmit power to a distant unit.
- * 4. `visited` prevents loops when units form a ring. Each unit and each
- *    adjacent edge is examined at most once, so the work is O(V + E) for the
- *    units in the board.
- *
- * This is a fresh implementation for the normalized `{cells, units}` model;
- * it preserves the old store's connected-component rule without keeping the
- * old mutable `specialForces` set. Callers derive it again from state after
- * every command, so a unit becomes powered or unpowered immediately when the
- * board topology changes.
+ * Derived, never persisted: evaluate a regular-path query on the board graph.
+ * One owner-scoped pattern starts at their occupied power sources and repeats
+ * neighbor steps through friendly occupied conductive cells. The interpreter
+ * de-duplicates visited cells, so cyclic unit networks terminate. This keeps
+ * the legacy connected-component behavior while making the path definition
+ * serializable and reusable by data-only Mods.
  */
 export function getPoweredUnitIds(
   state: GameState,
@@ -319,59 +338,14 @@ export function getPoweredUnitIds(
 
   // The returned set is the complete derived answer, never persisted in GameState.
   const powered = new Set<UnitId>();
-  const bounds: HexBounds = state.board;
 
-  // A separate traversal for each player prevents one player's stronghold from
-  // powering another player's units through an otherwise conductive chain.
+  // A separate interpretation per player scopes the `actor` predicate to that
+  // owner. The pattern is the same serializable grammar that future Mods use.
+  const customPatterns = state.settings.modRuleSet?.patterns.filter((pattern) => pattern.role === "core/powered-units") ?? [];
+  const patterns = customPatterns.length > 0 ? customPatterns : [POWER_NETWORK_PATTERN];
   for (const player of Object.values(state.players)) {
-    // `frontier` is the BFS queue; `visited` is separate from `powered` so a
-    // unit is enqueued once even if several powered neighbours point to it.
-    const frontier: UnitId[] = [];
-    const visited = new Set<UnitId>();
-
-    // Find all occupied, conductive power sources owned by this player.
-    for (const unit of Object.values(state.units)) {
-      if (unit.ownerId !== player.id) continue;
-      const cell = state.cells[unit.cellId];
-      if (!cell) continue;
-      const terrain = requireTerrain(terrains, cell.terrainId);
-      if (
-        hasTerrainCapability(terrain, CAPABILITY.conductor)
-        && hasTerrainCapability(terrain, CAPABILITY.source)
-      ) {
-        frontier.push(unit.id);
-        visited.add(unit.id);
-        powered.add(unit.id);
-      }
-    }
-
-    // Expand through friendly units on conductive terrain.
-    while (frontier.length > 0) {
-      const currentId = frontier.shift();
-      if (!currentId) continue;
-      const current = state.units[currentId];
-      if (!current) continue;
-      const currentCell = state.cells[current.cellId];
-      if (!currentCell) continue;
-
-      for (const neighbour of getHexNeighbours(currentCell.coordinate, bounds)) {
-        const neighbourId = toCellId(neighbour);
-        const neighbourCell = state.cells[neighbourId];
-        const neighbourUnit = neighbourCell?.unitId
-          ? state.units[neighbourCell.unitId]
-          : undefined;
-        // Empty cells, enemy units and already visited units terminate this
-        // edge. A conductive empty cell is intentionally not a power bridge.
-        if (!neighbourCell || !neighbourUnit || neighbourUnit.ownerId !== player.id || visited.has(neighbourUnit.id)) {
-          continue;
-        }
-        const neighbourTerrain = requireTerrain(terrains, neighbourCell.terrainId);
-        if (!hasTerrainCapability(neighbourTerrain, CAPABILITY.conductor)) continue;
-
-        visited.add(neighbourUnit.id);
-        powered.add(neighbourUnit.id);
-        frontier.push(neighbourUnit.id);
-      }
+    for (const pattern of patterns) {
+      for (const unitId of selectSpatialPatternUnits(state, terrains, pattern, player.id)) powered.add(unitId);
     }
   }
 
@@ -588,23 +562,23 @@ function attackUnit(
 
   const draft = createDraft(state);
   const events: GameEvent[] = [];
+  // Capture the target tile's pre-combat defense state once. Combat results,
+  // UI red/white frames, and the per-cell usage counter all use this same
+  // predicate; a split unit ID must never restore the tile's defense.
+  const hasDefense = canCounterattack(state, defender.id, terrains, units);
+  if (hasDefense) consumeCellDefense(draft, targetCell.id);
   let continuationUnitId = resolveAttack(
-    draft, attacker, defender, targetCell.id, attackStrength, powered, movesIntoTarget, events
+    draft, attacker, defender, targetCell.id, attackStrength, powered, movesIntoTarget, hasDefense, events
   );
   // A failed attack may leave its attacker on the source tile (or the
   // defender may counterattack and kill it there); those are not departures.
   if (departureGarrison && !draft.units[defender.id]) {
     leaveDepartureGarrison(draft, sourceCell.id, attacker, departureGarrison, units, events);
   }
-  applyCounterattack(draft, defender.id, continuationUnitId, terrains, units, events);
+  applyCounterattack(draft, defender.id, continuationUnitId, hasDefense, events);
   if (continuationUnitId && !draft.units[continuationUnitId]) continuationUnitId = undefined;
 
-  // Melee already incorporates the action strength into its casualty result.
-  // A non-moving attack has no split/casualty movement, so decay its surviving
-  // acting stack here after combat and counterattack both finish.
-  if (continuationUnitId && !movesIntoTarget) {
-    applyStationaryActionStrengthDecay(draft, continuationUnitId, attackerDefinition);
-  }
+  // Attacks are resolved by combat strength, not by the movement point decay.
   if (movesIntoTarget) {
     const arrivedCell = draft.cells[targetCell.id];
     const arrivingUnit = arrivedCell?.unitId ? draft.units[arrivedCell.unitId] : undefined;
@@ -737,17 +711,29 @@ function resolveAttack(
   attackStrength: number,
   powered: boolean,
   movesIntoTarget: boolean,
+  hasDefense: boolean,
   events: GameEvent[]
 ): UnitId | undefined {
   const sourceCell = draft.cells[attacker.cellId];
   const destinationCell = draft.cells[destinationId];
   if (!sourceCell || !destinationCell) return undefined;
 
-  // `attackStrength` is the stack's post-action strength. Legacy combat
-  // compares one point above it (the action's consumed point is refunded for
-  // the strike), but the surviving stack still loses that point on advance.
+  // `attackStrength` is already the forward force: a powered stack has kept
+  // one point at its source; a roamer attacks with its full number. The old
+  // action rule consumes one point only for an otherwise uneventful move, so
+  // attacks use the +1 comparison/damage adjustment below instead.
+  //
+  // If `attackStrength + 1` beats B, B is removed. With defense available the
+  // defender absorbs its strength from the advancing force; without defense
+  // the whole forward force enters. If it does not beat B, B loses the forward
+  // force, and an available defense kills the attacker; without defense the
+  // attacker stays at A and is exhausted for this action phase.
   if (attackStrength + 1 > defender.strength) {
-    const survivorStrength = attackStrength - defender.strength;
+    // Without an available defense, a successful capture does not trade away
+    // attacking points. A live defense absorbs the defender's strength first.
+    const survivorStrength = hasDefense
+      ? attackStrength - defender.strength
+      : attackStrength;
     delete draft.units[defender.id];
     if (!movesIntoTarget) {
       draft.cells[destinationId] = withCellUnit(destinationCell, undefined);
@@ -800,30 +786,29 @@ function applyCounterattack(
   draft: Draft,
   defenderId: UnitId,
   attackerId: UnitId | undefined,
-  terrains: TerrainCatalog,
-  units: UnitCatalog,
+  defenseWasAvailable: boolean,
   events: GameEvent[]
 ): void {
   if (!attackerId) return;
   const defender = draft.units[defenderId];
   const attacker = draft.units[attackerId];
   if (!defender || !attacker) return;
-  if (!canCounterattack(asDraftState(draft), defenderId, terrains, units)) return;
-
-  const used = draft.turn.counterattacksUsed[defender.id] ?? 0;
-
-  draft.turn = {
-    ...draft.turn,
-    counterattacksUsed: { ...draft.turn.counterattacksUsed, [defender.id]: used + 1 }
-  };
-  // Legacy defense is a binary reaction: a defender that still has its
-  // counterattack removes a failed attacker; it does not exchange the
-  // defender's post-hit strength as damage. The attack itself already reduced
-  // the defender by the legacy-adjusted amount in resolveAttack().
+  if (!defenseWasAvailable) return;
+  // The defense exchange is already represented by resolveAttack's strength
+  // arithmetic. If the defender survived that exchange, the attacking stack
+  // is eliminated; if it was broken, there is no separate retaliation.
   const attackerCell = draft.cells[attacker.cellId];
   if (attackerCell) draft.cells[attacker.cellId] = withCellUnit(attackerCell, undefined);
   delete draft.units[attacker.id];
   events.push({ type: "unit-counterattacked", message: "防守方反击，攻击单位被消灭。" });
+}
+
+function consumeCellDefense(draft: Draft, cellId: CellId): void {
+  const used = draft.turn.counterattacksUsed[cellId] ?? 0;
+  draft.turn = {
+    ...draft.turn,
+    counterattacksUsed: { ...draft.turn.counterattacksUsed, [cellId]: used + 1 }
+  };
 }
 
 /** Shared rule/query for both combat resolution and the red/white target hint. */
@@ -841,7 +826,7 @@ export function canCounterattack(
   if (!cell) return false;
   const terrain = terrains[cell.terrainId];
   if (!terrain) return false;
-  const used = state.turn.counterattacksUsed[unitId] ?? 0;
+  const used = state.turn.counterattacksUsed[cell.id] ?? 0;
   return used < getCounterattackLimit(terrain, definition);
 }
 
@@ -966,17 +951,6 @@ function exhaustUnitForCurrentPhase(draft: Draft, unitId: UnitId): boolean {
     exhaustedUnitIds: [...draft.turn.exhaustedUnitIds, unitId]
   };
   return true;
-}
-
-/** Applies action decay for a cannon-like action that leaves the unit in place. */
-function applyStationaryActionStrengthDecay(draft: Draft, unitId: UnitId, definition: UnitSpec): void {
-  const unit = draft.units[unitId];
-  const actionDecay = getActionStrengthDecay(definition);
-  if (!unit || !actionDecay || unit.strength <= actionDecay.minimumStrength) return;
-  draft.units[unitId] = {
-    ...unit,
-    strength: Math.max(actionDecay.minimumStrength, unit.strength - actionDecay.amount)
-  };
 }
 
 interface DepartureGarrison {
@@ -1185,11 +1159,16 @@ function finalizeCommand(
   result: CommandResult,
   terrains: TerrainCatalog,
   units: UnitCatalog,
-  matchConditions: MatchConditionCatalog
+  matchConditions: MatchConditionCatalog,
+  command: GameCommand
 ): CommandResult {
   if (!result.accepted) return result;
 
-  const draft = createDraft(result.state);
+  // Native transitions (move/attack/reinforce) are resolved first; data-only
+  // Mod rules then observe that committed result and may apply deterministic
+  // follow-up effects before power-loss and victory checks run.
+  const ruledState = applyModRules(previousState, result.state, command, terrains);
+  const draft = createDraft(ruledState);
   const events = [...result.events];
   applyPowerLossAfterTransition(previousState, draft, terrains, events);
   resolveMatchConditions(draft, terrains, matchConditions, events);
@@ -1386,12 +1365,9 @@ function removeUnit(draft: Draft, unitId: UnitId): void {
   const cell = draft.cells[unit.cellId];
   if (cell?.unitId === unitId) draft.cells[unit.cellId] = withCellUnit(cell, undefined);
   delete draft.units[unitId];
-  const { [unitId]: removedCounterattack, ...counterattacksUsed } = draft.turn.counterattacksUsed;
-  void removedCounterattack;
   draft.turn = {
     ...draft.turn,
-    exhaustedUnitIds: draft.turn.exhaustedUnitIds.filter((id) => id !== unitId),
-    counterattacksUsed
+    exhaustedUnitIds: draft.turn.exhaustedUnitIds.filter((id) => id !== unitId)
   };
 }
 
@@ -1482,8 +1458,7 @@ interface ActionStrengthDecay {
 
 /**
  * Opt-in unit rule for the old roaming-unit lifecycle. It is intentionally
- * separate from move/attack: a Mod can create a unit that acts without
- * changing strength, or give a stationary attacker the same decay.
+ * separate from attacks: a Mod can create a unit with its own movement decay.
  */
 function getActionStrengthDecay(definition: UnitSpec): ActionStrengthDecay | undefined {
   const capability = getUnitCapability(definition, UNIT_CAPABILITY.actionStrengthDecay);

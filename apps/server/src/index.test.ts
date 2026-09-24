@@ -306,6 +306,35 @@ describe("PvpRelayRoom lobby contract", () => {
     expect(room.broadcasts.some((event) => event.type === "snapshot-request")).toBe(false);
   });
 
+  it("relays local-first commands and keeps ordinary host snapshots as cache-only", () => {
+    const room = createRoom(2);
+    const host = join(room, "host");
+    const peer = join(room, "peer");
+    room.receive("lobby-ready", host, { ready: true });
+    room.receive("lobby-ready", peer, { ready: true });
+    room.broadcasts.length = 0;
+    host.sent.length = 0;
+    peer.sent.length = 0;
+
+    room.receive("host-snapshot", host, {
+      state: { sequence: 0 }, commandHeadId: null, cacheOnly: true, hostSentAtEpochMs: Date.now()
+    });
+    expect(room.broadcasts.some((message) => message.type === "host-snapshot")).toBe(false);
+
+    room.receive("player-intent", peer, {
+      parentCommandId: null,
+      command: { type: "end-action-phase", commandId: "local-command", actorId: "spoofed", expectedSequence: 0 }
+    });
+    expect(lastBroadcast<{ command: { actorId: string }; parentCommandId: null }>(room, "player-intent"))
+      .toMatchObject({ command: { actorId: "player-2" }, parentCommandId: null });
+    expect(host.sent.some((message) => message.type === "player-intent")).toBe(true);
+    expect(peer.sent.some((message) => message.type === "player-intent")).toBe(false);
+
+    room.receive("command-conflict", peer, { sequence: 4, commandHeadId: "different-history" });
+    expect(lastSent<{ sessionId: string; sequence: number }>(host, "command-conflict"))
+      .toMatchObject({ sessionId: "peer", sequence: 4 });
+  });
+
   it("rebases host clocks to server time and stamps cached deliveries at send time", () => {
     const now = vi.spyOn(Date, "now").mockReturnValue(100_000);
     const room = createRoom(2);

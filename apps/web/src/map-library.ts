@@ -16,10 +16,9 @@ export interface ConfiguredMap {
   readonly isDefault: boolean;
 }
 
-const installedModIds = new Set(installedTerrainMods.map((mod) => mod.id));
-
 /** A map code may be saved without its terrain Mods, but cannot be played yet. */
 export function missingTerrainMods(map: ConfiguredMap): string[] {
+  const installedModIds = new Set(installedTerrainMods.map((mod) => mod.id));
   return map.definition.requiredTerrainModIds.filter((id) => !installedModIds.has(id));
 }
 

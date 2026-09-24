@@ -1,4 +1,5 @@
 import { Client, type Room } from "@colyseus/sdk";
+import type { TerrainModDefinition } from "@numeral-lord/content-schema";
 import type { MapSubmission, MapWorkshopEntry, TerrainModEntry, TerrainModSubmission } from "./components/WorkshopPanel.vue";
 
 /** Server summaries omit the install flag, which is client-build-specific. */
@@ -7,7 +8,7 @@ export type WorkshopMapSummary = Omit<MapWorkshopEntry, "code"> & {
   readonly requiredTerrainModIds: readonly string[];
 };
 
-export type WorkshopTerrainModSummary = Omit<TerrainModEntry, "installed" | "sourceFiles"> & {
+export type WorkshopTerrainModSummary = Omit<TerrainModEntry, "installed" | "definition"> & {
   readonly modId: string;
 };
 
@@ -18,7 +19,7 @@ export interface WorkshopCatalogPayload {
 
 export type WorkshopDetailPayload =
   | { readonly kind: "map"; readonly entry: WorkshopMapSummary & { readonly code: string } }
-  | { readonly kind: "terrain-mod"; readonly entry: WorkshopTerrainModSummary & { readonly sourceFiles: NonNullable<TerrainModEntry["sourceFiles"]> } };
+  | { readonly kind: "terrain-mod"; readonly entry: WorkshopTerrainModSummary & { readonly definition?: TerrainModDefinition } };
 
 export interface WorkshopPublishedPayload {
   readonly kind: "map" | "terrain-mod";

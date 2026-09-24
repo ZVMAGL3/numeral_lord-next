@@ -1,4 +1,6 @@
 import type { GameCommand, GameState, MatchConditionModule, PlayerId } from "@numeral-lord/game-core";
+import type { SpatialPatternDefinition } from "@numeral-lord/game-core";
+import type { ModRuleDefinition } from "@numeral-lord/game-core";
 
 export type CapabilityTarget = "terrain" | "unit" | "match";
 
@@ -94,6 +96,10 @@ export interface ModDefinition {
   readonly capabilities: readonly CapabilityDefinition[];
   /** Optional, schema-validated map/room options; never arbitrary executable code. */
   readonly settings?: readonly ModSettingDefinition[];
+  /** Data-only regular path queries over the board graph. */
+  readonly spatialPatterns?: readonly SpatialPatternDefinition[];
+  /** Serializable event rules interpreted by game-core. */
+  readonly rules?: readonly ModRuleDefinition[];
   readonly terrains: readonly TerrainDefinition[];
   readonly units: readonly UnitDefinition[];
   readonly commandRules: readonly CommandRule[];

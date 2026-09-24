@@ -27,7 +27,10 @@ import { WorkshopRoom } from "./workshop.js";
 const installedMapCatalogs = {
   terrains: { ...coreTerrainCatalog, ...oilFieldTerrainCatalog },
   terrainModIds: Object.fromEntries(oilFieldMod.terrains.map((terrain) => [terrain.id, oilFieldMod.id])),
-  mods: { [oilFieldMod.id]: oilFieldMod }
+  mods: { [oilFieldMod.id]: oilFieldMod },
+  // The relay transports maps/mod settings but does not run a client's Mod
+  // code. The owning clients validate custom definitions before play.
+  allowUnknownTerrainMods: true
 };
 
 export { getLegalIntents };
@@ -183,10 +186,25 @@ export class PvpRelayRoom extends RelayRoom {
           resolvedCommandId: typeof payload.resolvedCommandId === "string" ? payload.resolvedCommandId : undefined
         });
       }
-      this.broadcast("host-snapshot", {
-        ...snapshot.payload,
-        serverSentAtEpochMs: receivedAtEpochMs
-      }, { except: client });
+      // Local-first command replication keeps snapshots out of the normal
+      // action path. Only initial join, handoff, or explicit conflict repair
+      // fans a full board out to the room.
+      if (payload.cacheOnly !== true || payload.reconcile === true) {
+        this.broadcast("host-snapshot", {
+          ...snapshot.payload,
+          serverSentAtEpochMs: receivedAtEpochMs
+        }, { except: client });
+      }
+    });
+    this.onMessage("command-conflict", (client, payload: Record<string, unknown> = {}) => {
+      if (this.phase !== "playing" || !this.members.has(client.sessionId)) return;
+      const host = this.clients.find((candidate) => candidate.sessionId === this.authoritativeHostSessionId);
+      if (!host) return;
+      host.send("command-conflict", {
+        sessionId: client.sessionId,
+        sequence: payload.sequence,
+        commandHeadId: typeof payload.commandHeadId === "string" ? payload.commandHeadId : null
+      });
     });
     this.onMessage("snapshot-check", (client, payload: Record<string, unknown> = {}) => {
       if (this.phase !== "playing" || !this.members.has(client.sessionId)
@@ -664,13 +682,14 @@ export class PvpRelayRoom extends RelayRoom {
 
   private updateModSettings(client: Client, rawSettings: unknown): void {
     try {
-      // The message replaces the entire room override. Unknown Mod IDs,
-      // undeclared fields and out-of-range values never enter room state.
+      // The message replaces the entire room override. Known Mod settings are
+      // schema-validated here; unknown Mod objects receive only safe JSON
+      // values because the relay forwards data and never executes their code.
       this.roomModSettings = validateModSettings(
         rawSettings,
         this.requiredTerrainModIds,
         installedMapCatalogs.mods,
-        false
+        true
       ) ?? {};
     } catch (error) {
       this.sendError(client, error instanceof Error ? error.message : "Mod 设置无效。");

@@ -159,6 +159,11 @@ export function createMatchFromMapDefinition(definition: MapDefinition, options:
     options.roomModSettings,
     options.mods
   );
+  const selectedMods = map.requiredTerrainModIds
+    .map((modId) => options.mods?.[modId])
+    .filter((mod): mod is NonNullable<typeof mod> => mod !== undefined);
+  const spatialPatterns = selectedMods.flatMap((mod) => mod.spatialPatterns ?? []).sort((left, right) => left.id.localeCompare(right.id));
+  const rules = selectedMods.flatMap((mod) => mod.rules ?? []).sort((left, right) => left.id.localeCompare(right.id));
   const rows = map.terrain.length / map.columns;
   const cells = {} as Record<CellId, MapCell>;
   const units = {} as Record<UnitId, UnitState>;
@@ -245,7 +250,8 @@ export function createMatchFromMapDefinition(definition: MapDefinition, options:
       friendlyFire: options.friendlyFire ?? false,
       matchConditionIds: map.matchConditionIds,
       modSettings: resolvedModSettings.values,
-      terrainCapabilityOverrides: resolvedModSettings.terrainCapabilityOverrides
+      terrainCapabilityOverrides: resolvedModSettings.terrainCapabilityOverrides,
+      ...(spatialPatterns.length || rules.length ? { modRuleSet: { patterns: spatialPatterns, rules } } : {})
     },
     board: { columns: map.columns, rows },
     cellTriggers,

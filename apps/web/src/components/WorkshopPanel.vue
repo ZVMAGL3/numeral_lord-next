@@ -1,9 +1,5 @@
 <script lang="ts">
-/** A workshop entry is data only. Displaying source never installs or executes it. */
-export interface WorkshopSourceFile {
-  readonly path: string;
-  readonly content: string;
-}
+import type { TerrainModDefinition } from "@numeral-lord/content-schema";
 
 export interface TerrainModEntry {
   /** Workshop publication ID; may differ from the package ID. */
@@ -18,7 +14,7 @@ export interface TerrainModEntry {
   readonly authorName?: string;
   readonly createdAt?: string;
   readonly readme?: string;
-  readonly sourceFiles?: readonly WorkshopSourceFile[];
+  readonly definition?: TerrainModDefinition;
   readonly previewImageUrl?: string;
 }
 
@@ -40,12 +36,9 @@ export interface MapWorkshopEntry {
 }
 
 export interface TerrainModSubmission {
-  readonly id: string;
   readonly name: string;
-  readonly version: string;
   readonly description: string;
-  readonly terrainIds: readonly string[];
-  readonly sourceFiles: readonly WorkshopSourceFile[];
+  readonly definition: TerrainModDefinition;
 }
 
 export interface MapSubmission {
@@ -84,6 +77,7 @@ const emit = defineEmits<{
   "save-map": [code: string];
   "publish-map": [entry: MapSubmission];
   "publish-terrain-mod": [entry: TerrainModSubmission];
+  "install-terrain-mod": [definition: TerrainModDefinition];
 }>();
 
 type Category = "terrain" | "maps";
@@ -92,30 +86,125 @@ const category = ref<Category>("terrain");
 const viewMode = ref<ViewMode>("browse");
 const selectedTerrainId = ref("");
 const selectedMapId = ref("");
-const selectedSourcePath = ref("");
 const showMapCode = ref(false);
 const copyMessage = ref("");
 const codeField = ref<HTMLTextAreaElement | null>(null);
 const publishMapCode = ref("");
 const publishMapDescription = ref("");
-const publishTerrainId = ref("");
 const publishTerrainName = ref("");
-const publishTerrainVersion = ref("1.0.0");
 const publishTerrainDescription = ref("");
-const publishTerrainIds = ref("");
-const publishSourcePath = ref("src/index.ts");
-const publishSourceContent = ref("");
+const publishModId = ref("mod-my-terrain");
+const publishModVersion = ref("1.0.0");
+const publishTerrainId = ref("mod/my-terrain");
+const publishTerrainDisplayName = ref("我的地块");
+const selectedCapabilities = ref<string[]>(["core/occupiable"]);
+const incomeAmount = ref(2);
+const departureGarrisonStrength = ref(1);
+const maxCounterattacks = ref(0);
+const publishSpatialPatterns = ref(JSON.stringify([{
+  id: "mod-my-terrain/conductive-network",
+  role: "core/powered-units",
+  result: { entity: "unit", distinctBy: "id" },
+  starts: {
+    op: "all",
+    items: [
+      { op: "terrain-has", capabilityId: "core/power-source" },
+      { op: "unit-owner-is", owner: "actor" }
+    ]
+  },
+  expression: {
+    op: "repeat",
+    min: 0,
+    max: 128,
+    item: {
+      op: "step",
+      relation: "hex-neighbor",
+      where: {
+        op: "all",
+        items: [
+          { op: "terrain-has", capabilityId: "core/power-conductor" },
+          { op: "unit-owner-is", owner: "actor" }
+        ]
+      }
+    }
+  }
+}], null, 2));
+const publishRules = ref(JSON.stringify([{
+  id: "mod-my-terrain/oilfield-income-on-enter",
+  trigger: "unit-enter",
+  target: { scope: "trigger-unit" },
+  conditions: [{ op: "at-cell-matches", predicate: { op: "terrain-has", capabilityId: "core/income-source" } }],
+  effects: [{ type: "grant-points", amount: 2 }]
+}], null, 2));
+const terrainCapabilityOptions = [
+  { id: "core/occupiable", label: "可占领", description: "允许单位占领该地块。" },
+  { id: "core/power-conductor", label: "传导供电", description: "连接相邻供电单位。" },
+  { id: "core/power-source", label: "供电源", description: "作为通电网络的供电起点。" },
+  { id: "core/income-source", label: "回合收益", description: "满足驻守条件时提供点数。" },
+  { id: "core/exhaust-on-departure", label: "离开时失活", description: "单位离开该地块时失去行动力。" },
+  { id: "core/adjacent-hostile-exhaustion", label: "敌方据点压制", description: "受相邻敌方据点影响时失去行动力。" },
+  { id: "core/exhaust-unpowered-after-capture", label: "占领后失活", description: "未通电单位占领后失去行动力。" },
+  { id: "core/departure-garrison", label: "离开时留兵", description: "单位离开时在原地留下游兵。" },
+  { id: "core/counterattack-terrain-limit", label: "反击次数限制", description: "限制该地块每回合可反击次数。" }
+];
+const generatedTerrainDefinition = computed<TerrainModDefinition>(() => {
+  const bindings = selectedCapabilities.value.map((id) => ({
+    id,
+    ...(id === "core/income-source" ? { config: { amount: incomeAmount.value } } : {}),
+    ...(id === "core/departure-garrison" ? { config: { strength: departureGarrisonStrength.value, unitDefinitionId: "core/roamer" } } : {}),
+    ...(id === "core/counterattack-terrain-limit" ? { config: { maxPerActionPhase: maxCounterattacks.value } } : {})
+  }));
+  const registered = selectedCapabilities.value
+    .filter((id) => id === "core/income-source" || id === "core/departure-garrison")
+    .map((id) => ({
+      id,
+      target: "terrain" as const,
+      defaultConfig: id === "core/income-source" ? { amount: 0 } : { strength: 1, unitDefinitionId: "core/roamer" }
+    }));
+  const settings = [
+    ...(selectedCapabilities.value.includes("core/income-source") ? [{
+      id: "incomePerTurn", displayName: "每回合收益", kind: "integer" as const,
+      defaultValue: incomeAmount.value, min: 0, max: 20,
+      target: { terrainId: publishTerrainId.value.trim(), capabilityId: "core/income-source", configKey: "amount" }
+    }] : []),
+    ...(selectedCapabilities.value.includes("core/departure-garrison") ? [{
+      id: "departureGarrisonStrength", displayName: "离开时留下的兵力", kind: "integer" as const,
+      defaultValue: departureGarrisonStrength.value, min: 1, max: 20,
+      target: { terrainId: publishTerrainId.value.trim(), capabilityId: "core/departure-garrison", configKey: "strength" }
+    }] : []),
+    ...(selectedCapabilities.value.includes("core/counterattack-terrain-limit") ? [{
+      id: "maxCounterattacks", displayName: "每回合反击次数", kind: "integer" as const,
+      defaultValue: maxCounterattacks.value, min: 0, max: 6,
+      target: { terrainId: publishTerrainId.value.trim(), capabilityId: "core/counterattack-terrain-limit", configKey: "maxPerActionPhase" }
+    }] : [])
+  ];
+  let spatialPatterns: TerrainModDefinition["spatialPatterns"] = [];
+  let rules: TerrainModDefinition["rules"] = [];
+  try {
+    const parsed = JSON.parse(publishSpatialPatterns.value) as unknown;
+    if (Array.isArray(parsed)) spatialPatterns = parsed as NonNullable<TerrainModDefinition["spatialPatterns"]>;
+  } catch { /* Form validation reports malformed patterns on submit. */ }
+  try {
+    const parsed = JSON.parse(publishRules.value) as unknown;
+    if (Array.isArray(parsed)) rules = parsed as NonNullable<TerrainModDefinition["rules"]>;
+  } catch { /* Form validation reports malformed rules on submit. */ }
+  return {
+    id: publishModId.value.trim(),
+    version: publishModVersion.value.trim(),
+    capabilities: registered,
+    ...(settings.length ? { settings } : {}),
+    ...(spatialPatterns.length ? { spatialPatterns } : {}),
+    ...(rules.length ? { rules } : {}),
+    terrains: [{ id: publishTerrainId.value.trim(), displayName: publishTerrainDisplayName.value.trim(), capabilities: bindings }]
+  };
+});
 const publishError = ref("");
 const downloadMessage = ref("");
 
 const selectedTerrain = computed(() => props.terrainMods.find((entry) => entry.id === selectedTerrainId.value));
 const selectedMap = computed(() => props.mapEntries.find((entry) => entry.id === selectedMapId.value));
-const selectedSource = computed(() => selectedTerrain.value?.sourceFiles?.find((file) => file.path === selectedSourcePath.value)
-  ?? selectedTerrain.value?.sourceFiles?.[0]);
-
-watch(() => selectedTerrain.value?.id, () => {
-  selectedSourcePath.value = "";
-});
+const selectedDefinitionJson = computed(() => selectedTerrain.value?.definition
+  ? JSON.stringify(selectedTerrain.value.definition, null, 2) : "");
 watch(() => selectedMap.value?.id, () => {
   showMapCode.value = false;
   copyMessage.value = "";
@@ -257,7 +346,7 @@ function openTerrain(entry: TerrainModEntry): void {
   downloadMessage.value = "";
   category.value = "terrain";
   viewMode.value = "detail";
-  if (!entry.sourceFiles) emit("select-terrain-mod", entry.id);
+  if (!entry.definition) emit("select-terrain-mod", entry.id);
 }
 
 function openDependency(id: string): void {
@@ -293,21 +382,6 @@ async function copyMapCode(): Promise<void> {
   }
 }
 
-function downloadTerrainSource(): void {
-  const entry = selectedTerrain.value;
-  if (!entry?.sourceFiles?.length) return;
-  // Downloading an inert JSON archive is distinct from installing a Mod.
-  // Runtime execution needs a separately verified, versioned content format.
-  const archive = { modId: entry.modId ?? entry.id, version: entry.version, sourceFiles: entry.sourceFiles };
-  const blobUrl = URL.createObjectURL(new Blob([JSON.stringify(archive, null, 2)], { type: "application/json" }));
-  const link = document.createElement("a");
-  link.href = blobUrl;
-  link.download = `${(entry.modId ?? entry.id).replace(/[^a-zA-Z0-9-]/g, "-")}-${entry.version.replace(/[^a-zA-Z0-9.-]/g, "-")}-source.json`;
-  link.click();
-  window.setTimeout(() => URL.revokeObjectURL(blobUrl), 0);
-  downloadMessage.value = "已下载源码归档；这不会安装或运行该 Mod。";
-}
-
 function submitMap(): void {
   const code = publishMapCode.value.trim();
   if (!code) { publishError.value = "请先粘贴地图码。"; return; }
@@ -323,20 +397,40 @@ function submitMap(): void {
 }
 
 function submitTerrainMod(): void {
-  const id = publishTerrainId.value.trim();
   const name = publishTerrainName.value.trim();
-  const version = publishTerrainVersion.value.trim();
   const description = publishTerrainDescription.value.trim();
-  const terrainIds = [...new Set(publishTerrainIds.value.split(/[\s,，]+/).map((value) => value.trim()).filter(Boolean))];
-  const sourcePath = publishSourcePath.value.trim();
-  const content = publishSourceContent.value;
-  if (!/^mod-[a-z0-9-]+$/.test(id) || !name || !version || !description || !terrainIds.length || !sourcePath || !content.trim()) {
-    publishError.value = "请填写 Mod 包 ID（如 mod-oil-field）、名称、版本、说明、地形 ID 和源码。";
+  if (!name || !publishTerrainDisplayName.value.trim()) { publishError.value = "请填写 Mod 名称和地块名称。"; return; }
+  const definition = generatedTerrainDefinition.value;
+  if (!definition.id || !definition.version || !definition.terrains[0]?.id) { publishError.value = "请填写 Mod ID、版本和地块 ID。"; return; }
+  try {
+    const patterns = JSON.parse(publishSpatialPatterns.value) as unknown;
+    if (!Array.isArray(patterns)) throw new Error();
+    if (patterns.some((pattern) => !pattern || typeof pattern !== "object" || typeof (pattern as { id?: unknown }).id !== "string")) throw new Error();
+  } catch {
+    publishError.value = "空间算法必须是有效的 JSON 数组；请检查括号、逗号和算法 ID。";
     return;
   }
-  const sourceFiles: WorkshopSourceFile[] = [{ path: sourcePath, content }];
+  try {
+    const rules = JSON.parse(publishRules.value) as unknown;
+    if (!Array.isArray(rules) || rules.some((rule) => !rule || typeof rule !== "object" || typeof (rule as { id?: unknown }).id !== "string")) throw new Error();
+  } catch {
+    publishError.value = "触发规则必须是有效的 JSON 数组；请检查括号、逗号和规则 ID。";
+    return;
+  }
   publishError.value = "";
-  emit("publish-terrain-mod", { id, name, version, description, terrainIds, sourceFiles });
+  emit("publish-terrain-mod", { name, description, definition });
+}
+
+function toggleCapability(id: string): void {
+  selectedCapabilities.value = selectedCapabilities.value.includes(id)
+    ? selectedCapabilities.value.filter((candidate) => candidate !== id)
+    : [...selectedCapabilities.value, id];
+}
+
+function installSelectedTerrain(): void {
+  if (selectedTerrain.value?.definition && !selectedTerrain.value.installed) {
+    emit("install-terrain-mod", selectedTerrain.value.definition);
+  }
 }
 </script>
 
@@ -346,7 +440,7 @@ function submitTerrainMod(): void {
       <div>
         <p class="eyebrow">COMMUNITY WORKSHOP</p>
         <h2>创意工坊</h2>
-        <p>浏览地块扩展和地图作品。地图码可以保存到「地图配置」；地块源码仅供预览，不会在这里自动执行。</p>
+        <p>浏览地图与结构化地块 Mod。地块 Mod 安装后会以数据形式加载，由游戏内核支持的能力规则执行。</p>
       </div>
       <button class="back-button" type="button" @click="emit('back')">← 返回主页</button>
     </header>
@@ -363,7 +457,7 @@ function submitTerrainMod(): void {
     <p v-if="actionMessage" class="action-message" :class="{ error: actionError }" role="status">{{ actionMessage }}</p>
 
     <div class="workshop-toolbar">
-      <div><strong>{{ category === 'terrain' ? '地块扩展' : '地图作品' }}</strong><p>{{ category === 'terrain' ? '查看规则、包含地块与源码。安装需要受校验的 Mod 格式，当前不会执行社区源码。' : '地图作品是一段可保存的地图码；开局前需要装齐所依赖的地块 Mod。' }}</p></div>
+      <div><strong>{{ category === 'terrain' ? '地块扩展' : '地图作品' }}</strong><p>{{ category === 'terrain' ? '查看结构化属性与包含地块。安装后由游戏内核执行已支持的能力。' : '地图作品是一段可保存的地图码；开局前需要装齐所依赖的地块 Mod。' }}</p></div>
       <button v-if="publishingEnabled && viewMode === 'browse'" class="outline-button publish-entry" type="button" @click="openPublish">＋ {{ category === 'terrain' ? '发布地块 Mod' : '发布地图作品' }}</button>
       <span v-else-if="!publishingEnabled" class="read-only-note">公网测试版仅开放浏览，暂不接受发布</span>
     </div>
@@ -408,19 +502,13 @@ function submitTerrainMod(): void {
           <p class="description">{{ selectedTerrain.description }}</p>
           <div class="metadata-block"><strong>包含地块</strong><div class="token-list"><code v-for="id in selectedTerrain.terrainIds" :key="id">{{ id }}</code><span v-if="!selectedTerrain.terrainIds.length" class="quiet">未声明地块 ID</span></div></div>
           <p v-if="selectedTerrain.readme" class="readme">{{ selectedTerrain.readme }}</p>
+          <div class="metadata-block"><strong>Mod 属性对象</strong><p class="quiet">这些是存入数据库并安装到本机的 JSON 属性；行为由游戏内核中对应的能力处理器执行，不运行上传脚本。</p></div>
+          <pre v-if="selectedDefinitionJson" class="definition-preview"><code>{{ selectedDefinitionJson }}</code></pre>
+          <p v-else class="source-empty">{{ selectedTerrain.definition === undefined ? '此旧版作品没有结构化属性对象，暂时无法安装；作者可以按新格式重新发布。' : '正在加载作品详情…' }}</p>
           <div class="detail-actions">
-            <button v-if="selectedTerrain.sourceFiles?.length" class="outline-button" type="button" @click="downloadTerrainSource">下载源码归档（不安装）</button>
-            <span v-if="!selectedTerrain.installed" class="install-unavailable">自动安装暂未开放：需要先完成版本、依赖和规则校验。</span>
+            <button class="primary-button" type="button" :disabled="selectedTerrain.installed || !selectedTerrain.definition || working" @click="installSelectedTerrain">{{ selectedTerrain.installed ? '已安装到本机' : selectedTerrain.definition ? '下载并安装 Mod' : '需要重新发布' }}</button>
           </div>
           <p v-if="downloadMessage" class="copy-message" role="status">{{ downloadMessage }}</p>
-          <div class="source-heading"><strong>源码预览</strong><span>仅展示文本，不执行代码</span></div>
-          <template v-if="selectedTerrain.sourceFiles?.length">
-            <div class="source-tabs" aria-label="源码文件">
-              <button v-for="file in selectedTerrain.sourceFiles" :key="file.path" type="button" :class="{ active: selectedSource?.path === file.path }" @click="selectedSourcePath = file.path">{{ file.path }}</button>
-            </div>
-            <pre class="source-code"><code>{{ selectedSource?.content }}</code></pre>
-          </template>
-          <p v-else class="source-empty">{{ selectedTerrain.sourceFiles ? '该作品未附带公开源码文件。' : '正在加载作品详情…' }}</p>
         </article>
 
         <article v-else-if="category === 'maps' && selectedMap" class="detail-card">
@@ -455,17 +543,41 @@ function submitTerrainMod(): void {
         </article>
 
         <article v-else class="publish-card">
-          <div class="section-heading"><strong>发布地块 Mod</strong><span>元信息与源码</span></div>
-          <p>这里提交的源码只作为作品文本展示，不会自动加载或在其他玩家设备上执行。</p>
-          <div class="form-grid">
-            <label>Mod 包 ID<input v-model="publishTerrainId" type="text" maxlength="100" placeholder="mod-my-terrain" /></label>
-            <label>名称<input v-model="publishTerrainName" type="text" maxlength="60" placeholder="地块名称" /></label>
-            <label>版本<input v-model="publishTerrainVersion" type="text" maxlength="32" placeholder="1.0.0" /></label>
-            <label>地形 ID<input v-model="publishTerrainIds" type="text" placeholder="mod/my-terrain，可用逗号分隔" /></label>
-          </div>
+          <div class="section-heading"><strong>发布地块 Mod</strong><span>版本化属性对象</span></div>
+          <p>填写基本信息，再从能力列表中选择地块功能。提交的是结构化属性对象；安装后由游戏内核执行，不会运行上传脚本。</p>
+          <label>Mod 名称<input v-model="publishTerrainName" type="text" maxlength="60" placeholder="地块扩展名称" /></label>
           <label>作品说明<textarea v-model="publishTerrainDescription" class="code-field small-field" maxlength="1000" placeholder="说明这个地块如何影响规则…" /></label>
-          <label>源码文件路径<input v-model="publishSourcePath" type="text" maxlength="160" placeholder="src/index.ts" /></label>
-          <label>源码文本<textarea v-model="publishSourceContent" class="code-field source-input" spellcheck="false" placeholder="粘贴地块 Mod 的源码…" /></label>
+          <div class="form-grid">
+            <label>Mod ID<input v-model="publishModId" type="text" maxlength="80" placeholder="mod-my-mod" /></label>
+            <label>版本<input v-model="publishModVersion" type="text" maxlength="40" placeholder="1.0.0" /></label>
+            <label>地块 ID<input v-model="publishTerrainId" type="text" maxlength="100" placeholder="mod/my-terrain" /></label>
+            <label>地块名称<input v-model="publishTerrainDisplayName" type="text" maxlength="40" placeholder="新地块" /></label>
+          </div>
+          <label class="capability-label">地块功能（可多选）</label>
+          <details class="capability-picker">
+            <summary>{{ selectedCapabilities.length ? `已选择 ${selectedCapabilities.length} 项功能` : '选择要添加的地块功能' }}<span>▾</span></summary>
+            <div class="capability-options">
+              <label v-for="option in terrainCapabilityOptions" :key="option.id" class="capability-option">
+                <input type="checkbox" :checked="selectedCapabilities.includes(option.id)" @change="toggleCapability(option.id)" />
+                <span><strong>{{ option.label }}</strong><small>{{ option.description }}</small><code>{{ option.id }}</code></span>
+              </label>
+            </div>
+          </details>
+          <div v-if="selectedCapabilities.includes('core/income-source') || selectedCapabilities.includes('core/departure-garrison') || selectedCapabilities.includes('core/counterattack-terrain-limit')" class="form-grid capability-config">
+            <label v-if="selectedCapabilities.includes('core/income-source')">每回合收益<input v-model.number="incomeAmount" type="number" min="0" max="20" /></label>
+            <label v-if="selectedCapabilities.includes('core/departure-garrison')">离开留下的兵力<input v-model.number="departureGarrisonStrength" type="number" min="1" max="20" /></label>
+            <label v-if="selectedCapabilities.includes('core/counterattack-terrain-limit')">每回合反击次数<input v-model.number="maxCounterattacks" type="number" min="0" max="6" /></label>
+            <p>这些是 Mod 默认值；房间设置中可再由房主调整。</p>
+          </div>
+          <label class="spatial-pattern-label">空间算法（JSON）<textarea v-model="publishSpatialPatterns" class="code-field pattern-input" spellcheck="false" /></label>
+          <p class="pattern-help">表达式支持 step（相邻一步）、sequence（依次匹配）、either（任选一种）和 repeat（重复范围）；条件支持地块能力、己方/敌方单位、单位标记及 all / any / not。result 可选择格子或单位；单位结果必须按 id 去重。role 为 core/powered-units 时会用此算法替换内核默认供电网络。示例从供电源出发，沿己方占据的导电地块递归扩展。</p>
+          <label class="spatial-pattern-label">触发规则（JSON）<textarea v-model="publishRules" class="code-field pattern-input" spellcheck="false" /></label>
+          <p class="pattern-help">规则以事件触发：state-changed、unit-enter、unit-leave、unit-destroyed、turn-start。目标可以是触发单位，或空间算法选中的单位；条件可检查事件格地块能力或单位是否匹配算法。效果支持加减兵力、奖励点数、失活、设置/移除标记及按算法同步标记。上传内容只接受受限 JSON 数据，不会执行脚本。</p>
+          <details class="capability-help">
+            <summary>我想添加列表里没有的自定义功能</summary>
+            <p>Mod 数据只能组合内核已经实现的能力，不能靠发布一段 JSON 或脚本凭空增加新规则。要新增全新的行为，需要先在游戏规则内核中实现并注册一个能力处理器，再把它加入这份可选列表；之后作者就能在这里选择它并配置参数。这样才能保证所有玩家执行结果一致，也不会运行陌生代码。</p>
+          </details>
+          <details class="definition-details"><summary>查看将发布的属性对象</summary><pre class="definition-preview"><code>{{ JSON.stringify(generatedTerrainDefinition, null, 2) }}</code></pre></details>
           <div class="submit-row"><span v-if="publishError" class="form-error" role="alert">{{ publishError }}</span><button class="primary-button" type="button" :disabled="working" @click="submitTerrainMod">发布地块 Mod</button></div>
         </article>
     </div>
@@ -484,4 +596,11 @@ function submitTerrainMod(): void {
 .detail-stack{max-width:920px;margin:0 auto}.catalog-back{width:auto;justify-self:start;margin:0;padding:7px 12px;border:1px solid rgba(143,188,206,.28);color:#c6e3ef;background:rgba(18,47,65,.45);font-size:11px}.map-preview{height:clamp(270px,34vw,450px)}.map-preview :deep(.board-canvas){height:100%;border:none;border-radius:0}.install-unavailable{color:#e6bba7;font-size:11px;line-height:1.5}.dependency-warning{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;padding:11px;border:1px solid rgba(239,157,164,.3);border-radius:10px;background:rgba(108,46,62,.16)}.dependency-warning button{width:auto;margin:0;padding:7px 10px;font-size:11px}
 @media(max-width:570px){.workshop-toolbar{align-items:stretch;flex-direction:column}.publish-entry{width:100%}.workshop-catalog{grid-template-columns:1fr}.work-card-preview{height:155px}.map-preview{height:280px}}
 .terrain-card-preview{position:relative;isolation:isolate;height:112px;background:#182638}.terrain-card-preview::before{display:none}.terrain-card-preview img{position:relative;z-index:1;filter:none}.terrain-card-preview .custom-terrain-art{max-width:94px;max-height:88px;object-fit:contain}.terrain-card-preview .oil-field-art{position:relative;display:grid;place-items:center;width:72px;height:80px;clip-path:polygon(50% 0,93% 24%,93% 76%,50% 100%,7% 76%,7% 24%);background:linear-gradient(145deg,#b77b43,#684024);box-shadow:inset 0 0 0 3px #f0ba69}.terrain-card-preview .oil-field-art img{width:65px;height:72px;object-fit:contain;opacity:.25;mix-blend-mode:screen}.terrain-card-preview .generic-terrain-mark{position:relative;z-index:1;color:#d9c99b;font-size:48px;line-height:1}.terrain-preview-image{max-width:min(100%,180px);max-height:140px;margin:12px auto}
+.capability-label{margin-top:16px;color:#b7ceda;font-size:11px;font-weight:700}.capability-picker{position:relative;margin-top:7px;border:1px solid rgba(136,177,204,.31);border-radius:10px;background:#0c1b2b}.capability-picker>summary,.capability-help>summary,.definition-details>summary{display:flex;justify-content:space-between;align-items:center;min-height:40px;padding:0 12px;color:#cce1ec;font-size:12px;cursor:pointer;list-style:none}.capability-picker>summary::-webkit-details-marker,.capability-help>summary::-webkit-details-marker,.definition-details>summary::-webkit-details-marker{display:none}.capability-picker[open]>summary{border-bottom:1px solid rgba(136,177,204,.2)}.capability-options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;padding:10px}.capability-option{display:flex!important;align-items:flex-start;gap:9px;margin:0!important;padding:9px;border:1px solid rgba(136,177,204,.17);border-radius:8px;background:rgba(29,51,69,.55)}.capability-option input{flex:none;width:15px;height:15px;margin:2px 0 0;accent-color:#75dccc}.capability-option span{display:grid;gap:3px}.capability-option strong{color:#dcebf4;font-size:11px}.capability-option small{color:#8eaabc;font-size:10px;font-weight:400;line-height:1.4}.capability-option code{color:#7ccfc7;font-size:9px}.capability-help,.definition-details{margin-top:12px;border:1px solid rgba(136,177,204,.2);border-radius:9px;background:rgba(12,27,43,.5)}.capability-help>summary,.definition-details>summary{justify-content:flex-start;min-height:36px;color:#9fded7;font-size:11px}.capability-help p{margin:0;padding:0 12px 12px;color:#a8bdcc;font-size:11px;line-height:1.6}.definition-details .definition-preview{margin:0 10px 10px}.publish-card .form-grid{margin-top:2px}.publish-card .form-grid label{min-width:0}
+.capability-config{margin-top:10px;padding:12px;border:1px solid rgba(136,177,204,.18);border-radius:10px;background:rgba(15,32,48,.55)}.capability-config p{grid-column:1/-1;margin:2px 0 0;color:#8eaabc;font-size:10px}.spatial-pattern-label{margin-top:16px!important}.pattern-input{min-height:300px}.pattern-help{margin:7px 0 0;color:#91adbd;font-size:10px;line-height:1.6}
+@media(max-width:570px){.capability-options{grid-template-columns:1fr}}
+</style>
+
+<style scoped>
+.definition-preview { max-height: 360px; overflow: auto; margin: 10px 0; padding: 14px; border: 1px solid rgba(125,167,191,.26); border-radius: 10px; background: #0b1928; color: #d7e9f1; font: 11px/1.6 ui-monospace, Consolas, monospace; white-space: pre; }
 </style>

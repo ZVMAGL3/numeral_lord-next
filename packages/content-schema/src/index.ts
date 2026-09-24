@@ -3,11 +3,12 @@ import { z } from "zod";
 export * from "./workshop.js";
 
 export const modManifestSchema = z.object({
-  id: z.string().regex(/^[a-z0-9-]+$/),
+  id: z.string().regex(/^mod-[a-z0-9]+(?:-[a-z0-9]+)*$/),
   version: z.string(),
   apiVersion: z.literal(1),
-  entry: z.string().endsWith(".ts"),
-  dependencies: z.record(z.string(), z.string()).default({})
+  contentKind: z.literal("terrain-data"),
+  dependencies: z.record(z.string(), z.string()).default({}),
+  definition: z.record(z.string(), z.unknown())
 });
 
 export type ModManifest = z.infer<typeof modManifestSchema>;

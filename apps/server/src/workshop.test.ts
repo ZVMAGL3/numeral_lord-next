@@ -23,7 +23,39 @@ afterEach(async () => {
   await rm(resolvedDirectory, { recursive: true, force: true });
 });
 
-describe("workshop persistence and inert previews", () => {
+const exampleModDefinition = {
+  id: "mod-oil-field",
+  version: "1.0.0",
+  capabilities: [{ id: "core/income-source", target: "terrain", defaultConfig: { amount: 0 } }],
+  settings: [{
+    id: "incomePerTurn", displayName: "每回合收益", kind: "integer", defaultValue: 2, min: 0, max: 20,
+    target: { terrainId: "mod/oil-field", capabilityId: "core/income-source", configKey: "amount" }
+  }],
+  spatialPatterns: [{
+    id: "mod-oil-field/wire-network",
+    role: "core/powered-units",
+    result: { entity: "unit", distinctBy: "id" },
+    starts: { op: "terrain-has", capabilityId: "core/power-source" },
+    expression: {
+      op: "repeat", min: 0, max: 128,
+      item: { op: "step", relation: "hex-neighbor", where: { op: "terrain-has", capabilityId: "core/power-conductor" } }
+    }
+  }],
+  rules: [{
+    id: "mod-oil-field/field-income",
+    trigger: "unit-enter",
+    target: { scope: "trigger-unit" },
+    conditions: [{ op: "at-cell-matches", predicate: { op: "terrain-has", capabilityId: "core/income-source" } }],
+    effects: [{ type: "grant-points", amount: 2 }]
+  }],
+  terrains: [{
+    id: "mod/oil-field",
+    displayName: "油田",
+    capabilities: [{ id: "core/occupiable" }, { id: "core/income-source", config: { amount: 2 } }]
+  }]
+};
+
+describe("workshop persistence and data-only Mod objects", () => {
   it("publishes a JSON map without installing its required terrain Mod", async () => {
     const published = await store.publishMap({ code: DEFAULT_MAP_CODE, description: "内置地形示例" }, "地图作者");
     expect(published.kind).toBe("map");
@@ -70,15 +102,11 @@ describe("workshop persistence and inert previews", () => {
     }
   });
 
-  it("keeps a Mod as source text only, without evaluating it", async () => {
-    const source = "throw new Error('This source must never run');";
+  it("stores and returns a JSON Mod definition object, without source files", async () => {
     const published = await store.publishTerrainMod({
-      id: "mod-oil-field",
       name: "油田",
-      version: "1.0.0",
       description: "不导电的资源地块",
-      terrainIds: ["mod/oil-field"],
-      sourceFiles: [{ path: "src/index.ts", content: source }]
+      definition: exampleModDefinition
     }, "Mod 作者");
     const catalog = await store.list();
     expect(catalog.terrainMods).toMatchObject([{
@@ -90,29 +118,50 @@ describe("workshop persistence and inert previews", () => {
     expect("sourceFiles" in catalog.terrainMods[0]!).toBe(false);
     const detail = await store.get({ kind: "terrain-mod", id: published.id });
     if (detail?.kind !== "terrain-mod") throw new Error("Missing Mod detail");
-    expect(detail.entry.sourceFiles[0]?.content).toBe(source);
+    expect(detail.entry.definition).toEqual(exampleModDefinition);
   });
 
-  it("rejects duplicate and oversized submissions, unsafe paths and mismatched terrain IDs", async () => {
+  it("rejects duplicate, oversized and invalid capability objects", async () => {
     await store.publishMap({ code: DEFAULT_MAP_CODE, description: "" }, "A");
     await expect(store.publishMap({ code: DEFAULT_MAP_CODE, description: "" }, "B"))
       .rejects.toThrow(/已经发布/);
     await expect(store.publishMap({ code: "x".repeat(65_537), description: "" }, "A"))
       .rejects.toBeInstanceOf(WorkshopInputError);
     const mod = {
-      id: "mod-oil-field",
       name: "油田",
-      version: "1.0.0",
       description: "",
-      terrainIds: ["mod/oil-field"],
-      sourceFiles: [{ path: "src/index.ts", content: "export default 1;" }]
+      definition: exampleModDefinition
     };
-    await expect(store.publishTerrainMod({ ...mod, terrainIds: ["mod/unrelated"] }, "A"))
-      .rejects.toThrow(/属于该 Mod/);
-    await expect(store.publishTerrainMod({ ...mod, sourceFiles: [{ path: "../escape.ts", content: "x" }] }, "A"))
-      .rejects.toThrow(/路径无效/);
-    await expect(store.publishTerrainMod({ ...mod, sourceFiles: [{ path: "src/index.ts", content: "x".repeat(65_537) }] }, "A"))
+    await expect(store.publishTerrainMod({ ...mod, definition: { ...exampleModDefinition, terrains: [{ ...exampleModDefinition.terrains[0]!, id: "mod/unrelated" }] } }, "A"))
+      .rejects.toThrow(/地块 ID/);
+    await expect(store.publishTerrainMod({ ...mod, definition: { ...exampleModDefinition, terrains: [{ ...exampleModDefinition.terrains[0]!, capabilities: [{ id: "mod/execute-script" }] }] } }, "A"))
+      .rejects.toThrow(/不支持/);
+    await expect(store.publishTerrainMod({ ...mod, definition: {
+      ...exampleModDefinition,
+      settings: [{ ...exampleModDefinition.settings[0]!, target: { terrainId: "mod/oil-field", capabilityId: "core/power-conductor", configKey: "amount" } }]
+    } }, "A")).rejects.toThrow(/未绑定对应能力/);
+    await expect(store.publishTerrainMod({ ...mod, definition: {
+      ...exampleModDefinition,
+      spatialPatterns: [{ ...exampleModDefinition.spatialPatterns[0]!, expression: {
+        op: "repeat", min: 0, max: 50_000, item: exampleModDefinition.spatialPatterns[0]!.expression
+      } }]
+    } }, "A")).rejects.toThrow(/重复次数/);
+    await expect(store.publishTerrainMod({ ...mod, definition: {
+      ...exampleModDefinition,
+      spatialPatterns: [{ ...exampleModDefinition.spatialPatterns[0]!, result: { entity: "unit" } }]
+    } }, "A")).rejects.toThrow(/按 ID 去重/);
+    await expect(store.publishTerrainMod({ ...mod, definition: {
+      ...exampleModDefinition,
+      rules: [{ ...exampleModDefinition.rules[0]!, effects: [{ type: "execute-script", source: "alert(1)" }] }]
+    } }, "A")).rejects.toThrow(/不支持的效果/);
+    await expect(store.publishTerrainMod({ ...mod, definition: {
+      ...exampleModDefinition,
+      rules: [{ ...exampleModDefinition.rules[0]!, target: { scope: "pattern-units", patternId: "mod-oil-field/missing" } }]
+    } }, "A")).rejects.toThrow(/规则 ID、触发器、目标或结构无效/);
+    await expect(store.publishTerrainMod({ ...mod, definition: { ...exampleModDefinition, terrains: [{ ...exampleModDefinition.terrains[0]!, displayName: "x".repeat(65_537) }] } }, "A"))
       .rejects.toThrow(/64 KiB/);
+    await expect(store.publishTerrainMod({ ...mod, definition: undefined }, "A"))
+      .rejects.toBeInstanceOf(WorkshopInputError);
     expect((await store.list()).terrainMods).toHaveLength(0);
   });
 

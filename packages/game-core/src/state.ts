@@ -39,6 +39,8 @@ export interface UnitState {
   readonly ownerId: PlayerId;
   readonly cellId: CellId;
   readonly strength: number;
+  /** Mod-owned boolean tags, changed only by validated data-only rule effects. */
+  readonly markers?: readonly string[];
 }
 
 export interface PlayerState {
@@ -62,7 +64,8 @@ export interface TurnState {
   /** Units that may not take another action before the current turn ends. */
   readonly exhaustedUnitIds: readonly UnitId[];
   /** How many counterattacks each unit has spent in the current action phase. */
-  readonly counterattacksUsed: Readonly<Record<UnitId, number>>;
+  /** Counterattack usage is terrain-cell state, not unit identity state. */
+  readonly counterattacksUsed: Readonly<Record<CellId, number>>;
 }
 
 export interface MatchSettings {
@@ -73,6 +76,11 @@ export interface MatchSettings {
   readonly modSettings?: Readonly<Record<string, Readonly<Record<string, number | boolean | string>>>>;
   /** Generic capability values resolved from Mod setting schemas, by terrain and capability ID. */
   readonly terrainCapabilityOverrides?: Readonly<Record<string, Readonly<Record<string, Readonly<Record<string, unknown>>>>>>;
+  /** Version-pinned data-only Mod rule snapshot loaded with the selected map. */
+  readonly modRuleSet?: {
+    readonly patterns: readonly import("./spatial-pattern.js").SpatialPatternDefinition[];
+    readonly rules: readonly import("./mod-rules.js").ModRuleDefinition[];
+  };
 }
 
 /** Persisted settlement data shared by the browser, server and headless AI. */

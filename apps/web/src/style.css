@@ -69,11 +69,24 @@ h1 { margin: 0; font-size: clamp(28px, 5vw, 42px); letter-spacing: -.04em; }
 .sync-panel h2 { margin: 0 0 7px; color: #f6faff; font-size: 24px; }
 .sync-panel p { max-width: 410px; margin: 0; color: #a7bdd1; font-size: 12px; line-height: 1.7; }
 @keyframes sync-spin { to { transform: rotate(360deg); } }
-.match-result { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 16px; padding: 16px 18px; border: 1px solid rgba(126,231,194,.52); border-radius: 18px; background: linear-gradient(110deg, rgba(31,86,92,.78), rgba(25,47,70,.92)); box-shadow: 0 12px 34px rgba(21, 195, 167, .12); }
-.match-result h2 { margin: 2px 0 5px; color: #f5fffb; font-size: clamp(20px, 3vw, 28px); }
-.match-result p { margin: 0; color: #b9d9d7; font-size: 12px; }
-.match-result .result-kicker { color: #8df5ce; font-size: 10px; font-weight: 900; letter-spacing: .12em; }
-.match-result button { width: auto; min-width: 150px; margin-top: 0; }
+.result-backdrop { position: fixed; z-index: 50; inset: 0; display: grid; place-items: center; overflow-y: auto; padding: 22px; background: rgba(3, 8, 16, .76); backdrop-filter: blur(8px); animation: result-fade-in .22s ease-out both; }
+.result-dialog { position: relative; width: min(470px, 100%); overflow: hidden; padding: clamp(28px, 6vw, 42px) clamp(22px, 6vw, 40px) 30px; border: 1px solid rgba(126,231,194,.48); border-radius: 24px; background: radial-gradient(ellipse at 50% -10%, rgba(76,197,174,.2), transparent 54%), linear-gradient(155deg, #1b3046, #101c2d 78%); box-shadow: 0 32px 100px rgba(0,0,0,.58), 0 0 42px rgba(72,209,177,.1); text-align: center; animation: result-pop-in .32s cubic-bezier(.2,.8,.2,1) both; }
+.result-dialog::before { position: absolute; top: 0; left: 16%; width: 68%; height: 1px; background: linear-gradient(90deg, transparent, rgba(158,255,222,.9), transparent); content: ""; }
+.result-emblem { display: grid; width: 58px; height: 58px; place-items: center; margin: 0 auto 18px; border: 1px solid rgba(126,231,194,.5); border-radius: 18px; background: rgba(99,220,187,.1); color: #8ff0cd; font-size: 30px; line-height: 1; box-shadow: inset 0 0 22px rgba(126,231,194,.08), 0 8px 28px rgba(0,0,0,.18); }
+.result-kicker { margin: 0 0 11px; color: #91e9cd; font-size: 10px; font-weight: 900; letter-spacing: .15em; }
+.result-kicker span { padding: 0 4px; color: #5b8d91; }
+.result-dialog h2 { margin: 0; color: #f5fbff; font-size: clamp(25px, 6vw, 34px); line-height: 1.2; text-wrap: balance; }
+.result-message { margin: 11px 0 0; color: #b4c8d8; font-size: 13px; line-height: 1.65; }
+.result-divider { display: flex; align-items: center; gap: 12px; margin: 25px 0 21px; color: #6f899e; font-size: 10px; }
+.result-divider span { height: 1px; flex: 1; background: linear-gradient(90deg, transparent, rgba(141,181,203,.25)); }
+.result-divider span:last-child { transform: rotate(180deg); }
+.result-divider i { font-style: normal; white-space: nowrap; }
+.result-return { display: flex; width: 100%; min-height: 48px; align-items: center; justify-content: center; gap: 8px; margin: 0; }
+.result-return span { font-size: 17px; transition: transform .18s ease; }
+.result-return:hover span { transform: translateX(3px); }
+.result-waiting { margin: 0; color: #92a9bd; font-size: 12px; }
+@keyframes result-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes result-pop-in { from { opacity: 0; transform: translateY(10px) scale(.97); } to { opacity: 1; transform: translateY(0) scale(1); } }
 .play-layout { display: grid; grid-template-columns: 240px minmax(0,1fr) 270px; gap: 16px; align-items: start; }
 .panel { border: 1px solid rgba(141,166,204,.28); border-radius: 18px; background: linear-gradient(160deg,#1a2940,#111d2e); padding: 15px; }
 .panel-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 12px; color: #dce9fb; font-size: 14px; font-weight: 800; }
@@ -121,7 +134,7 @@ footer { margin-top: 15px; color: #64748b; text-align: center; font-size: 11px; 
 code { color: #9adffc; }
 @media (max-width:1020px) { .play-layout { grid-template-columns:220px minmax(0,1fr); } .action-panel { grid-column:1 / -1; } }
 @media (max-width:800px) { .room-hub-grid { grid-template-columns: 1fr; }.room-option { min-height: 195px; } }
-@media (max-width:680px) { .app-shell { padding:14px 11px; } .topbar { align-items:flex-start; flex-direction:column; gap:10px; } .topbar-meta { width:100%; align-items:flex-start; } .room-entry { grid-template-columns:1fr; min-height:0; padding:22px 16px; gap:18px; } .join-row { grid-template-columns:1fr; }.match-result { align-items:stretch; flex-direction:column; } .match-result button { width:100%; } .play-layout { grid-template-columns:1fr; } .player-panel { order:2; display:grid; grid-template-columns:1fr 1fr; gap:4px; } .player-panel .panel-heading,.player-panel .legend { grid-column:1 / -1; } .player-card { margin:0; } .board-wrap { order:1; grid-template-rows:minmax(260px,36dvh) auto; } .board-canvas { min-height:260px; } .action-panel { grid-column:auto; order:3; } }
+@media (max-width:680px) { .app-shell { padding:14px 11px; } .topbar { align-items:flex-start; flex-direction:column; gap:10px; } .topbar-meta { width:100%; align-items:flex-start; } .room-entry { grid-template-columns:1fr; min-height:0; padding:22px 16px; gap:18px; } .join-row { grid-template-columns:1fr; }.result-backdrop { padding:15px; }.result-dialog { border-radius:20px; }.play-layout { grid-template-columns:1fr; } .player-panel { order:2; display:grid; grid-template-columns:1fr 1fr; gap:4px; } .player-panel .panel-heading,.player-panel .legend { grid-column:1 / -1; } .player-card { margin:0; } .board-wrap { order:1; grid-template-rows:minmax(260px,36dvh) auto; } .board-canvas { min-height:260px; } .action-panel { grid-column:auto; order:3; } }
 @media (max-width:680px) { .room-hub { padding: 23px 16px; }.room-option { min-height: 0; padding: 19px; }.room-option p { margin-bottom: 18px; }.room-option .join-row { grid-template-columns: 1fr; }.room-option .join-row button { width: 100%; }.room-hub-foot { flex-direction: column; }.topbar-back { min-height: 42px; }.sync-panel { min-height: 260px; } }
 @media (max-width:360px) { .leave-actions { flex-direction: column; } }
-@media (prefers-reduced-motion: reduce) { .sync-spinner { animation-duration: 2s; } }
+@media (prefers-reduced-motion: reduce) { .sync-spinner { animation-duration: 2s; }.result-backdrop,.result-dialog { animation:none; } }

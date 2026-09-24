@@ -140,6 +140,36 @@ describe("core turn rules", () => {
     unitId: id("p2-home"), targetId: toCellId({ column: 0, row: 1 })
   };
 
+  it("runs an installed Mod's unit-enter rule after the native move", () => {
+    const destinationId = toCellId({ column: 2, row: 1 });
+    const state: GameState = {
+      ...fixture(),
+      settings: {
+        friendlyFire: false,
+        modRuleSet: {
+          patterns: [],
+          rules: [{
+            id: "mod-test/mark-arrival",
+            trigger: "unit-enter",
+            target: { scope: "trigger-unit" },
+            conditions: [{ op: "at-cell-matches", predicate: { op: "terrain-has", capabilityId: "core/occupiable" } }],
+            effects: [{ type: "set-unit-marker", marker: "mod-test/arrived" }]
+          }]
+        }
+      }
+    };
+    const result = applyCommand(state, {
+      type: "move-unit", commandId: "mod-move", actorId: p1, expectedSequence: 0,
+      unitId: id("p1-scout"), destinationId
+    }, terrains, unitCatalog);
+
+    expect(result.accepted).toBe(true);
+    if (!result.accepted) return;
+    const movedId = result.state.cells[destinationId]?.unitId;
+    expect(movedId).toBeDefined();
+    expect(result.state.units[movedId!]?.markers).toEqual(["mod-test/arrived"]);
+  });
+
   it("compiles capture exhaustion into the enter triggers of each opted-in terrain", () => {
     const map = createMatchFromMapCode(DEFAULT_MAP_CODE, {
       terrains: { ...coreTerrainCatalog, ...oilFieldTerrainCatalog },
@@ -524,9 +554,149 @@ describe("core turn rules", () => {
     expect(result.state.units[attackerId]).toBeUndefined();
     expect(result.state.cells[toCellId({ column: 1, row: 1 })]?.unitId).toBeUndefined();
     expect(result.state.units[defenderId]?.strength).toBe(3);
-    expect(result.state.turn.counterattacksUsed[defenderId]).toBe(1);
+    expect(result.state.turn.counterattacksUsed[targetCell]).toBe(1);
     expect(canCounterattack(result.state, defenderId, terrains, unitCatalog)).toBe(false);
     expect(result.events.map((event) => event.type)).toContain("unit-counterattacked");
+  });
+
+  it("pins installed Mod rules and patterns into the created match state", () => {
+    const pattern = {
+      id: "mod-oil-field/powered-network",
+      role: "core/powered-units" as const,
+      starts: { op: "terrain-has" as const, capabilityId: "core/power-source" },
+      expression: { op: "repeat" as const, min: 0, max: 12, item: {
+        op: "step" as const, relation: "hex-neighbor" as const,
+        where: { op: "terrain-has" as const, capabilityId: "core/power-conductor" }
+      } },
+      result: { entity: "unit" as const, distinctBy: "id" as const }
+    };
+    const rule = {
+      id: "mod-oil-field/on-turn-start",
+      trigger: "turn-start" as const,
+      target: { scope: "trigger-unit" as const },
+      effects: [{ type: "grant-points" as const, amount: 1 }]
+    };
+    const runtimeMod = { ...oilFieldMod, spatialPatterns: [pattern], rules: [rule] };
+    const match = createMatchFromMapCode(DEFAULT_MAP_CODE, {
+      terrains: { ...coreTerrainCatalog, ...oilFieldTerrainCatalog },
+      terrainModIds: { "mod/oil-field": oilFieldMod.id },
+      mods: { [oilFieldMod.id]: runtimeMod }
+    });
+
+    expect(match.settings.modRuleSet?.patterns).toEqual([pattern]);
+    expect(match.settings.modRuleSet?.rules).toEqual([rule]);
+  });
+
+  it("uses Mod powered-unit patterns as a deduplicated owner-scoped override", () => {
+    const pattern = {
+      id: "mod-test/only-home-row",
+      role: "core/powered-units" as const,
+      starts: { op: "unit-owner-is" as const, owner: "actor" as const },
+      expression: { op: "repeat" as const, min: 0, max: 0, item: {
+        op: "step" as const, relation: "hex-neighbor" as const,
+        where: { op: "terrain-has" as const, capabilityId: "core/power-conductor" }
+      } },
+      result: { entity: "unit" as const, distinctBy: "id" as const }
+    };
+    const state: GameState = {
+      ...fixture(),
+      settings: { friendlyFire: false, modRuleSet: { patterns: [pattern, pattern], rules: [] } }
+    };
+
+    expect(getPoweredUnitIds(state, terrains)).toEqual(new Set([id("p1-home"), id("p1-scout"), id("p2-home")]));
+  });
+
+  it("uses only the four forward points for a powered 5-vs-4 defended attack", () => {
+    const base = fixture();
+    const attackerId = id("p1-scout");
+    const defenderId = id("p2-home");
+    const targetCell = toCellId({ column: 2, row: 1 });
+    const oldHomeCell = base.units[defenderId]!.cellId;
+    const { unitId: _oldTarget, ...emptyTarget } = base.cells[targetCell]!;
+    const { unitId: _oldHome, ...emptyHome } = base.cells[oldHomeCell]!;
+    const state: GameState = {
+      ...base,
+      cells: {
+        ...base.cells,
+        [targetCell]: { ...emptyTarget, unitId: defenderId },
+        [oldHomeCell]: emptyHome
+      },
+      units: {
+        ...base.units,
+        [attackerId]: { ...base.units[attackerId]!, strength: 5 },
+        [defenderId]: { ...base.units[defenderId]!, cellId: targetCell, strength: 4 }
+      }
+    };
+    const result = applyCommand(state, {
+      type: "attack-unit", commandId: "powered-5-vs-4", actorId: p1,
+      expectedSequence: 0, unitId: attackerId, targetId: targetCell
+    }, terrains, unitCatalog);
+    expect(result.accepted).toBe(true);
+    if (!result.accepted) return;
+    expect(result.state.units[attackerId]?.strength).toBe(1);
+    expect(result.state.cells[base.units[attackerId]!.cellId]?.unitId).toBe(attackerId);
+    expect(result.state.units[defenderId]).toBeUndefined();
+    expect(result.state.cells[targetCell]?.unitId).toBeUndefined();
+  });
+
+  it.each([
+    ["roamer", 2, 2, true,  undefined, undefined, 2],
+    ["roamer", 2, 2, false, undefined, p1,        2],
+    ["roamer", 2, 3, true,  undefined, p2,        1],
+    ["roamer", 2, 3, false, p1,        p2,        1],
+    ["powered",2, 2, true,  undefined, p2,        1],
+    ["powered",2, 2, false, p1,        p2,        1],
+    ["powered",2, 3, true,  undefined, p2,        2],
+    ["powered",2, 3, false, p1,        p2,        2]
+  ] as const)("matches legacy combat example %s %i vs %i (defense=%s)", (
+    attackerKind, attackerStrength, defenderStrength, hasDefense,
+    expectedSourceOwner, expectedTargetOwner, expectedTargetStrength
+  ) => {
+    const base = fixture();
+    const attackerId = id("p1-scout");
+    const defenderId = id("p2-home");
+    const sourceCell = base.units[attackerId]!.cellId;
+    const targetCell = toCellId({ column: 2, row: 1 });
+    const oldDefenderCell = base.units[defenderId]!.cellId;
+    const { unitId: _oldTargetUnit, ...emptyTarget } = base.cells[targetCell]!;
+    const { unitId: _oldHomeUnit, ...emptyDefenderHome } = base.cells[oldDefenderCell]!;
+    const cells = {
+      ...base.cells,
+      [targetCell]: { ...emptyTarget, unitId: defenderId },
+      [oldDefenderCell]: emptyDefenderHome,
+      ...(attackerKind === "roamer"
+        ? { [base.units[id("p1-home")]!.cellId]: { ...base.cells[base.units[id("p1-home")]!.cellId]!, terrainId: "mountain" } }
+        : {})
+    };
+    const state: GameState = {
+      ...base,
+      cells,
+      units: {
+        ...base.units,
+        [attackerId]: { ...base.units[attackerId]!, strength: attackerStrength },
+        [defenderId]: { ...base.units[defenderId]!, cellId: targetCell, strength: defenderStrength }
+      },
+      turn: {
+        ...base.turn,
+        counterattacksUsed: hasDefense ? {} : { [targetCell]: 1 }
+      }
+    };
+    expect(getPoweredUnitIds(state, terrains).has(attackerId)).toBe(attackerKind === "powered");
+    const result = applyCommand(state, {
+      type: "attack-unit", commandId: `table-${attackerKind}-${defenderStrength}-${hasDefense}`,
+      actorId: p1, expectedSequence: 0, unitId: attackerId, targetId: targetCell
+    }, terrains, unitCatalog);
+    expect(result.accepted).toBe(true);
+    if (!result.accepted) return;
+    const sourceUnit = result.state.cells[sourceCell]?.unitId
+      ? result.state.units[result.state.cells[sourceCell]!.unitId!]
+      : undefined;
+    const targetUnit = result.state.cells[targetCell]?.unitId
+      ? result.state.units[result.state.cells[targetCell]!.unitId!]
+      : undefined;
+    expect(sourceUnit?.ownerId).toBe(expectedSourceOwner);
+    expect(targetUnit?.ownerId).toBe(expectedTargetOwner);
+    expect(targetUnit?.strength).toBe(expectedTargetOwner ? expectedTargetStrength : undefined);
   });
 
   it("keeps enemy stronghold exhaustion ahead of power gained from a capture", () => {
@@ -915,7 +1085,7 @@ describe("core turn rules", () => {
     if (!result.accepted) return;
     expect(result.state.units[id("p2-home")]?.strength).toBe(1);
     expect(result.state.units[artilleryId]).toBeUndefined();
-    expect(result.state.turn.counterattacksUsed[id("p2-home")]).toBe(1);
+    expect(result.state.turn.counterattacksUsed[result.state.units[id("p2-home")]!.cellId]).toBe(1);
     expect(result.events.map((event) => event.type)).toContain("unit-counterattacked");
   });
 
@@ -981,7 +1151,7 @@ describe("core turn rules", () => {
     const reactions = [...first.events, ...second.events]
       .filter((event) => event.type === "unit-counterattacked");
     expect(reactions).toHaveLength(expectedCounterattacks);
-    expect(second.state.turn.counterattacksUsed[defenderId] ?? 0).toBe(expectedCounterattacks);
+    expect(second.state.turn.counterattacksUsed[defendingCellId] ?? 0).toBe(expectedCounterattacks);
     // The defender survives both low-strength attacks. On plain/ocean, the
     // first cannon baits its reaction and the second is not counterattacked.
     expect(second.state.units[defenderId]?.strength).toBe(14);
@@ -1019,7 +1189,7 @@ describe("core turn rules", () => {
     expect(result.accepted).toBe(true);
     if (!result.accepted) return;
     expect(result.events.some((event) => event.type === "unit-counterattacked")).toBe(false);
-    expect(result.state.turn.counterattacksUsed[defenderId]).toBeUndefined();
+    expect(result.state.turn.counterattacksUsed[toCellId({ column: 3, row: 1 })]).toBeUndefined();
   });
 
   it("shares counterattack availability between combat rules and attack-target hints", () => {
@@ -1058,20 +1228,24 @@ describe("core turn rules", () => {
     expect(canCounterattack(stateWithPoweredDefender, poweredDefenderId, terrains, unitCatalog)).toBe(true);
     expect(canCounterattack({
       ...stateWithPoweredDefender,
-      turn: { ...state.turn, counterattacksUsed: { [poweredDefenderId]: 1 } }
+      turn: { ...state.turn, counterattacksUsed: { [frontCell]: 1 } }
     }, poweredDefenderId, terrains, unitCatalog)).toBe(false);
     expect(canCounterattack({
       ...stateWithPoweredDefender,
       turn: { ...state.turn, exhaustedUnitIds: [poweredDefenderId] }
     }, poweredDefenderId, terrains, unitCatalog)).toBe(false);
 
-    // Stronghold unlimited retaliation remains the previously selected rule.
+    // A stronghold has six defenses per opponent action phase.
     const coreStrongholdTerrains = { ...terrains, stronghold: coreTerrainCatalog["core/stronghold"]! };
     expect(canCounterattack(state, id("p2-home"), coreStrongholdTerrains, unitCatalog)).toBe(true);
     expect(canCounterattack({
       ...state,
-      turn: { ...state.turn, counterattacksUsed: { [id("p2-home")]: 20 } }
+      turn: { ...state.turn, counterattacksUsed: { [state.units[id("p2-home")]!.cellId]: 5 } }
     }, id("p2-home"), coreStrongholdTerrains, unitCatalog)).toBe(true);
+    expect(canCounterattack({
+      ...state,
+      turn: { ...state.turn, counterattacksUsed: { [state.units[id("p2-home")]!.cellId]: 6 } }
+    }, id("p2-home"), coreStrongholdTerrains, unitCatalog)).toBe(false);
   });
 
   it("limits a powered unit on plain to one retaliation while preserving stronghold unlimited", () => {
@@ -1127,16 +1301,17 @@ describe("core turn rules", () => {
     if (!second.accepted) return;
     expect(first.events.some((event) => event.type === "unit-counterattacked")).toBe(true);
     expect(second.events.some((event) => event.type === "unit-counterattacked")).toBe(false);
-    expect(second.state.turn.counterattacksUsed[defenderId]).toBe(1);
+    expect(second.state.turn.counterattacksUsed[frontCell]).toBe(1);
     expect(second.state.units[defenderId]?.strength).toBe(14);
   });
 
   it("resets counterattack usage when the next player's action phase starts", () => {
     const defenderId = id("p2-home");
     const base = fixture();
+    const defenderCellId = base.units[defenderId]!.cellId;
     const state: GameState = {
       ...base,
-      turn: { ...base.turn, counterattacksUsed: { [defenderId]: 1 } }
+      turn: { ...base.turn, counterattacksUsed: { [defenderCellId]: 1 } }
     };
     const actionEnd = applyCommand(state, {
       type: "end-action-phase", commandId: "p1-action-end", actorId: p1, expectedSequence: 0
@@ -1145,7 +1320,7 @@ describe("core turn rules", () => {
     if (!actionEnd.accepted) return;
     // Point allocation still belongs to the same turn: do not replenish the
     // defender's reaction before the attacking player has finished.
-    expect(actionEnd.state.turn.counterattacksUsed[defenderId]).toBe(1);
+    expect(actionEnd.state.turn.counterattacksUsed[defenderCellId]).toBe(1);
     const reinforcementEnd = applyCommand(actionEnd.state, {
       type: "end-reinforcement-phase", commandId: "p1-reinforcement-end", actorId: p1,
       expectedSequence: actionEnd.state.sequence

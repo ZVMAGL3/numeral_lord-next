@@ -19,9 +19,9 @@ const oneCounterattack: CapabilityBinding = {
   id: "core/counterattack-terrain-limit",
   config: { maxPerActionPhase: 1 }
 };
-const unlimitedCounterattacks: CapabilityBinding = {
+const strongholdCounterattackLimit: CapabilityBinding = {
   id: "core/counterattack-terrain-limit",
-  config: { maxPerActionPhase: "unlimited" }
+  config: { maxPerActionPhase: 6 }
 };
 
 /**
@@ -97,7 +97,6 @@ export const coreTerrainMod = defineMod({
     },
     {
       // 防守方在这块地皮上每个进攻回合可反击的次数。0 表示不能反击，
-      // "unlimited" 表示不限次数；未设置则由兵种的反击次数能力决定。
       id: "core/counterattack-terrain-limit",
       target: "terrain",
       defaultConfig: { maxPerActionPhase: 1 }
@@ -177,7 +176,7 @@ export const coreTerrainMod = defineMod({
         survivalAnchor,
         adjacentHostileExhaustion,
         exhaustUnpoweredCapturingUnit,
-        unlimitedCounterattacks
+        strongholdCounterattackLimit
       ]
     },
   ],

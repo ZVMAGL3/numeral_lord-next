@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Application, Assets, Graphics, Rectangle, Sprite, Text, type Texture } from "pixi.js";
+import { Application, Assets, Container, Graphics, Rectangle, Sprite, Text, type Texture } from "pixi.js";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { CellId, GameState, UnitId } from "@numeral-lord/game-core";
 
@@ -28,10 +28,9 @@ let app: Application | undefined;
 let observer: ResizeObserver | undefined;
 let pulseTick: (() => void) | undefined;
 let actionPulses: ActionPulse[] = [];
+let interactionLayers: { legal: Container; counterattack: Container; selection: Container } | undefined;
+const cellLayouts = new Map<CellId, { x: number; y: number; radius: number }>();
 const powered = computed(() => new Set(props.poweredUnitIds));
-const legalActions = computed(() => new Set(props.legalActionCellIds));
-const counterattackCells = computed(() => new Set(props.counterattackCellIds ?? []));
-const noCounterattackCells = computed(() => new Set(props.noCounterattackCellIds ?? []));
 const actionableUnits = computed(() => new Set(props.actionableUnitIds));
 
 interface ActionPulse {
@@ -112,6 +111,8 @@ onBeforeUnmount(() => {
   pulseTick = undefined;
   instance.stage.off("pointertap", onBoardBackgroundTap);
   actionPulses = [];
+  interactionLayers = undefined;
+  cellLayouts.clear();
   try {
     instance.destroy(true);
   } catch {
@@ -120,8 +121,11 @@ onBeforeUnmount(() => {
     host?.querySelector("canvas")?.remove();
   }
 });
-watch(() => [props.state, props.selectedUnitId, props.legalActionCellIds, props.counterattackCellIds,
-  props.noCounterattackCellIds, props.actionableUnitIds, props.poweredUnitIds], draw, { deep: true });
+// Rules replace the immutable GameState snapshot. Deep traversal is unnecessary,
+// and local selection must not destroy terrain, text, or pointer hit targets.
+watch(() => [props.state, props.actionableUnitIds, props.poweredUnitIds], draw);
+watch(() => [props.selectedUnitId, props.legalActionCellIds, props.counterattackCellIds,
+  props.noCounterattackCellIds], drawInteractionOverlay);
 
 function draw(): void {
   if (!app || !canvasHost.value) return;
@@ -130,6 +134,8 @@ function draw(): void {
   // HMR. Never clear a valid previous frame until a drawable size exists.
   if (width < 1 || height < 1) return;
   actionPulses = [];
+  interactionLayers = undefined;
+  cellLayouts.clear();
   app.stage.removeChildren().forEach((child) => child.destroy());
   app.stage.hitArea = new Rectangle(0, 0, width, height);
   const { columns, rows } = props.state.board;
@@ -154,20 +160,21 @@ function draw(): void {
     // getHexNeighbours(), otherwise a visual neighbour differs from a rule neighbour.
     const x = offsetX + horizontalUnit * radius * (cell.coordinate.column + ((cell.coordinate.row + 1) % 2) * 0.5);
     const y = offsetY + 1.5 * radius * cell.coordinate.row;
+    cellLayouts.set(cell.id, { x, y, radius });
     drawTerrainLayer(cell.terrainId, x, y, radius);
     const unit = cell.unitId ? props.state.units[cell.unitId] : undefined;
     const player = unit ? props.state.players[unit.ownerId] : undefined;
 
     // This transparent hit layer stays below the unit / stronghold layers;
     // interactions remain on the hex while the visual layers are noninteractive.
-    // Legal action outline follows the same 0.98 terrain footprint, instead
-    // of the previous radius-1 inset that made attack targets look smaller.
+    // Local target outlines use a separate overlay, leaving these hit targets
+    // intact while the player selects, cancels, or changes the selected unit.
     const tile = new Graphics().poly(hexagon(x, y, radius * 0.98))
       .fill({ color: 0xffffff, alpha: 0.001 })
       .stroke({
-        color: legalActions.value.has(cell.id) ? 0x67e8f9 : 0x8ba2c1,
-        width: legalActions.value.has(cell.id) ? 3 : 1,
-        alpha: legalActions.value.has(cell.id) ? 1 : 0.45
+        color: 0x8ba2c1,
+        width: 1,
+        alpha: 0.45
       });
     if (props.preview) tile.eventMode = "none";
     else bindCellInteraction(tile, cell.id);
@@ -190,17 +197,6 @@ function draw(): void {
     // composed separately; this is only the castle artwork layer.
     if (cell.terrainId === "core/stronghold") {
       addLegacySprite(legacyTextureUrls.stronghold, x, y, radius, 0.98);
-    }
-
-    // Counterattack readiness is shown only on this selected attacker's legal
-    // occupied destinations, and is shared so every room client sees the same.
-    if (unit && (counterattackCells.value.has(cell.id) || noCounterattackCells.value.has(cell.id))) {
-      const canReact = counterattackCells.value.has(cell.id);
-      const defenseFrame = new Graphics().poly(hexagon(x, y, radius * 0.98))
-        .stroke({ color: canReact ? 0xf0525f : 0xffffff, width: Math.max(3, radius * 0.075), alpha: 1 });
-      defenseFrame.zIndex = 25;
-      defenseFrame.eventMode = "none";
-      app.stage.addChild(defenseFrame);
     }
 
     if (!props.preview && unit && actionableUnits.value.has(unit.id)) {
@@ -240,15 +236,64 @@ function draw(): void {
       app.stage.addChild(strength);
     }
 
-    if (cell.unitId && props.state.units[cell.unitId]?.id === props.selectedUnitId) {
-      const selection = new Graphics().poly(hexagon(x, y, radius - 4))
-        .stroke({ color: 0xfef08a, width: 3, alpha: 0.95 });
-      selection.zIndex = 30;
-      selection.eventMode = "none";
-      app.stage.addChild(selection);
+  }
+  const legal = new Container();
+  const counterattack = new Container();
+  const selection = new Container();
+  legal.zIndex = 5;
+  counterattack.zIndex = 25;
+  selection.zIndex = 30;
+  for (const layer of [legal, counterattack, selection]) {
+    layer.eventMode = "none";
+    layer.interactiveChildren = false;
+    app.stage.addChild(layer);
+  }
+  interactionLayers = { legal, counterattack, selection };
+  drawInteractionOverlay();
+  updateActionPulses(performance.now());
+}
+
+/** Only this client's selected unit and legal targets belong in these layers. */
+function drawInteractionOverlay(): void {
+  if (!interactionLayers) return;
+  for (const layer of Object.values(interactionLayers)) {
+    layer.removeChildren().forEach((child) => child.destroy());
+  }
+  for (const cellId of props.legalActionCellIds) {
+    const layout = cellLayouts.get(cellId);
+    if (!layout) continue;
+    const { x, y, radius } = layout;
+    const frame = new Graphics().poly(hexagon(x, y, radius * 0.98))
+      .stroke({ color: 0x67e8f9, width: 3, alpha: 1 });
+    frame.eventMode = "none";
+    interactionLayers.legal.addChild(frame);
+  }
+  // Available counterattacks remain red; spent/unavailable ones remain white.
+  // These hints are private previews, never relayed to other room members.
+  for (const [cellIds, color] of [
+    [props.noCounterattackCellIds ?? [], 0xffffff],
+    [props.counterattackCellIds ?? [], 0xf0525f]
+  ] as const) {
+    for (const cellId of cellIds) {
+      const layout = cellLayouts.get(cellId);
+      const unitId = props.state.cells[cellId]?.unitId;
+      if (!layout || !unitId || !props.state.units[unitId]) continue;
+      const { x, y, radius } = layout;
+      const frame = new Graphics().poly(hexagon(x, y, radius * 0.92))
+        .stroke({ color, width: Math.max(3, radius * 0.075), alpha: 1 });
+      frame.eventMode = "none";
+      interactionLayers.counterattack.addChild(frame);
     }
   }
-  updateActionPulses(performance.now());
+  const unit = props.selectedUnitId ? props.state.units[props.selectedUnitId] : undefined;
+  const layout = unit ? cellLayouts.get(unit.cellId) : undefined;
+  if (layout) {
+    const { x, y, radius } = layout;
+    const frame = new Graphics().poly(hexagon(x, y, radius - 4))
+      .stroke({ color: 0xfef08a, width: 3, alpha: 0.95 });
+    frame.eventMode = "none";
+    interactionLayers.selection.addChild(frame);
+  }
 }
 
 /** Pixi's stage receives taps outside every hex hit layer. */

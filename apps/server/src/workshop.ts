@@ -8,7 +8,7 @@ import type {
   WorkshopMapEntry,
   WorkshopMapSummary,
   WorkshopPublished,
-  WorkshopSourceFile,
+  TerrainModDefinition,
   WorkshopTerrainModEntry,
   WorkshopTerrainModSummary
 } from "@numeral-lord/content-schema";
@@ -24,8 +24,7 @@ import { dirname, join } from "node:path";
 const MAX_MAPS = 200;
 const MAX_TERRAIN_MODS = 100;
 const MAX_MAP_CODE_BYTES = 64 * 1024;
-const MAX_SOURCE_BYTES = 64 * 1024;
-const MAX_SOURCE_FILES = 16;
+const MAX_MOD_DEFINITION_BYTES = 64 * 1024;
 const MAX_DATABASE_BYTES = 32 * 1024 * 1024;
 const PUBLICATION_COOLDOWN_MS = 3_000;
 const MAX_PUBLICATIONS_PER_SESSION = 10;
@@ -65,7 +64,7 @@ export class WorkshopStore {
     await this.load();
     return {
       maps: this.database.maps.map(({ code: _code, ...summary }): WorkshopMapSummary => summary),
-      terrainMods: this.database.terrainMods.map(({ sourceFiles: _sourceFiles, ...summary }): WorkshopTerrainModSummary => summary)
+      terrainMods: this.database.terrainMods.map(terrainModSummary)
     };
   }
 
@@ -77,7 +76,7 @@ export class WorkshopStore {
     }
     if (request.kind === "terrain-mod") {
       const entry = this.database.terrainMods.find((mod) => mod.id === request.id);
-      return entry ? { kind: "terrain-mod", entry } : undefined;
+      return entry ? { kind: "terrain-mod", entry: stripLegacySourceFiles(entry) } : undefined;
     }
     throw new WorkshopInputError("工坊内容类型无效。");
   }
@@ -119,12 +118,12 @@ export class WorkshopStore {
     const payload = validateTerrainModRequest(input);
     const entry: WorkshopTerrainModEntry = {
       id: randomUUID(),
-      modId: payload.id,
+      modId: payload.definition.id,
       name: payload.name,
-      version: payload.version,
+      version: payload.definition.version,
       description: payload.description,
-      terrainIds: payload.terrainIds,
-      sourceFiles: payload.sourceFiles,
+      terrainIds: payload.definition.terrains.map((terrain) => terrain.id),
+      definition: payload.definition,
       authorName: normalizeAuthorName(authorName),
       createdAt: new Date().toISOString()
     };
@@ -221,10 +220,7 @@ export class PostgresWorkshopStore {
         const { code: _code, ...summary } = parseStoredEntry<WorkshopMapEntry>(entry);
         return summary;
       }),
-      terrainMods: terrainMods.rows.map(({ entry }) => {
-        const { sourceFiles: _sourceFiles, ...summary } = parseStoredEntry<WorkshopTerrainModEntry>(entry);
-        return summary;
-      })
+      terrainMods: terrainMods.rows.map(({ entry }) => terrainModSummary(parseStoredEntry<WorkshopTerrainModEntry>(entry)))
     };
   }
 
@@ -240,7 +236,7 @@ export class PostgresWorkshopStore {
       const result = await this.pool.query<{ entry: string }>(
         "SELECT entry FROM nl_workshop_terrain_mods WHERE id = $1", [request.id]
       );
-      return result.rows[0] ? { kind: "terrain-mod", entry: parseStoredEntry<WorkshopTerrainModEntry>(result.rows[0].entry) } : undefined;
+      return result.rows[0] ? { kind: "terrain-mod", entry: stripLegacySourceFiles(parseStoredEntry<WorkshopTerrainModEntry>(result.rows[0].entry)) } : undefined;
     }
     throw new WorkshopInputError("工坊内容类型无效。");
   }
@@ -286,8 +282,8 @@ export class PostgresWorkshopStore {
     await this.load();
     const payload = validateTerrainModRequest(input);
     const entry: WorkshopTerrainModEntry = {
-      id: randomUUID(), modId: payload.id, name: payload.name, version: payload.version,
-      description: payload.description, terrainIds: payload.terrainIds, sourceFiles: payload.sourceFiles,
+      id: randomUUID(), modId: payload.definition.id, name: payload.name, version: payload.definition.version,
+      description: payload.description, terrainIds: payload.definition.terrains.map((terrain) => terrain.id), definition: payload.definition,
       authorName: normalizeAuthorName(authorName), createdAt: new Date().toISOString()
     };
     const client = await this.pool.connect();
@@ -340,6 +336,7 @@ export class PostgresWorkshopStore {
       CREATE INDEX IF NOT EXISTS nl_workshop_mods_created_idx ON nl_workshop_terrain_mods (created_at DESC);
     `);
     await this.importLegacyJsonOnce();
+    await this.removeLegacySourceFilesOnce();
   }
 
   /** Merge legacy JSON entries once; never overwrite or truncate existing database rows. */
@@ -387,6 +384,35 @@ export class PostgresWorkshopStore {
       client.release();
     }
   }
+
+  /** Purge the former raw TypeScript payload field; current Mods are JSON definition objects only. */
+  private async removeLegacySourceFilesOnce(): Promise<void> {
+    const migrationName = "terrain_mod_definition_objects_v1";
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock($1)", [DATABASE_MIGRATION_LOCK]);
+      const done = await client.query("SELECT 1 FROM nl_schema_migrations WHERE name = $1", [migrationName]);
+      if (!done.rowCount) {
+        const rows = await client.query<{ id: string; entry: string }>(
+          "SELECT id, entry FROM nl_workshop_terrain_mods WHERE entry::jsonb ? 'sourceFiles' FOR UPDATE"
+        );
+        for (const row of rows.rows) {
+          const legacy = JSON.parse(row.entry) as WorkshopTerrainModEntry;
+          await client.query("UPDATE nl_workshop_terrain_mods SET entry = $2 WHERE id = $1", [
+            row.id, JSON.stringify(stripLegacySourceFiles(legacy))
+          ]);
+        }
+        await client.query("INSERT INTO nl_schema_migrations (name) VALUES ($1)", [migrationName]);
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
 }
 
 /** Local development uses the same portable JSON records inside a SQLite file. */
@@ -413,10 +439,7 @@ export class SqliteWorkshopStore {
         const { code: _code, ...summary } = parseStoredEntry<WorkshopMapEntry>(entry);
         return summary;
       }),
-      terrainMods: terrainMods.map(({ entry }) => {
-        const { sourceFiles: _sourceFiles, ...summary } = parseStoredEntry<WorkshopTerrainModEntry>(entry);
-        return summary;
-      })
+      terrainMods: terrainMods.map(({ entry }) => terrainModSummary(parseStoredEntry<WorkshopTerrainModEntry>(entry)))
     };
   }
 
@@ -428,7 +451,7 @@ export class SqliteWorkshopStore {
     }
     if (request.kind === "terrain-mod") {
       const row = this.database!.prepare("SELECT entry FROM nl_workshop_terrain_mods WHERE id = ?").get(request.id) as { entry: string } | undefined;
-      return row ? { kind: "terrain-mod", entry: parseStoredEntry<WorkshopTerrainModEntry>(row.entry) } : undefined;
+      return row ? { kind: "terrain-mod", entry: stripLegacySourceFiles(parseStoredEntry<WorkshopTerrainModEntry>(row.entry)) } : undefined;
     }
     throw new WorkshopInputError("工坊内容类型无效。");
   }
@@ -469,9 +492,9 @@ export class SqliteWorkshopStore {
   async publishTerrainMod(input: unknown, authorName: string): Promise<WorkshopPublished> {
     await this.load();
     const payload = validateTerrainModRequest(input);
-    const entry: WorkshopTerrainModEntry = {
-      id: randomUUID(), modId: payload.id, name: payload.name, version: payload.version,
-      description: payload.description, terrainIds: payload.terrainIds, sourceFiles: payload.sourceFiles,
+      const entry: WorkshopTerrainModEntry = {
+      id: randomUUID(), modId: payload.definition.id, name: payload.name, version: payload.definition.version,
+      description: payload.description, terrainIds: payload.definition.terrains.map((terrain) => terrain.id), definition: payload.definition,
       authorName: normalizeAuthorName(authorName), createdAt: new Date().toISOString()
     };
     const database = this.database!;
@@ -526,6 +549,26 @@ export class SqliteWorkshopStore {
       CREATE INDEX IF NOT EXISTS nl_workshop_mods_created_idx ON nl_workshop_terrain_mods (created_at DESC);
     `);
     this.importLegacyJsonOnce();
+    this.removeLegacySourceFilesOnce();
+  }
+
+  private removeLegacySourceFilesOnce(): void {
+    const database = this.database!;
+    const migrationName = "terrain_mod_definition_objects_v1";
+    if (database.prepare("SELECT 1 FROM nl_schema_migrations WHERE name = ?").get(migrationName)) return;
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      const rows = database.prepare("SELECT id, entry FROM nl_workshop_terrain_mods WHERE json_type(entry, '$.sourceFiles') IS NOT NULL").all() as { id: string; entry: string }[];
+      const update = database.prepare("UPDATE nl_workshop_terrain_mods SET entry = ? WHERE id = ?");
+      for (const row of rows) {
+        update.run(JSON.stringify(stripLegacySourceFiles(JSON.parse(row.entry) as WorkshopTerrainModEntry)), row.id);
+      }
+      database.prepare("INSERT INTO nl_schema_migrations (name) VALUES (?)").run(migrationName);
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   /** Merge legacy JSON entries once; never overwrite or truncate existing database rows. */
@@ -662,51 +705,259 @@ function validateMapRequest(input: unknown): PublishMapRequest {
   return { code: input.code, description: validateDescription(input.description) };
 }
 
+const SUPPORTED_TERRAIN_CAPABILITIES = new Set([
+  "core/occupiable", "core/power-conductor", "core/power-source", "core/income-source",
+  "core/exhaust-on-departure", "core/adjacent-hostile-exhaustion",
+  "core/exhaust-unpowered-after-capture", "core/departure-garrison", "core/counterattack-terrain-limit"
+]);
+
 function validateTerrainModRequest(input: unknown): PublishTerrainModRequest {
-  if (!isRecord(input)) throw new WorkshopInputError("地块 Mod 数据无效。");
-  const { id, name, version, terrainIds, sourceFiles } = input;
+  if (!isRecord(input) || !isRecord(input.definition)) throw new WorkshopInputError("地块 Mod 必须提交结构化 definition 对象。");
+  const { id, version, capabilities, terrains, settings } = input.definition;
   if (typeof id !== "string" || !/^mod-[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id) || id.length > 80) {
     throw new WorkshopInputError("Mod ID 应采用 mod-名称 格式。");
-  }
-  if (typeof name !== "string" || name.trim().length === 0 || byteLength(name) > 120) {
-    throw new WorkshopInputError("Mod 名称无效或过长。");
   }
   if (typeof version !== "string" || !/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$/.test(version) || version.length > 40) {
     throw new WorkshopInputError("Mod 版本应采用 1.0.0 格式。");
   }
-  if (!Array.isArray(terrainIds) || terrainIds.length === 0 || terrainIds.length > 32
-    || terrainIds.some((terrainId) => typeof terrainId !== "string" || terrainId.length > 120
-      || !new RegExp(`^mod/${id.slice(4)}(?:/[a-z0-9]+(?:-[a-z0-9]+)*)*$`).test(terrainId))
-    || new Set(terrainIds).size !== terrainIds.length) {
-    throw new WorkshopInputError("地形 ID 必须属于该 Mod，且不能重复。");
-  }
-  if (!Array.isArray(sourceFiles) || sourceFiles.length === 0 || sourceFiles.length > MAX_SOURCE_FILES) {
-    throw new WorkshopInputError("Mod 源码文件应为 1 到 16 个。");
-  }
-  let totalSourceBytes = 0;
-  const files: WorkshopSourceFile[] = [];
-  const paths = new Set<string>();
-  for (const item of sourceFiles) {
-    if (!isRecord(item) || typeof item.path !== "string" || typeof item.content !== "string"
-      || item.path.length > 120 || !isSafeRelativePath(item.path) || paths.has(item.path)) {
-      throw new WorkshopInputError("Mod 源码文件路径无效或重复。");
+  const serialized = JSON.stringify(input.definition);
+  if (byteLength(serialized) > MAX_MOD_DEFINITION_BYTES) throw new WorkshopInputError("Mod 属性对象不能超过 64 KiB。");
+  if (!Array.isArray(capabilities) || capabilities.length > 32) throw new WorkshopInputError("Mod 能力定义无效或过多。");
+  const registeredCapabilities = new Set<string>();
+  for (const capability of capabilities) {
+    if (!isRecord(capability) || typeof capability.id !== "string"
+      || !SUPPORTED_TERRAIN_CAPABILITIES.has(capability.id) || capability.target !== "terrain"
+      || registeredCapabilities.has(capability.id)
+      || !isRecord(capability.defaultConfig) || !isJsonData(capability.defaultConfig)) {
+      throw new WorkshopInputError("Mod 含有引擎不支持或格式不正确的地块能力。");
     }
-    const size = byteLength(item.content);
-    totalSourceBytes += size;
-    if (size === 0 || totalSourceBytes > MAX_SOURCE_BYTES) {
-      throw new WorkshopInputError("Mod 源码为空或总量超过 64 KiB。");
+    registeredCapabilities.add(capability.id);
+  }
+  if (!Array.isArray(terrains) || terrains.length === 0 || terrains.length > 32) {
+    throw new WorkshopInputError("Mod 必须定义 1 到 32 个地块。");
+  }
+  const terrainIds = new Set<string>();
+  const slug = id.slice(4);
+  for (const terrain of terrains) {
+    if (!isRecord(terrain) || typeof terrain.id !== "string"
+      || !new RegExp(`^mod/${slug}(?:/[a-z0-9]+(?:-[a-z0-9]+)*)*$`).test(terrain.id)
+      || terrainIds.has(terrain.id) || typeof terrain.displayName !== "string"
+      || terrain.displayName.trim().length === 0 || byteLength(terrain.displayName) > 120
+      || !Array.isArray(terrain.capabilities) || terrain.capabilities.length > 32) {
+      throw new WorkshopInputError("地块 ID、名称或能力列表无效；地块 ID 必须属于当前 Mod。");
     }
-    paths.add(item.path);
-    files.push({ path: item.path, content: item.content });
+    terrainIds.add(terrain.id);
+    const bindings = new Set<string>();
+    for (const binding of terrain.capabilities) {
+      if (!isRecord(binding) || typeof binding.id !== "string"
+        || !SUPPORTED_TERRAIN_CAPABILITIES.has(binding.id) || bindings.has(binding.id)
+        || (binding.config !== undefined && (!isRecord(binding.config) || !isJsonData(binding.config)))) {
+        throw new WorkshopInputError("地块绑定了引擎不支持或格式不正确的能力。");
+      }
+      bindings.add(binding.id);
+    }
+  }
+  if (settings !== undefined) {
+    if (!Array.isArray(settings) || settings.length > 32) throw new WorkshopInputError("Mod 可配置属性无效。");
+    const settingIds = new Set<string>();
+    for (const setting of settings) {
+      if (!isRecord(setting)) throw new WorkshopInputError("Mod 可配置属性无效。");
+      const settingTarget = setting.target;
+      if (!isRecord(setting) || typeof setting.id !== "string" || !/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(setting.id)
+        || settingIds.has(setting.id) || typeof setting.displayName !== "string" || !setting.displayName.trim()
+        || byteLength(setting.displayName) > 120 || !isRecord(settingTarget)
+        || typeof settingTarget.terrainId !== "string" || !terrainIds.has(settingTarget.terrainId)
+        || typeof settingTarget.capabilityId !== "string" || !SUPPORTED_TERRAIN_CAPABILITIES.has(settingTarget.capabilityId)
+        || typeof settingTarget.configKey !== "string" || !/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(settingTarget.configKey)) {
+        throw new WorkshopInputError("Mod 设置项必须指向本 Mod 地块上的有效能力配置。");
+      }
+      const targetTerrain = terrains.find((terrain) => isRecord(terrain) && terrain.id === settingTarget.terrainId);
+      if (!isRecord(targetTerrain) || !Array.isArray(targetTerrain.capabilities)
+        || !targetTerrain.capabilities.some((binding) => isRecord(binding) && binding.id === settingTarget.capabilityId)) {
+        throw new WorkshopInputError("Mod 设置项引用的地块未绑定对应能力。");
+      }
+      if (setting.kind === "integer") {
+        if (!Number.isInteger(setting.defaultValue) || !Number.isInteger(setting.min) || !Number.isInteger(setting.max)
+          || (setting.min as number) > (setting.defaultValue as number) || (setting.defaultValue as number) > (setting.max as number)
+          || (setting.max as number) - (setting.min as number) > 1_000_000) {
+          throw new WorkshopInputError("整数设置项的默认值和范围无效。");
+        }
+      } else if (setting.kind === "boolean") {
+        if (typeof setting.defaultValue !== "boolean") throw new WorkshopInputError("布尔设置项必须提供布尔默认值。");
+      } else if (setting.kind === "choice") {
+        if (typeof setting.defaultValue !== "string" || !Array.isArray(setting.options) || setting.options.length === 0
+          || setting.options.length > 32 || !setting.options.every((option) => typeof option === "string")
+          || !setting.options.includes(setting.defaultValue)) {
+          throw new WorkshopInputError("选项设置项必须包含其默认值。");
+        }
+      } else {
+        throw new WorkshopInputError("Mod 设置项类型只支持整数、布尔值或选项。");
+      }
+      if (!isJsonData(setting)) throw new WorkshopInputError("Mod 设置项包含不可用的数据。");
+      settingIds.add(setting.id);
+    }
+  }
+  if (input.definition.spatialPatterns !== undefined) {
+    const patterns = input.definition.spatialPatterns;
+    if (!Array.isArray(patterns) || patterns.length > 32) throw new WorkshopInputError("空间算法最多定义 32 个。");
+    const patternIds = new Set<string>();
+    for (const pattern of patterns) {
+      if (!isRecord(pattern) || typeof pattern.id !== "string"
+        || !new RegExp(`^${id}/[a-z0-9]+(?:[/-][a-z0-9]+)*$`).test(pattern.id)
+        || !isRecord(pattern.result)
+        || (pattern.result.entity !== "cell" && (pattern.result.entity !== "unit" || pattern.result.distinctBy !== "id"))
+        || (pattern.role !== undefined && (pattern.role !== "core/powered-units" || pattern.result.entity !== "unit"))
+        || patternIds.has(pattern.id) || !isJsonData(pattern)) {
+        throw new WorkshopInputError("空间算法 ID、结果类型或结构无效；单位结果必须声明按 ID 去重。");
+      }
+      validateSpatialPredicate(pattern.starts, 0);
+      validateSpatialExpression(pattern.expression, 0);
+      patternIds.add(pattern.id);
+    }
+  }
+  const patternIds = new Set<string>(
+    Array.isArray(input.definition.spatialPatterns)
+      ? input.definition.spatialPatterns.flatMap((pattern) => isRecord(pattern) && typeof pattern.id === "string" ? [pattern.id] : [])
+      : []
+  );
+  if (input.definition.rules !== undefined) {
+    const rules = input.definition.rules;
+    if (!Array.isArray(rules) || rules.length > 64) throw new WorkshopInputError("Mod 规则最多定义 64 条。");
+    const ruleIds = new Set<string>();
+    for (const rule of rules) {
+      if (!isRecord(rule) || typeof rule.id !== "string"
+        || !new RegExp(`^${id}/[a-z0-9]+(?:[/-][a-z0-9]+)*$`).test(rule.id)
+        || ruleIds.has(rule.id)
+        || !["state-changed", "unit-enter", "unit-leave", "unit-destroyed", "turn-start"].includes(String(rule.trigger))
+        || !isRecord(rule.target)
+        || (rule.target.scope !== "trigger-unit" && rule.target.scope !== "pattern-units")
+        || (rule.target.scope === "pattern-units" && (typeof rule.target.patternId !== "string" || !patternIds.has(rule.target.patternId)))
+        || (rule.conditions !== undefined && (!Array.isArray(rule.conditions) || rule.conditions.length > 16))
+        || !Array.isArray(rule.effects) || rule.effects.length === 0 || rule.effects.length > 32
+        || !isJsonData(rule)) {
+        throw new WorkshopInputError("Mod 规则 ID、触发器、目标或结构无效。");
+      }
+      if (rule.target.scope === "pattern-units" && typeof rule.target.patternId === "string"
+        && !isUnitPattern(rule.target.patternId, input.definition.spatialPatterns)) {
+        throw new WorkshopInputError("Mod 规则的单位目标必须引用单位结果空间算法。");
+      }
+      for (const condition of rule.conditions ?? []) {
+        if (!isRecord(condition) || typeof condition.op !== "string") throw new WorkshopInputError("Mod 规则条件格式无效。");
+        if (condition.op === "at-cell-matches") validateSpatialPredicate(condition.predicate, 0);
+        else if (condition.op === "pattern-includes-trigger-unit") {
+          if (typeof condition.patternId !== "string" || !isUnitPattern(condition.patternId, input.definition.spatialPatterns)) {
+            throw new WorkshopInputError("Mod 规则条件必须引用单位结果空间算法。");
+          }
+        } else throw new WorkshopInputError("Mod 规则含有不支持的条件操作。");
+      }
+      for (const effect of rule.effects) {
+        if (!isRecord(effect) || typeof effect.type !== "string") throw new WorkshopInputError("Mod 规则效果格式无效。");
+        switch (effect.type) {
+          case "change-strength":
+            if (!Number.isInteger(effect.amount) || Math.abs(effect.amount as number) > 100) throw new WorkshopInputError("兵力变化必须是 -100 到 100 的整数。");
+            break;
+          case "grant-points":
+            if (!Number.isInteger(effect.amount) || (effect.amount as number) < 0 || (effect.amount as number) > 100) throw new WorkshopInputError("点数奖励必须是 0 到 100 的整数。");
+            break;
+          case "exhaust-unit":
+            break;
+          case "set-unit-marker":
+          case "remove-unit-marker":
+            validateMarker(effect.marker);
+            break;
+          case "sync-unit-marker":
+            validateMarker(effect.marker);
+            if (typeof effect.patternId !== "string" || !isUnitPattern(effect.patternId, input.definition.spatialPatterns)) {
+              throw new WorkshopInputError("标记同步效果必须引用单位结果空间算法。");
+            }
+            break;
+          default:
+            throw new WorkshopInputError("Mod 规则包含不支持的效果。");
+        }
+      }
+      ruleIds.add(rule.id);
+    }
+  }
+  if (typeof input.name !== "string" || input.name.trim().length === 0 || byteLength(input.name) > 120) {
+    throw new WorkshopInputError("Mod 名称无效或过长。");
   }
   return {
-    id,
-    name: name.trim(),
-    version,
+    name: input.name.trim(),
     description: validateDescription(input.description),
-    terrainIds: [...terrainIds] as string[],
-    sourceFiles: files
+    definition: input.definition as unknown as TerrainModDefinition
   };
+}
+
+function validateSpatialPredicate(input: unknown, depth: number): void {
+  if (depth > 12 || !isRecord(input) || typeof input.op !== "string") throw new WorkshopInputError("空间算法条件格式无效或嵌套过深。");
+  switch (input.op) {
+    case "terrain-has":
+      if (typeof input.capabilityId !== "string" || !SUPPORTED_TERRAIN_CAPABILITIES.has(input.capabilityId)) {
+        throw new WorkshopInputError("空间算法引用了不支持的地块能力。");
+      }
+      return;
+    case "unit-owner-is":
+      if (input.owner !== "actor" && input.owner !== "other") throw new WorkshopInputError("空间算法的阵营条件无效。");
+      return;
+    case "unit-has-marker":
+      validateMarker(input.marker);
+      return;
+    case "all":
+    case "any":
+      if (!Array.isArray(input.items) || input.items.length === 0 || input.items.length > 16) throw new WorkshopInputError("空间算法条件组不能为空或过多。");
+      for (const item of input.items) validateSpatialPredicate(item, depth + 1);
+      return;
+    case "not":
+      validateSpatialPredicate(input.item, depth + 1);
+      return;
+    default:
+      throw new WorkshopInputError("空间算法包含不支持的条件操作。");
+  }
+}
+
+function validateMarker(value: unknown): void {
+  if (typeof value !== "string" || !/^[a-z0-9][a-z0-9/_-]{0,79}$/.test(value)) {
+    throw new WorkshopInputError("单位标记必须是小写字母、数字、斜线、短横线或下划线组成的 ID。");
+  }
+}
+
+function isUnitPattern(patternId: string, patterns: unknown): boolean {
+  return Array.isArray(patterns) && patterns.some((pattern) => isRecord(pattern)
+    && pattern.id === patternId && isRecord(pattern.result) && pattern.result.entity === "unit" && pattern.result.distinctBy === "id");
+}
+
+function validateSpatialExpression(input: unknown, depth: number): void {
+  if (depth > 12 || !isRecord(input) || typeof input.op !== "string") throw new WorkshopInputError("空间算法表达式格式无效或嵌套过深。");
+  switch (input.op) {
+    case "step":
+      if (input.relation !== "hex-neighbor") throw new WorkshopInputError("当前空间算法只支持六边形相邻关系。");
+      validateSpatialPredicate(input.where, 0);
+      return;
+    case "sequence":
+    case "either":
+      if (!Array.isArray(input.items) || input.items.length === 0 || input.items.length > 16) throw new WorkshopInputError("空间算法组合不能为空或过多。");
+      for (const item of input.items) validateSpatialExpression(item, depth + 1);
+      return;
+    case "repeat":
+      if (!Number.isInteger(input.min) || !Number.isInteger(input.max) || (input.min as number) < 0
+        || (input.max as number) < (input.min as number) || (input.max as number) > 4096) {
+        throw new WorkshopInputError("空间算法重复次数范围无效。");
+      }
+      validateSpatialExpression(input.item, depth + 1);
+      return;
+    default:
+      throw new WorkshopInputError("空间算法包含不支持的路径操作。");
+  }
+}
+
+function isJsonData(value: unknown, depth = 0): boolean {
+  if (depth > 12) return false;
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.length <= 256 && value.every((item) => isJsonData(item, depth + 1));
+  if (!isRecord(value)) return false;
+  const entries = Object.entries(value);
+  return entries.length <= 256 && entries.every(([key, item]) => key !== "__proto__" && isJsonData(item, depth + 1));
 }
 
 function validateDescription(value: unknown): string {
@@ -720,17 +971,22 @@ function normalizeAuthorName(value: unknown): string {
   return typeof value === "string" && value.trim() ? value.trim().slice(0, 40) : "匿名玩家";
 }
 
-function isSafeRelativePath(path: string): boolean {
-  return !path.startsWith("/") && !path.includes("\\") && !path.includes(":")
-    && path.split("/").every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
-}
-
 function byteLength(value: string): number {
   return Buffer.byteLength(value, "utf8");
 }
 
 function parseStoredEntry<T>(value: string): T {
   return JSON.parse(value) as T;
+}
+
+function stripLegacySourceFiles(entry: WorkshopTerrainModEntry): WorkshopTerrainModEntry {
+  const { sourceFiles: _legacySourceFiles, ...dataOnlyEntry } = entry as WorkshopTerrainModEntry & { readonly sourceFiles?: unknown };
+  return dataOnlyEntry;
+}
+
+function terrainModSummary(entry: WorkshopTerrainModEntry): WorkshopTerrainModSummary {
+  const { definition: _definition, sourceFiles: _legacySourceFiles, ...summary } = entry as WorkshopTerrainModEntry & { readonly sourceFiles?: unknown };
+  return summary;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

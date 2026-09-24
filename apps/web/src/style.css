@@ -89,6 +89,8 @@ h1 { margin: 0; font-size: clamp(28px, 5vw, 42px); letter-spacing: -.04em; }
 .legend-token { width: 12px; height: 12px; border: 2px solid #172033; border-radius: 50%; background: #8090a5; }
 .legend-token.powered { border-color: #a7f3d0; background: #68a8b1; }
 .legend-token.exhausted { border-color: #fbbf24; background: #8090a5; }
+.counter-frame-key { width: 11px; height: 11px; border: 2px solid #f0525f; border-radius: 3px; background: transparent; }
+.counter-frame-key.safe { margin-left: 2px; border-color: #fff; }
 /* Keep the Pixi viewport independent from growing event and notation sidebars. */
 .board-wrap { display: grid; min-width: 0; grid-template-rows: clamp(390px,38vw,500px) auto; gap: 10px; align-self:start; }
 .notice { min-height: 20px; margin: 0; color: #b8cae3; text-align: center; font-size: 13px; }

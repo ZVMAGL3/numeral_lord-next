@@ -3,7 +3,7 @@ import { coreMatchConditionCatalog } from "../../core-content/src/match-conditio
 import { createMatchFromMapCode, DEFAULT_MAP_CODE } from "../../core-content/src/map-code.js";
 import { coreTerrainCatalog } from "../../core-content/src/terrains.js";
 import { oilFieldMod, oilFieldTerrainCatalog } from "../../oil-field-mod/src/index.js";
-import { applyCommand, finishMatch, getActionableUnitIds, getLegalActionDestinationIds, getPoweredUnitIds, startMatch } from "./engine.js";
+import { applyCommand, canCounterattack, finishMatch, getActionableUnitIds, getLegalActionDestinationIds, getPoweredUnitIds, startMatch } from "./engine.js";
 import { applyIntent, getLegalIntents } from "./simulation.js";
 import type { TerrainCatalog, UnitCatalog } from "./content.js";
 import { toCellId } from "./hex.js";
@@ -454,6 +454,41 @@ describe("core turn rules", () => {
     expect(arrivedUnitId).toBeDefined();
     expect(getPoweredUnitIds(result.state, terrains).has(arrivedUnitId!)).toBe(true);
     expect(result.state.turn.exhaustedUnitIds).not.toContain(arrivedUnitId);
+  });
+
+  it("keeps an unpowered attacker at its source when a non-retaliating target survives", () => {
+    const state = fixture();
+    const sourceCell = toCellId({ column: 1, row: 1 });
+    const targetCell = toCellId({ column: 2, row: 1 });
+    const targetId = id("p2-quiet-defender");
+    const attackCatalog: UnitCatalog = {
+      ...unitCatalog,
+      peaceful: { id: "peaceful", displayName: "无反击单位", capabilities: [] }
+    };
+    const attackState: GameState = {
+      ...state,
+      cells: {
+        ...state.cells,
+        [sourceCell]: { ...state.cells[sourceCell]!, terrainId: "ocean" },
+        [targetCell]: { ...state.cells[targetCell]!, unitId: targetId }
+      },
+      units: {
+        ...state.units,
+        [id("p1-scout")]: { ...state.units[id("p1-scout")]!, strength: 3 },
+        [targetId]: { id: targetId, definitionId: "peaceful", ownerId: p2, cellId: targetCell, strength: 5 }
+      }
+    };
+    const result = applyCommand(attackState, {
+      type: "attack-unit", commandId: "quiet-target-resists", actorId: p1, expectedSequence: 0,
+      unitId: id("p1-scout"), targetId: targetCell
+    }, terrains, attackCatalog);
+    expect(result.accepted).toBe(true);
+    if (!result.accepted) return;
+    expect(result.state.units[id("p1-scout")]?.cellId).toBe(sourceCell);
+    expect(result.state.cells[sourceCell]?.unitId).toBe(id("p1-scout"));
+    expect(result.state.units[targetId]?.strength).toBe(2);
+    expect(result.state.turn.exhaustedUnitIds).toContain(id("p1-scout"));
+    expect(result.events.some((event) => event.type === "unit-counterattacked")).toBe(false);
   });
 
   it("keeps enemy stronghold exhaustion ahead of power gained from a capture", () => {
@@ -946,6 +981,115 @@ describe("core turn rules", () => {
     if (!result.accepted) return;
     expect(result.events.some((event) => event.type === "unit-counterattacked")).toBe(false);
     expect(result.state.turn.counterattacksUsed[defenderId]).toBeUndefined();
+  });
+
+  it("shares counterattack availability between combat rules and attack-target hints", () => {
+    const state = fixture();
+    const poweredDefenderId = id("p2-powered-front");
+    const frontCell = toCellId({ column: 2, row: 1 });
+    const bridgeCell = toCellId({ column: 3, row: 1 });
+    const movedStrongholdCell = toCellId({ column: 4, row: 1 });
+    const { unitId: ignoredHome, ...emptyFrontCell } = state.cells[frontCell]!;
+    void ignoredHome;
+    const { unitId: ignoredBridge, ...emptyBridgeCell } = state.cells[bridgeCell]!;
+    void ignoredBridge;
+    const { unitId: ignoredMovedHome, ...emptyMovedHomeCell } = state.cells[movedStrongholdCell]!;
+    void ignoredMovedHome;
+    const stateWithPoweredDefender: GameState = {
+      ...state,
+      cells: {
+        ...state.cells,
+        [frontCell]: { ...emptyFrontCell, terrainId: "plain", unitId: poweredDefenderId },
+        [bridgeCell]: { ...emptyBridgeCell, unitId: id("p2-bridge") },
+        [movedStrongholdCell]: { ...emptyMovedHomeCell, terrainId: "stronghold", unitId: id("p2-home") }
+      },
+      units: {
+        ...state.units,
+        [id("p2-home")]: { ...state.units[id("p2-home")]!, cellId: movedStrongholdCell },
+        [id("p2-bridge")]: {
+          id: id("p2-bridge"), definitionId: "roamer", ownerId: p2, cellId: bridgeCell, strength: 1
+        },
+        [poweredDefenderId]: {
+          id: poweredDefenderId, definitionId: "roamer", ownerId: p2, cellId: frontCell, strength: 4
+        }
+      }
+    };
+
+    expect(getPoweredUnitIds(stateWithPoweredDefender, terrains).has(poweredDefenderId)).toBe(true);
+    expect(canCounterattack(stateWithPoweredDefender, poweredDefenderId, terrains, unitCatalog)).toBe(true);
+    expect(canCounterattack({
+      ...stateWithPoweredDefender,
+      turn: { ...state.turn, counterattacksUsed: { [poweredDefenderId]: 1 } }
+    }, poweredDefenderId, terrains, unitCatalog)).toBe(false);
+    expect(canCounterattack({
+      ...stateWithPoweredDefender,
+      turn: { ...state.turn, exhaustedUnitIds: [poweredDefenderId] }
+    }, poweredDefenderId, terrains, unitCatalog)).toBe(false);
+
+    // Stronghold unlimited retaliation remains the previously selected rule.
+    const coreStrongholdTerrains = { ...terrains, stronghold: coreTerrainCatalog["core/stronghold"]! };
+    expect(canCounterattack(state, id("p2-home"), coreStrongholdTerrains, unitCatalog)).toBe(true);
+    expect(canCounterattack({
+      ...state,
+      turn: { ...state.turn, counterattacksUsed: { [id("p2-home")]: 20 } }
+    }, id("p2-home"), coreStrongholdTerrains, unitCatalog)).toBe(true);
+  });
+
+  it("limits a powered unit on plain to one retaliation while preserving stronghold unlimited", () => {
+    const state = fixture();
+    const frontCell = toCellId({ column: 3, row: 1 });
+    const strongholdCell = toCellId({ column: 4, row: 1 });
+    const secondAttackerCell = toCellId({ column: 2, row: 0 });
+    const defenderId = id("p2-powered-front");
+    const secondAttackerId = id("p1-second-cannon");
+    const { unitId: ignoredOldHome, ...emptyFrontCell } = state.cells[frontCell]!;
+    void ignoredOldHome;
+    const attackCatalog: UnitCatalog = {
+      ...unitCatalog,
+      cannon: {
+        id: "cannon",
+        displayName: "测试炮",
+        capabilities: [
+          { id: "core/attack", config: { movesIntoTarget: false } },
+          { id: "core/attack-range", config: { min: 1, max: 5 } }
+        ]
+      }
+    };
+    const battleState: GameState = {
+      ...state,
+      cells: {
+        ...state.cells,
+        [frontCell]: { ...emptyFrontCell, terrainId: "plain", unitId: defenderId },
+        [strongholdCell]: { ...state.cells[strongholdCell]!, terrainId: "stronghold", unitId: id("p2-home") },
+        [secondAttackerCell]: { ...state.cells[secondAttackerCell]!, unitId: secondAttackerId }
+      },
+      units: {
+        ...state.units,
+        [id("p1-scout")]: { ...state.units[id("p1-scout")]!, definitionId: "cannon", strength: 3 },
+        [id("p2-home")]: { ...state.units[id("p2-home")]!, cellId: strongholdCell },
+        [defenderId]: { id: defenderId, definitionId: "roamer", ownerId: p2, cellId: frontCell, strength: 20 },
+        [secondAttackerId]: {
+          id: secondAttackerId, definitionId: "cannon", ownerId: p1, cellId: secondAttackerCell, strength: 3
+        }
+      }
+    };
+    expect(getPoweredUnitIds(battleState, terrains).has(defenderId)).toBe(true);
+    const first = applyCommand(battleState, {
+      type: "attack-unit", commandId: "powered-front-first", actorId: p1, expectedSequence: 0,
+      unitId: id("p1-scout"), targetId: frontCell
+    }, terrains, attackCatalog);
+    expect(first.accepted).toBe(true);
+    if (!first.accepted) return;
+    const second = applyCommand(first.state, {
+      type: "attack-unit", commandId: "powered-front-second", actorId: p1,
+      expectedSequence: first.state.sequence, unitId: secondAttackerId, targetId: frontCell
+    }, terrains, attackCatalog);
+    expect(second.accepted).toBe(true);
+    if (!second.accepted) return;
+    expect(first.events.some((event) => event.type === "unit-counterattacked")).toBe(true);
+    expect(second.events.some((event) => event.type === "unit-counterattacked")).toBe(false);
+    expect(second.state.turn.counterattacksUsed[defenderId]).toBe(1);
+    expect(second.state.units[defenderId]?.strength).toBe(14);
   });
 
   it("resets counterattack usage when the next player's action phase starts", () => {

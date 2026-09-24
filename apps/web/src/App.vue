@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { Client, type Room } from "@colyseus/sdk";
 import {
   applyCommand,
+  canCounterattack,
   DEFAULT_LOBBY_SETTINGS,
   getActionableUnitIds,
   getLegalActionDestinationIds,
@@ -305,6 +306,14 @@ const latestContinuation = computed(() => [...notation.value].reverse().find((en
 const legalActionCellIds = computed<readonly CellId[]>(() => selectedUnit.value
   ? getLegalActionDestinationIds(game.value, selectedUnit.value.id, installedTerrainCatalog, coreUnitCatalog)
   : []);
+const counterattackCellIds = computed<readonly CellId[]>(() => legalActionCellIds.value.filter((cellId) => {
+  const defenderId = game.value.cells[cellId]?.unitId;
+  return defenderId !== undefined && canCounterattack(game.value, defenderId, installedTerrainCatalog, coreUnitCatalog);
+}));
+const noCounterattackCellIds = computed<readonly CellId[]>(() => legalActionCellIds.value.filter((cellId) => {
+  const defenderId = game.value.cells[cellId]?.unitId;
+  return defenderId !== undefined && !canCounterattack(game.value, defenderId, installedTerrainCatalog, coreUnitCatalog);
+}));
 
 function resolveRelayEndpoint(): string {
   // A query override keeps the static preview deployable without bundling a
@@ -1450,7 +1459,7 @@ onBeforeUnmount(() => {
           <span class="player-color" :style="{ background: player.color }" />
           <div><strong>{{ player.displayName }}</strong><small>队伍 {{ player.teamId }} · 座位 {{ player.seat }}</small></div><b>{{ player.reinforcementPoints }} 点</b>
         </article>
-        <div class="legend"><p><i class="legend-token powered" />通电兵：每回合 +1；1 点不能行动</p><p><i class="legend-token roaming" />游兵：行动 -1；1 点作最后一次行动后失活</p><p><i class="legend-token exhausted" />失活：本回合不能继续行动</p></div>
+        <div class="legend"><p><i class="legend-token powered" />通电兵：每回合 +1；1 点不能行动</p><p><i class="legend-token roaming" />游兵：行动 -1；1 点作最后一次行动后失活</p><p><i class="legend-token exhausted" />失活：本回合不能继续行动</p><p><i class="counter-frame-key" /><i class="counter-frame-key safe" />攻击目标红框会反击，白框不会</p></div>
       </aside>
 
       <section class="board-wrap">
@@ -1458,6 +1467,8 @@ onBeforeUnmount(() => {
           :state="game"
           :selected-unit-id="selectedUnitId"
           :legal-action-cell-ids="legalActionCellIds"
+          :counterattack-cell-ids="counterattackCellIds"
+          :no-counterattack-cell-ids="noCounterattackCellIds"
           :actionable-unit-ids="actionableUnitIds"
           :powered-unit-ids="poweredUnitIds"
           @cell-click="onCellClick"

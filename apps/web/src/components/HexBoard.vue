@@ -7,6 +7,10 @@ const props = defineProps<{
   state: GameState;
   selectedUnitId: UnitId | null;
   legalActionCellIds: readonly CellId[];
+  /** Enemy attack targets with an available reaction this action phase. */
+  counterattackCellIds?: readonly CellId[];
+  /** Enemy attack targets that cannot react (capability, limit, or exhausted). */
+  noCounterattackCellIds?: readonly CellId[];
   actionableUnitIds: readonly UnitId[];
   poweredUnitIds: readonly UnitId[];
   /** Read-only compact rendering used by the lobby map preview. */
@@ -26,6 +30,8 @@ let pulseTick: (() => void) | undefined;
 let actionPulses: ActionPulse[] = [];
 const powered = computed(() => new Set(props.poweredUnitIds));
 const legalActions = computed(() => new Set(props.legalActionCellIds));
+const counterattackCells = computed(() => new Set(props.counterattackCellIds ?? []));
+const noCounterattackCells = computed(() => new Set(props.noCounterattackCellIds ?? []));
 const actionableUnits = computed(() => new Set(props.actionableUnitIds));
 
 interface ActionPulse {
@@ -114,7 +120,8 @@ onBeforeUnmount(() => {
     host?.querySelector("canvas")?.remove();
   }
 });
-watch(() => [props.state, props.selectedUnitId, props.legalActionCellIds, props.actionableUnitIds, props.poweredUnitIds], draw, { deep: true });
+watch(() => [props.state, props.selectedUnitId, props.legalActionCellIds, props.counterattackCellIds,
+  props.noCounterattackCellIds, props.actionableUnitIds, props.poweredUnitIds], draw, { deep: true });
 
 function draw(): void {
   if (!app || !canvasHost.value) return;
@@ -144,20 +151,29 @@ function draw(): void {
     const x = offsetX + horizontalUnit * radius * (cell.coordinate.column + ((cell.coordinate.row + 1) % 2) * 0.5);
     const y = offsetY + 1.5 * radius * cell.coordinate.row;
     drawTerrainLayer(cell.terrainId, x, y, radius);
+    const unit = cell.unitId ? props.state.units[cell.unitId] : undefined;
+    const player = unit ? props.state.players[unit.ownerId] : undefined;
 
     // This transparent hit layer stays below the unit / stronghold layers;
     // interactions remain on the hex while the visual layers are noninteractive.
     // Legal action outline follows the same 0.98 terrain footprint, instead
     // of the previous radius-1 inset that made attack targets look smaller.
+    const isCounterattackTarget = counterattackCells.value.has(cell.id);
+    const isSafeAttackTarget = noCounterattackCells.value.has(cell.id);
+    const targetFrameColor = isCounterattackTarget ? 0xf0525f : 0xffffff;
     const tile = new Graphics().poly(hexagon(x, y, radius * 0.98))
       .fill({ color: 0xffffff, alpha: 0.001 })
-      .stroke({ color: legalActions.value.has(cell.id) ? 0x67e8f9 : 0x8ba2c1, width: legalActions.value.has(cell.id) ? 3 : 1, alpha: legalActions.value.has(cell.id) ? 1 : 0.45 });
+      .stroke({
+        color: isCounterattackTarget || isSafeAttackTarget
+          ? targetFrameColor
+          : legalActions.value.has(cell.id) ? 0x67e8f9 : 0x8ba2c1,
+        width: isCounterattackTarget || isSafeAttackTarget ? 4 : legalActions.value.has(cell.id) ? 3 : 1,
+        alpha: isCounterattackTarget || isSafeAttackTarget || legalActions.value.has(cell.id) ? 1 : 0.45
+      });
     if (props.preview) tile.eventMode = "none";
     else bindCellInteraction(tile, cell.id);
     app.stage.addChild(tile);
 
-    const unit = cell.unitId ? props.state.units[cell.unitId] : undefined;
-    const player = unit ? props.state.players[unit.ownerId] : undefined;
     const isPowered = unit ? powered.value.has(unit.id) : false;
     const isExhausted = unit ? props.state.turn.exhaustedUnitIds.includes(unit.id) : false;
 

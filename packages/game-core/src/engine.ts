@@ -624,7 +624,10 @@ function attackUnit(
   // Ranged/non-entering attacks have no terrain arrival reaction, so retain
   // their normal unpowered attack exhaustion. Captures are handled by the
   // destination terrain's enter capability above, using post-capture power.
-  if (!movesIntoTarget && !powered && continuationUnitId
+  const attackerStayedAtSource = movesIntoTarget && continuationUnitId
+    && draft.units[continuationUnitId]?.cellId !== targetCell.id;
+  if ((!movesIntoTarget || attackerStayedAtSource) && !powered && continuationUnitId
+    && draft.units[continuationUnitId]
     && hasUnitCapability(attackerDefinition, UNIT_CAPABILITY.attackExhaustion)) {
     if (exhaustUnitForCurrentPhase(draft, continuationUnitId)) {
       events.push({ type: "unit-exhausted", message: "游兵完成攻击，本回合失去行动力。" });
@@ -737,9 +740,6 @@ function resolveAttack(
   if (movesIntoTarget && powered) {
     draft.units[attacker.id] = { ...attacker, strength: 1 };
     draft.cells[attacker.cellId] = { ...sourceCell, unitId: attacker.id };
-  } else if (movesIntoTarget) {
-    delete draft.units[attacker.id];
-    draft.cells[attacker.cellId] = withCellUnit(sourceCell, undefined);
   }
 
   if (attackStrength > defender.strength) {
@@ -749,6 +749,10 @@ function resolveAttack(
       draft.cells[destinationId] = withCellUnit(destinationCell, undefined);
       events.push({ type: "unit-attacked", message: "远程进攻成功，敌方单位被消灭。" });
       return attacker.id;
+    }
+    if (!powered) {
+      delete draft.units[attacker.id];
+      draft.cells[attacker.cellId] = withCellUnit(sourceCell, undefined);
     }
     const survivorId = createSplitId(attacker.id, draft.state.sequence);
     draft.units[survivorId] = {
@@ -765,8 +769,12 @@ function resolveAttack(
   if (attackStrength === defender.strength) {
     delete draft.units[defender.id];
     draft.cells[destinationId] = withCellUnit(destinationCell, undefined);
+    if (movesIntoTarget && !powered) {
+      delete draft.units[attacker.id];
+      draft.cells[attacker.cellId] = withCellUnit(sourceCell, undefined);
+    }
     events.push({ type: "unit-attacked", message: movesIntoTarget ? "双方兵力相抵，单位同时消灭。" : "远程攻击消灭了敌方单位。" });
-    return movesIntoTarget ? (powered ? attacker.id : undefined) : attacker.id;
+    return movesIntoTarget && !powered ? undefined : attacker.id;
   }
 
   draft.units[defender.id] = {
@@ -774,7 +782,11 @@ function resolveAttack(
     strength: defender.strength - attackStrength
   };
   events.push({ type: "unit-attacked", message: "进攻失败，防守方损失部分兵力。" });
-  return movesIntoTarget ? (powered ? attacker.id : undefined) : attacker.id;
+  // A failed melee attack does not move the attacker. Keeping its id alive
+  // lets the defender's configured reaction resolve normally; if there is no
+  // reaction available, the unpowered attacker remains at its source and is
+  // exhausted by the post-attack rule below.
+  return attacker.id;
 }
 
 /** A defender may react independently of its own attack range. */
@@ -790,17 +802,9 @@ function applyCounterattack(
   const defender = draft.units[defenderId];
   const attacker = draft.units[attackerId];
   if (!defender || !attacker) return;
-  const definition = units[defender.definitionId];
-  if (!definition || !hasUnitCapability(definition, UNIT_CAPABILITY.counterattack)) return;
+  if (!canCounterattack(asDraftState(draft), defenderId, terrains, units)) return;
 
   const used = draft.turn.counterattacksUsed[defender.id] ?? 0;
-  const defendingCell = draft.cells[defender.cellId];
-  if (!defendingCell) return;
-  const terrain = requireTerrain(terrains, defendingCell.terrainId);
-  // Terrain can suppress or extend the unit's reaction, but cannot grant
-  // counterattack to a unit without the corresponding unit capability.
-  const limit = getCounterattackLimit(terrain, definition);
-  if (used >= limit) return;
 
   draft.turn = {
     ...draft.turn,
@@ -817,6 +821,25 @@ function applyCounterattack(
   if (attackerCell) draft.cells[attacker.cellId] = withCellUnit(attackerCell, undefined);
   delete draft.units[attacker.id];
   events.push({ type: "unit-counterattacked", message: "防守单位发动反击，进攻单位被消灭。" });
+}
+
+/** Shared rule/query for both combat resolution and the red/white target hint. */
+export function canCounterattack(
+  state: GameState,
+  unitId: UnitId,
+  terrains: TerrainCatalog,
+  units: UnitCatalog
+): boolean {
+  const unit = state.units[unitId];
+  if (!unit || state.turn.phase !== "action" || state.turn.exhaustedUnitIds.includes(unitId)) return false;
+  const definition = units[unit.definitionId];
+  if (!definition || !hasUnitCapability(definition, UNIT_CAPABILITY.counterattack)) return false;
+  const cell = state.cells[unit.cellId];
+  if (!cell) return false;
+  const terrain = terrains[cell.terrainId];
+  if (!terrain) return false;
+  const used = state.turn.counterattacksUsed[unitId] ?? 0;
+  return used < getCounterattackLimit(terrain, definition);
 }
 
 /**

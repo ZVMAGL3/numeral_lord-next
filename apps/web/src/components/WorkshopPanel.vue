@@ -574,8 +574,8 @@ function installSelectedTerrain(): void {
           <label class="spatial-pattern-label">触发规则（JSON）<textarea v-model="publishRules" class="code-field pattern-input" spellcheck="false" /></label>
           <p class="pattern-help">规则以事件触发：state-changed、unit-enter、unit-leave、unit-destroyed、turn-start。目标可以是触发单位，或空间算法选中的单位；条件可检查事件格地块能力或单位是否匹配算法。效果支持加减兵力、奖励点数、失活、设置/移除标记及按算法同步标记。上传内容只接受受限 JSON 数据，不会执行脚本。</p>
           <details class="capability-help">
-            <summary>我想添加列表里没有的自定义功能</summary>
-            <p>Mod 数据只能组合内核已经实现的能力，不能靠发布一段 JSON 或脚本凭空增加新规则。要新增全新的行为，需要先在游戏规则内核中实现并注册一个能力处理器，再把它加入这份可选列表；之后作者就能在这里选择它并配置参数。这样才能保证所有玩家执行结果一致，也不会运行陌生代码。</p>
+            <summary>现在可以自定义哪些功能？</summary>
+            <p>不必为每一种规则组合单独改内核：可以在上方用 JSON 组合空间路径、触发事件、条件与效果，例如“单位进入带某种能力的地块时奖励点数”或“按匹配网络给单位同步标记”。路径支持相邻、顺序、分支和有界重复；效果目前包括兵力变化、奖励点数、失活和标记操作。边界是：Mod 仍是声明式数据，不执行上传脚本；如果需要全新的效果原语或更复杂的计算，才需要扩展共享规则解释器，这样双方客户端才能得到相同结果。</p>
           </details>
           <details class="definition-details"><summary>查看将发布的属性对象</summary><pre class="definition-preview"><code>{{ JSON.stringify(generatedTerrainDefinition, null, 2) }}</code></pre></details>
           <div class="submit-row"><span v-if="publishError" class="form-error" role="alert">{{ publishError }}</span><button class="primary-button" type="button" :disabled="working" @click="submitTerrainMod">发布地块 Mod</button></div>

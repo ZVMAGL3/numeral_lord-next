@@ -19,7 +19,7 @@ const actionStrengthDecay: CapabilityBinding = {
 const poweredActionThreshold: CapabilityBinding = { id: "core/powered-action-threshold", config: { minimumStrength: 2 } };
 /** Each powered unit supplies one reinforcement point during its owner's turn. */
 const poweredIncome: CapabilityBinding = { id: "core/powered-income", config: { amount: 1 } };
-/** 攻击结算成功后，本回合不能再次行动；这是单位能力，不是地图效果。 */
+/** 标记该单位参与地形的“攻击占领进入反应”；占领后仍未通电才失活。 */
 const exhaustAfterAttack: CapabilityBinding = { id: "core/exhaust-after-attack" };
 
 export const coreUnitMod = defineMod({

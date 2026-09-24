@@ -13,6 +13,11 @@ const noCounterattack: CapabilityBinding = {
   config: { maxPerActionPhase: 0 }
 };
 
+/** Reuse the core terrain's capture-arrival reaction on this optional tile. */
+const captureArrivalExhaustion: CapabilityBinding = {
+  id: "core/exhaust-unpowered-after-capture"
+};
+
 // These two public rule capabilities are registered by this Mod because the
 // oil field is an optional content package, not a native terrain.
 const oilFieldIncome: CapabilityBinding = {
@@ -73,7 +78,7 @@ export const oilFieldMod = defineMod({
     displayName: "油田",
     // It is occupiable but deliberately not conductive: oil income does not
     // turn a roaming unit into a powered unit.
-    capabilities: [occupiable, oilFieldIncome, departureGarrison, noCounterattack]
+    capabilities: [occupiable, oilFieldIncome, departureGarrison, noCounterattack, captureArrivalExhaustion]
   }],
   units: [],
   commandRules: [],

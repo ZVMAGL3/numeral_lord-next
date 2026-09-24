@@ -23,13 +23,17 @@ const id = (value: string) => value as UnitId;
 
 const terrains: TerrainCatalog = {
   mountain: { id: "mountain", displayName: "山地", capabilities: [] },
-  plain: { id: "plain", displayName: "平原", capabilities: [{ id: "core/occupiable" }, { id: "core/power-conductor" }] },
+  plain: { id: "plain", displayName: "平原", capabilities: [
+    { id: "core/occupiable" }, { id: "core/power-conductor" },
+    { id: "core/exhaust-unpowered-after-capture" }
+  ] },
   ocean: {
     id: "ocean",
     displayName: "海洋",
     capabilities: [
       { id: "core/occupiable" },
-      { id: "core/exhaust-on-departure", config: { destinationTerrainIdNot: "ocean" } }
+      { id: "core/exhaust-on-departure", config: { destinationTerrainIdNot: "ocean" } },
+      { id: "core/exhaust-unpowered-after-capture" }
     ]
   },
   stronghold: {
@@ -40,7 +44,8 @@ const terrains: TerrainCatalog = {
       { id: "core/power-conductor" },
       { id: "core/power-source" },
       { id: "core/survival-anchor" },
-      { id: "core/adjacent-hostile-exhaustion" }
+      { id: "core/adjacent-hostile-exhaustion" },
+      { id: "core/exhaust-unpowered-after-capture" }
     ]
   },
   oilfield: {
@@ -48,6 +53,7 @@ const terrains: TerrainCatalog = {
     displayName: "油田",
     capabilities: [
       { id: "core/occupiable" },
+      { id: "core/exhaust-unpowered-after-capture" },
       {
         id: "core/departure-garrison",
         config: { strength: 1, unitDefinitionId: "roamer" }
@@ -298,6 +304,169 @@ describe("core turn rules", () => {
     const arrivedUnitId = result.state.cells[targetCell]?.unitId;
     expect(arrivedUnitId).toBeDefined();
     expect(result.state.turn.exhaustedUnitIds).toContain(arrivedUnitId);
+  });
+
+  it("lets the optional oil-field Mod handle capture exhaustion through its enter effect", () => {
+    const state = fixture();
+    const sourceCell = toCellId({ column: 1, row: 1 });
+    const targetCell = toCellId({ column: 2, row: 1 });
+    const oldEnemyHomeCell = toCellId({ column: 3, row: 1 });
+    const newEnemyHomeCell = toCellId({ column: 4, row: 2 });
+    const targetId = id("p2-target");
+    const { unitId: ignoredOldHome, ...emptyOldHomeCell } = state.cells[oldEnemyHomeCell]!;
+    void ignoredOldHome;
+    const { unitId: ignoredNewHome, ...newHomeWithoutUnit } = state.cells[newEnemyHomeCell]!;
+    void ignoredNewHome;
+    const attackState: GameState = {
+      ...state,
+      cells: {
+        ...state.cells,
+        [sourceCell]: { ...state.cells[sourceCell]!, terrainId: "ocean" },
+        [targetCell]: { ...state.cells[targetCell]!, terrainId: "oilfield", unitId: targetId },
+        [oldEnemyHomeCell]: emptyOldHomeCell,
+        [newEnemyHomeCell]: { ...newHomeWithoutUnit, terrainId: "stronghold", unitId: id("p2-home") }
+      },
+      units: {
+        ...state.units,
+        [id("p2-home")]: { ...state.units[id("p2-home")]!, cellId: newEnemyHomeCell },
+        [targetId]: { id: targetId, definitionId: "roamer", ownerId: p2, cellId: targetCell, strength: 1 }
+      }
+    };
+    const result = applyCommand(attackState, {
+      type: "attack-unit", commandId: "capture-oil-field", actorId: p1, expectedSequence: 0,
+      unitId: id("p1-scout"), targetId: targetCell
+    }, terrains, unitCatalog);
+    expect(result.accepted).toBe(true);
+    if (!result.accepted) return;
+    const arrivedUnitId = result.state.cells[targetCell]?.unitId;
+    expect(arrivedUnitId).toBeDefined();
+    expect(getPoweredUnitIds(result.state, terrains).has(arrivedUnitId!)).toBe(false);
+    expect(result.state.turn.exhaustedUnitIds).toContain(arrivedUnitId);
+  });
+
+  it("does not exhaust a roamer that becomes powered by capturing a stronghold", () => {
+    const state = fixture();
+    const sourceCell = toCellId({ column: 1, row: 1 });
+    const targetCell = toCellId({ column: 2, row: 1 });
+    const oldEnemyHomeCell = toCellId({ column: 3, row: 1 });
+    const newEnemyHomeCell = toCellId({ column: 4, row: 2 });
+    const targetId = id("p2-target");
+    const oldEnemyHome = state.cells[oldEnemyHomeCell]!;
+    const newEnemyHome = state.cells[newEnemyHomeCell]!;
+    const { unitId: ignoredOldHomeUnit, ...emptyOldHomeCell } = oldEnemyHome;
+    void ignoredOldHomeUnit;
+    const { unitId: ignoredNewHomeUnit, ...newEnemyHomeWithoutUnit } = newEnemyHome;
+    void ignoredNewHomeUnit;
+    const attackState: GameState = {
+      ...state,
+      cells: {
+        ...state.cells,
+        [sourceCell]: { ...state.cells[sourceCell]!, terrainId: "ocean" },
+        [targetCell]: { ...state.cells[targetCell]!, terrainId: "stronghold", unitId: targetId },
+        [oldEnemyHomeCell]: emptyOldHomeCell,
+        [newEnemyHomeCell]: { ...newEnemyHomeWithoutUnit, terrainId: "stronghold", unitId: id("p2-home") }
+      },
+      units: {
+        ...state.units,
+        [id("p2-home")]: { ...state.units[id("p2-home")]!, cellId: newEnemyHomeCell },
+        [targetId]: { id: targetId, definitionId: "roamer", ownerId: p2, cellId: targetCell, strength: 1 }
+      }
+    };
+    expect(getPoweredUnitIds(attackState, terrains).has(id("p1-scout"))).toBe(false);
+
+    const result = applyCommand(attackState, {
+      type: "attack-unit", commandId: "capture-power-source", actorId: p1, expectedSequence: 0,
+      unitId: id("p1-scout"), targetId: targetCell
+    }, terrains, unitCatalog);
+    expect(result.accepted).toBe(true);
+    if (!result.accepted) return;
+    const arrivedUnitId = result.state.cells[targetCell]?.unitId;
+    expect(arrivedUnitId).toBeDefined();
+    expect(getPoweredUnitIds(result.state, terrains).has(arrivedUnitId!)).toBe(true);
+    expect(result.state.turn.exhaustedUnitIds).not.toContain(arrivedUnitId);
+  });
+
+  it("does not exhaust a roamer that connects to power by capturing a plain", () => {
+    const state = fixture();
+    const sourceCell = toCellId({ column: 1, row: 1 });
+    const targetCell = toCellId({ column: 2, row: 1 });
+    const oldP1HomeCell = toCellId({ column: 0, row: 1 });
+    const oldP2HomeCell = toCellId({ column: 3, row: 1 });
+    const newP1HomeCell = toCellId({ column: 4, row: 1 });
+    const newP2HomeCell = toCellId({ column: 4, row: 0 });
+    const supportCell = oldP2HomeCell;
+    const targetId = id("p2-target");
+    const clearUnit = (cell: MapCell): MapCell => {
+      const { unitId: ignored, ...emptyCell } = cell;
+      void ignored;
+      return emptyCell;
+    };
+    const attackState: GameState = {
+      ...state,
+      cells: {
+        ...state.cells,
+        [sourceCell]: { ...state.cells[sourceCell]!, terrainId: "ocean" },
+        [oldP1HomeCell]: clearUnit(state.cells[oldP1HomeCell]!),
+        [oldP2HomeCell]: { ...state.cells[oldP2HomeCell]!, terrainId: "plain", unitId: id("p1-support") },
+        [newP1HomeCell]: { ...state.cells[newP1HomeCell]!, terrainId: "stronghold", unitId: id("p1-home") },
+        [newP2HomeCell]: { ...state.cells[newP2HomeCell]!, terrainId: "stronghold", unitId: id("p2-home") },
+        [targetCell]: { ...state.cells[targetCell]!, unitId: targetId }
+      },
+      units: {
+        ...state.units,
+        [id("p1-home")]: { ...state.units[id("p1-home")]!, cellId: newP1HomeCell },
+        [id("p1-support")]: {
+          id: id("p1-support"), definitionId: "roamer", ownerId: p1, cellId: supportCell, strength: 1
+        },
+        [id("p2-home")]: { ...state.units[id("p2-home")]!, cellId: newP2HomeCell },
+        [targetId]: { id: targetId, definitionId: "roamer", ownerId: p2, cellId: targetCell, strength: 1 }
+      }
+    };
+    expect(getPoweredUnitIds(attackState, terrains).has(id("p1-scout"))).toBe(false);
+
+    const result = applyCommand(attackState, {
+      type: "attack-unit", commandId: "capture-power-link", actorId: p1, expectedSequence: 0,
+      unitId: id("p1-scout"), targetId: targetCell
+    }, terrains, unitCatalog);
+    expect(result.accepted).toBe(true);
+    if (!result.accepted) return;
+    const arrivedUnitId = result.state.cells[targetCell]?.unitId;
+    expect(arrivedUnitId).toBeDefined();
+    expect(getPoweredUnitIds(result.state, terrains).has(arrivedUnitId!)).toBe(true);
+    expect(result.state.turn.exhaustedUnitIds).not.toContain(arrivedUnitId);
+  });
+
+  it("keeps enemy stronghold exhaustion ahead of power gained from a capture", () => {
+    const state = fixture();
+    const sourceCell = toCellId({ column: 1, row: 1 });
+    const targetCell = toCellId({ column: 2, row: 1 });
+    const targetId = id("p2-target");
+    const attackState: GameState = {
+      ...state,
+      cells: {
+        ...state.cells,
+        [sourceCell]: { ...state.cells[sourceCell]!, terrainId: "ocean" },
+        [targetCell]: { ...state.cells[targetCell]!, terrainId: "stronghold", unitId: targetId }
+      },
+      units: {
+        ...state.units,
+        [targetId]: { id: targetId, definitionId: "roamer", ownerId: p2, cellId: targetCell, strength: 1 }
+      }
+    };
+    expect(getPoweredUnitIds(attackState, terrains).has(id("p1-scout"))).toBe(false);
+
+    const result = applyCommand(attackState, {
+      type: "attack-unit", commandId: "capture-under-hostile-lock", actorId: p1, expectedSequence: 0,
+      unitId: id("p1-scout"), targetId: targetCell
+    }, terrains, unitCatalog);
+    expect(result.accepted).toBe(true);
+    if (!result.accepted) return;
+    const arrivedUnitId = result.state.cells[targetCell]?.unitId;
+    expect(arrivedUnitId).toBeDefined();
+    expect(getPoweredUnitIds(result.state, terrains).has(arrivedUnitId!)).toBe(true);
+    expect(result.state.turn.exhaustedUnitIds).toContain(arrivedUnitId);
+    expect(result.events.find((event) => event.type === "unit-exhausted")?.message)
+      .toContain("敌方据点封锁区");
   });
 
   it("does not exhaust a powered roamer after attacking", () => {

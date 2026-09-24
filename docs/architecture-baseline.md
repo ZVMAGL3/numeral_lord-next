@@ -55,11 +55,11 @@
 | `core/counterattack` | 受到攻击后是否可以反击。 |
 | `core/counterattack-limit` | 每个行动阶段最多反击次数。 |
 | `core/action-strength-decay` | 行动后的兵力变化；基础游兵为减 1、最低保留 1，若行动前已是 1 则在动作完成后本回合失活。 |
-| `core/exhaust-after-attack` | 攻击完成后让该单位本回合失活；基础游兵拥有此能力，通电状态由引擎跳过该规则。 |
+| `core/exhaust-after-attack` | 单位参与地形的“攻击占领进入反应”；占领后仍未通电时本回合失活，若占领后变为通电则不触发。 |
 | `core/powered-action-threshold` | 通电状态下可行动的最小兵力；基础游兵为 2，因此通电 1 点兵不可移动或攻击。 |
 | `core/powered-income` | 通电状态下每回合产生的点数；基础游兵为 1。 |
 
-这些能力由规则内核在命令结算中统一处理，而不是由 Vue 的选中状态处理。游兵攻击后的失活只由 `core/exhaust-after-attack` 触发；通电兵可以继续攻击。无论单位是否通电，只要完成移动或近战攻击后落在“已占据敌方据点”的六邻格，`core/adjacent-hostile-exhaustion` 优先写入同一个 `turn.exhaustedUnitIds`；空据点、友方据点和据点自身所在格都不会触发。这个数组是每个行动阶段自动清空的权威状态，因此 AI、回放、浏览器预测和 Node 服务端得到完全相同的“能否继续行动”结果。
+这些能力由规则内核在命令结算中统一处理，而不是由 Vue 的选中状态处理。攻击占领后会执行目标地形声明的 `core/exhaust-unpowered-after-capture` 进入反应；此时重新计算供电，因此占领据点或接通己方供电网络的游兵不会因攻击失活。若落点在已占据敌方据点的六邻格，`core/adjacent-hostile-exhaustion` 先于其他进入反应执行并保持最高优先级，即使这次占领刚让单位通电也仍会失活。空据点、友方据点和据点自身所在格不触发封锁。两个效果共用 `turn.exhaustedUnitIds`，这是每个行动阶段自动清空的权威状态，因此 AI、回放、浏览器预测和 Node 服务端得到完全相同的“能否继续行动”结果。
 
 合法目标由移动目标和攻击目标合并计算：关闭友伤时，同队单位不会被列为攻击目标，也会被引擎再次拒绝。远程单位可把 `core/attack.movesIntoTarget` 设为 `false`，从而攻击后仍留在原格；因此自动续选由动作结果的 `continuation` 决定，而非攻击目标坐标。
 

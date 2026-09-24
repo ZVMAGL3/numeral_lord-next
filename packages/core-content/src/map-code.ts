@@ -200,6 +200,9 @@ export function createMatchFromMapDefinition(definition: MapDefinition, options:
         addCellLink(source.id, toCellId(neighbour), "enter", "core/adjacent-hostile-exhaustion");
       }
     }
+    if (hasTerrainCapability(terrain, "core/exhaust-unpowered-after-capture")) {
+      addCellLocalTrigger(source.id, "enter", "core/exhaust-unpowered-after-capture");
+    }
     if (hasTerrainCapability(terrain, "core/departure-garrison")) addCellLocalTrigger(source.id, "leave", "core/departure-garrison");
     if (hasTerrainCapability(terrain, "core/exhaust-on-departure")) addCellLocalTrigger(source.id, "leave", "core/exhaust-on-departure");
   }

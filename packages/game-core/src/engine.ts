@@ -110,6 +110,7 @@ const CAPABILITY = {
   income: "core/income-source",
   departureExhaustion: "core/exhaust-on-departure",
   hostileExhaustion: "core/adjacent-hostile-exhaustion",
+  attackCaptureExhaustion: "core/exhaust-unpowered-after-capture",
   departureGarrison: "core/departure-garrison",
   counterattackTerrainLimit: "core/counterattack-terrain-limit"
 } as const;
@@ -605,18 +606,26 @@ function attackUnit(
   if (movesIntoTarget) {
     const arrivedCell = draft.cells[targetCell.id];
     const arrivingUnit = arrivedCell?.unitId ? draft.units[arrivedCell.unitId] : undefined;
-    if (arrivingUnit) applyAdjacentHostileExhaustion(draft, arrivingUnit, terrains, events);
+    if (arrivingUnit && arrivingUnit.id === continuationUnitId && arrivingUnit.cellId === targetCell.id) {
+      // Arrival reactions are resolved against the captured cell's current
+      // state: power may have changed because the capture connected this unit
+      // to a source, or the occupied stronghold itself may now be its source.
+      // The linked hostile-stronghold trigger is deliberately first and cannot
+      // be bypassed by becoming powered on arrival.
+      applyAdjacentHostileExhaustion(draft, arrivingUnit, terrains, events);
+      applyCaptureArrivalExhaustion(draft, arrivingUnit.id, attackerDefinition, terrains, events);
+    }
   }
 
   // Generic one-point exhaustion is deliberately after the stronghold-zone
   // check so the zone rule remains the highest-priority reason for arrival.
   applyMinimumStrengthExhaustion(draft, continuationUnitId, attacker, attackerDefinition, events);
 
-  // An attack itself exhausts only an unpowered unit with this capability.
-  // The hostile-stronghold zone above runs first, so its higher-priority event
-  // wins when both rules would mark the same arrival unit exhausted. Powered
-  // units retain their action and may attack again unless the zone catches them.
-  if (!powered && continuationUnitId && hasUnitCapability(attackerDefinition, UNIT_CAPABILITY.attackExhaustion)) {
+  // Ranged/non-entering attacks have no terrain arrival reaction, so retain
+  // their normal unpowered attack exhaustion. Captures are handled by the
+  // destination terrain's enter capability above, using post-capture power.
+  if (!movesIntoTarget && !powered && continuationUnitId
+    && hasUnitCapability(attackerDefinition, UNIT_CAPABILITY.attackExhaustion)) {
     if (exhaustUnitForCurrentPhase(draft, continuationUnitId)) {
       events.push({ type: "unit-exhausted", message: "游兵完成攻击，本回合失去行动力。" });
     }
@@ -808,6 +817,34 @@ function applyCounterattack(
   if (attackerCell) draft.cells[attacker.cellId] = withCellUnit(attackerCell, undefined);
   delete draft.units[attacker.id];
   events.push({ type: "unit-counterattacked", message: "防守单位发动反击，进攻单位被消灭。" });
+}
+
+/**
+ * Resolve the destination terrain's "unpowered attacker captured a unit"
+ * enter reaction. This is terrain-owned so optional terrain Mods can opt in
+ * without adding special cases to the unit or attack implementation. Power is
+ * recalculated after capture; if capture just powered the arriving unit, its
+ * unit-level exhaust-after-attack capability no longer applies.
+ */
+function applyCaptureArrivalExhaustion(
+  draft: Draft,
+  unitId: UnitId,
+  definition: UnitSpec,
+  terrains: TerrainCatalog,
+  events: GameEvent[]
+): void {
+  const unit = draft.units[unitId];
+  if (!unit || !hasUnitCapability(definition, UNIT_CAPABILITY.attackExhaustion)) return;
+  const cell = draft.cells[unit.cellId];
+  if (!cell) return;
+  const terrain = terrains[cell.terrainId];
+  if (!terrain || !hasCellTrigger(
+    draft.state, cell.id, "enter", CAPABILITY.attackCaptureExhaustion, terrain
+  )) return;
+  if (getPoweredUnitIds(asDraftState(draft), terrains).has(unitId)) return;
+  if (exhaustUnitForCurrentPhase(draft, unitId)) {
+    events.push({ type: "unit-exhausted", message: "游兵完成攻击，本回合失去行动力。" });
+  }
 }
 
 /** A terrain's reaction limit overrides the unit's ordinary fallback limit. */

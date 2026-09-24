@@ -52,6 +52,11 @@ const adjacentHostileExhaustion: CapabilityBinding = {
   id: "core/adjacent-hostile-exhaustion"
 };
 
+/** Capture exhaustion is an enter reaction; post-capture power is checked by the engine. */
+const exhaustUnpoweredCapturingUnit: CapabilityBinding = {
+  id: "core/exhaust-unpowered-after-capture"
+};
+
 /** 离开海洋进入陆地后，本次行动的单位本回合不能再次行动。 */
 const oceanDepartureExhaustion: CapabilityBinding = {
   id: "core/exhaust-on-departure",
@@ -122,6 +127,12 @@ export const coreTerrainMod = defineMod({
       // 六邻格、占据条件、队伍关系是当前能力的固定契约。
       defaultConfig: {}
     },
+    {
+      // 进入地块时处理攻击占领后的游兵失活，供电状态按占领后重新计算。
+      id: "core/exhaust-unpowered-after-capture",
+      target: "terrain",
+      defaultConfig: {}
+    },
   ],
 
   // 每项都是独立地形定义；数组顺序不表示继承关系。
@@ -144,13 +155,13 @@ export const coreTerrainMod = defineMod({
       id: "core/ocean",
       displayName: "海洋",
       // 可驻兵，但没有 power-conductor，所以其中单位默认保持游兵。
-      capabilities: [occupiable, oceanDepartureExhaustion, oneCounterattack]
+      capabilities: [occupiable, oceanDepartureExhaustion, oneCounterattack, exhaustUnpoweredCapturingUnit]
     },
     {
       id: "core/plain",
       displayName: "平原",
       // 可驻兵且可传电；平原本身不产点。
-      capabilities: [occupiable, powerConductor, oneCounterattack]
+      capabilities: [occupiable, powerConductor, oneCounterattack, exhaustUnpoweredCapturingUnit]
     },
     {
       id: "core/stronghold",
@@ -165,6 +176,7 @@ export const coreTerrainMod = defineMod({
         // 这是胜负锚点，不等同于供电能力；地图可单独选择胜负模块。
         survivalAnchor,
         adjacentHostileExhaustion,
+        exhaustUnpoweredCapturingUnit,
         unlimitedCounterattacks
       ]
     },

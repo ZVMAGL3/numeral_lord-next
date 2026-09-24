@@ -53,6 +53,7 @@ import { getPoweredUnitIds, type GameState } from "@numeral-lord/game-core";
 import { createMatchFromMapCode, parseMapCode } from "@numeral-lord/core-content";
 import { installedMapCatalogs, installedTerrainCatalog } from "../installed-content";
 import HexBoard from "./HexBoard.vue";
+import TerrainModPreview from "./TerrainModPreview.vue";
 
 const props = withDefaults(defineProps<{
   terrainMods: readonly TerrainModEntry[];
@@ -325,8 +326,6 @@ function makeThumbnail(code?: string): MapThumbnail | null {
   } catch { return null; }
 }
 const mapThumbnails = computed(() => new Map(props.mapEntries.map((entry) => [entry.id, makeThumbnail(entry.code)])));
-const oilFieldArtworkUrl = `${import.meta.env.BASE_URL}legacy/TSF.png`;
-
 function selectCategory(next: Category): void {
   category.value = next;
   viewMode.value = "browse";
@@ -466,11 +465,7 @@ function installSelectedTerrain(): void {
       <template v-if="category === 'terrain'">
         <button v-for="entry in terrainMods" :key="entry.id" class="workshop-work-card" type="button" @click="openTerrain(entry)">
           <span class="work-card-preview terrain-card-preview" aria-hidden="true">
-            <img v-if="entry.previewImageUrl" class="custom-terrain-art" :src="entry.previewImageUrl" alt="" />
-            <span v-else-if="entry.terrainIds.includes('mod/oil-field')" class="oil-field-art">
-              <img :src="oilFieldArtworkUrl" alt="" />
-            </span>
-            <span v-else class="generic-terrain-mark">⬡</span>
+            <TerrainModPreview :terrain-ids="entry.terrainIds" :image-url="entry.previewImageUrl" />
           </span>
           <span class="work-card-info"><span class="work-card-title"><strong>{{ entry.name }}</strong><em :class="{ installed: entry.installed }">{{ entry.installed ? '已安装' : '未安装' }}</em></span><span class="work-card-description">{{ entry.description || '暂无作品简介' }}</span><small>{{ entry.authorName || entry.author || '社区作者' }} · {{ entry.terrainIds.length }} 个地块</small></span>
         </button>
@@ -498,7 +493,7 @@ function installSelectedTerrain(): void {
         <article v-if="category === 'terrain' && selectedTerrain" class="detail-card">
           <div class="detail-overline"><span>TERRAIN MOD</span><span>{{ selectedTerrain.modId || selectedTerrain.id }}</span></div>
           <div class="title-row"><div><h3>{{ selectedTerrain.name }}</h3><p>{{ selectedTerrain.authorName || selectedTerrain.author || '社区作者' }} · v{{ selectedTerrain.version }}</p></div><span class="status-pill" :class="{ installed: selectedTerrain.installed }">{{ selectedTerrain.installed ? '已安装' : '未安装' }}</span></div>
-          <img v-if="selectedTerrain.previewImageUrl" class="terrain-preview-image" :src="selectedTerrain.previewImageUrl" :alt="`${selectedTerrain.name}预览`" />
+          <div class="terrain-detail-preview"><TerrainModPreview large :terrain-ids="selectedTerrain.terrainIds" :image-url="selectedTerrain.previewImageUrl" /></div>
           <p class="description">{{ selectedTerrain.description }}</p>
           <div class="metadata-block"><strong>包含地块</strong><div class="token-list"><code v-for="id in selectedTerrain.terrainIds" :key="id">{{ id }}</code><span v-if="!selectedTerrain.terrainIds.length" class="quiet">未声明地块 ID</span></div></div>
           <p v-if="selectedTerrain.readme" class="readme">{{ selectedTerrain.readme }}</p>
@@ -603,4 +598,6 @@ function installSelectedTerrain(): void {
 
 <style scoped>
 .definition-preview { max-height: 360px; overflow: auto; margin: 10px 0; padding: 14px; border: 1px solid rgba(125,167,191,.26); border-radius: 10px; background: #0b1928; color: #d7e9f1; font: 11px/1.6 ui-monospace, Consolas, monospace; white-space: pre; }
+.terrain-detail-preview { display: grid; place-items: center; min-height: 176px; margin: 13px 0; border: 1px solid rgba(138,179,203,.25); border-radius: 12px; background: radial-gradient(circle at 50% 42%,rgba(238,178,93,.16),transparent 48%),#182638; }
+.terrain-detail-preview :deep(.terrain-art-tile) { width: 100px; height: 112px; }
 </style>

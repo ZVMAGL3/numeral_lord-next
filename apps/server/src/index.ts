@@ -466,6 +466,21 @@ export class PvpRelayRoom extends RelayRoom {
       previous.installedModIds = installedModIds;
       if (this.phase === "lobby" && this.missingModIds(previous).length > 0) previous.ready = false;
       this.members.set(client.sessionId, previous);
+      // Match-start is retained so a replacement host can rebuild the opening
+      // state if no authoritative snapshot has been published yet. Keep its
+      // session mapping in step with the resumed browser identity; otherwise
+      // the refreshed host receives the right seat from room-role but appears
+      // as a spectator when the retained payload is replayed.
+      if (this.matchStartPayload) {
+        this.matchStartPayload = {
+          ...this.matchStartPayload,
+          assignments: this.matchStartPayload.assignments.map((assignment) =>
+            assignment.sessionId === oldSessionId
+              ? { ...assignment, sessionId: client.sessionId }
+              : assignment
+          )
+        };
+      }
       if (oldClient) {
         console.info("PvP browser identity moved to a new tab", {
           roomId: this.roomId,

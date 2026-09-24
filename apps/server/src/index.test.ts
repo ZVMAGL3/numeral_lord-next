@@ -421,6 +421,30 @@ describe("PvpRelayRoom lobby contract", () => {
     )).toHaveLength(1);
   });
 
+  it("updates the retained match assignment when the host refreshes during a live match", () => {
+    const room = createRoom(2);
+    const host = join(room, "host-old", "房主", "stable-host-account");
+    const player = join(room, "player", "棋手", "stable-player-account");
+    room.receive("lobby-ready", host, { ready: true });
+    room.receive("lobby-ready", player, { ready: true });
+
+    const refreshedHost = join(room, "host-new", "房主", "stable-host-account");
+    refreshedHost.sent.length = 0;
+    room.receive("room-sync", refreshedHost);
+
+    expect(lastSent<MatchStartPayload>(refreshedHost, "match-start").assignments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ sessionId: "host-new", seat: 1, playerId: "player-1" })
+      ])
+    );
+    expect(lastSent<Record<string, unknown>>(refreshedHost, "room-role")).toMatchObject({
+      sessionId: "host-new",
+      seat: 1,
+      participating: true,
+      playerId: "player-1"
+    });
+  });
+
   it("room-sync returns authoritative lobby context without requesting a game snapshot", () => {
     const room = createRoom(2);
     const host = join(room, "host");

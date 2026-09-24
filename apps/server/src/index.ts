@@ -239,6 +239,12 @@ export class PvpRelayRoom extends RelayRoom {
             client.send("snapshot-request", { sessionId: client.sessionId });
           }
         } else if (!this.sendCachedSnapshot(client)) {
+          // A room can enter `playing` a moment before its new host publishes
+          // the first snapshot. Give refreshes/late spectators the deterministic
+          // opening board immediately, then request the live host snapshot to
+          // replace it. This avoids an endless loading screen if that request
+          // races with host handoff or reconnect.
+          this.sendMatchStart(client);
           this.requestHostSnapshot(client.sessionId);
         }
       }

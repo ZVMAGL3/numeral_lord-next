@@ -391,6 +391,23 @@ describe("PvpRelayRoom lobby contract", () => {
     expect(room.broadcasts.some((event) => event.type === "snapshot-request")).toBe(false);
   });
 
+  it("bootstraps a refreshing spectator before the first host snapshot is cached", () => {
+    const room = createRoom(2);
+    const host = join(room, "host");
+    room.receive("lobby-ready", host, { ready: true });
+    const late = join(room, "late");
+    late.sent.length = 0;
+
+    room.receive("room-sync", late);
+
+    expect(late.sent.map((message) => message.type)).toEqual([
+      "room-role", "room-state", "room-host", "match-start"
+    ]);
+    expect(lastSent<LobbyRoomState>(late, "room-state").phase).toBe("playing");
+    expect(lastSent<MatchStartPayload>(late, "match-start").mapCode).toBe(DEFAULT_MAP_CODE);
+    expect(host.sent.some((message) => message.type === "snapshot-request")).toBe(true);
+  });
+
   it("lets only the host select a validated map and frees seats outside its range", () => {
     const room = createRoom(4);
     const host = join(room, "host");

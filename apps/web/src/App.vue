@@ -475,9 +475,21 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string, r
       logConnection("match.start", { assignments: payload.assignments.length, roomId: room.roomId });
       startLobbyMatch(payload);
     });
-    room.onMessage("snapshot-request", () => {
-      logConnection("snapshot.requested", { host: relayIsHost.value, sequence: game.value.sequence });
-      if (relayIsHost.value) broadcastSnapshot();
+    room.onMessage("snapshot-request", (payload?: { commandId?: string; errorMessage?: string }) => {
+      logConnection("snapshot.requested", {
+        host: relayIsHost.value,
+        sequence: game.value.sequence,
+        hasCommandId: typeof payload?.commandId === "string"
+      });
+      if (relayIsHost.value) {
+        const resolution = typeof payload?.commandId === "string"
+          ? {
+            resolvedCommandId: payload.commandId,
+            ...(typeof payload.errorMessage === "string" ? { errorMessage: payload.errorMessage } : {})
+          }
+          : undefined;
+        broadcastSnapshot(resolution);
+      }
     });
     room.onMessage("room-host", (payload: { sessionId?: string }) => {
       relayIsHost.value = payload.sessionId === room.sessionId;
@@ -488,7 +500,19 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string, r
       if (!relayIsHost.value || !payload.command) return;
       tickClocks();
       const active = currentPlayer.value;
-      if (!active || payload.command.actorId !== active.id) return;
+      if (!active || payload.command.actorId !== active.id) {
+        logConnection("intent.rejected-stale-actor", {
+          commandId: payload.command.commandId,
+          requestedActorId: payload.command.actorId,
+          activePlayerId: active?.id ?? null,
+          sequence: game.value.sequence
+        });
+        broadcastSnapshot({
+          resolvedCommandId: payload.command.commandId,
+          errorMessage: "对局状态已变化，已重新同步棋盘，请确认当前行动玩家后重试。"
+        });
+        return;
+      }
       const result = applyCommand(game.value, payload.command, installedTerrainCatalog, coreUnitCatalog, coreMatchConditionCatalog);
       if (!applyResult(result, false, payload.command.commandId) && !result.accepted) {
         broadcastSnapshot({ resolvedCommandId: payload.command.commandId, errorMessage: result.error.message });

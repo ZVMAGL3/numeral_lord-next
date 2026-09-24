@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { coreMatchConditionCatalog } from "../../core-content/src/match-conditions.js";
+import { createMatchFromMapCode, DEFAULT_MAP_CODE } from "../../core-content/src/map-code.js";
 import { coreTerrainCatalog } from "../../core-content/src/terrains.js";
-import { oilFieldTerrainCatalog } from "../../oil-field-mod/src/index.js";
+import { oilFieldMod, oilFieldTerrainCatalog } from "../../oil-field-mod/src/index.js";
 import { applyCommand, finishMatch, getActionableUnitIds, getLegalActionDestinationIds, getPoweredUnitIds, startMatch } from "./engine.js";
 import { applyIntent, getLegalIntents } from "./simulation.js";
 import type { TerrainCatalog, UnitCatalog } from "./content.js";
@@ -138,6 +139,25 @@ describe("core turn rules", () => {
     type: "attack-unit" as const, commandId: "siege", actorId: p2, expectedSequence: 0,
     unitId: id("p2-home"), targetId: toCellId({ column: 0, row: 1 })
   };
+
+  it("compiles capture exhaustion into the enter triggers of each opted-in terrain", () => {
+    const map = createMatchFromMapCode(DEFAULT_MAP_CODE, {
+      terrains: { ...coreTerrainCatalog, ...oilFieldTerrainCatalog },
+      terrainModIds: { "mod/oil-field": oilFieldMod.id },
+      mods: { [oilFieldMod.id]: oilFieldMod }
+    });
+    const handledTerrainIds = new Set([
+      "core/plain", "core/ocean", "core/stronghold", "mod/oil-field"
+    ]);
+    const cells = Object.values(map.cells).filter((cell) => handledTerrainIds.has(cell.terrainId));
+
+    expect(cells.length).toBeGreaterThan(0);
+    for (const cell of cells) {
+      expect(map.cellTriggers?.[cell.id]?.enter).toContainEqual({
+        relationId: "core/exhaust-unpowered-after-capture"
+      });
+    }
+  });
 
   it("rejects unknown command types instead of returning undefined", () => {
     const state = fixture();
@@ -467,6 +487,45 @@ describe("core turn rules", () => {
     expect(result.state.turn.exhaustedUnitIds).toContain(arrivedUnitId);
     expect(result.events.find((event) => event.type === "unit-exhausted")?.message)
       .toContain("敌方据点封锁区");
+  });
+
+  it("does not run destination enter reactions on a defender when a powered attack fails", () => {
+    const state = fixture();
+    const p3 = "p3" as PlayerId;
+    const t3 = "t3" as TeamId;
+    const targetCell = toCellId({ column: 2, row: 1 });
+    const targetId = id("p3-defender");
+    const attackState: GameState = {
+      ...state,
+      cells: {
+        ...state.cells,
+        [targetCell]: { ...state.cells[targetCell]!, unitId: targetId }
+      },
+      units: {
+        ...state.units,
+        [id("p1-scout")]: { ...state.units[id("p1-scout")]!, strength: 3 },
+        [targetId]: { id: targetId, definitionId: "non-countering-unit", ownerId: p3, cellId: targetCell, strength: 5 }
+      },
+      players: {
+        ...state.players,
+        [p3]: { id: p3, teamId: t3, seat: 3, displayName: "玩家 3", color: "#0f0", reinforcementPoints: 0 }
+      },
+      teams: { ...state.teams, [t3]: { id: t3, playerIds: [p3] } }
+    };
+    const units: UnitCatalog = {
+      ...unitCatalog,
+      "non-countering-unit": { id: "non-countering-unit", displayName: "不反击单位", capabilities: [] }
+    };
+    const result = applyCommand(attackState, {
+      type: "attack-unit", commandId: "failed-powered-attack", actorId: p1, expectedSequence: 0,
+      unitId: id("p1-scout"), targetId: targetCell
+    }, terrains, units);
+    expect(result.accepted).toBe(true);
+    if (!result.accepted) return;
+    expect(result.state.cells[targetCell]?.unitId).toBe(targetId);
+    expect(result.state.units[id("p1-scout")]?.cellId).toBe(toCellId({ column: 1, row: 1 }));
+    expect(result.state.turn.exhaustedUnitIds).toEqual([]);
+    expect(result.events.some((event) => event.type === "unit-exhausted")).toBe(false);
   });
 
   it("does not exhaust a powered roamer after attacking", () => {

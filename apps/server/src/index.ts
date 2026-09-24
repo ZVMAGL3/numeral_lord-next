@@ -80,8 +80,6 @@ export class PvpRelayRoom extends RelayRoom {
   private authoritativeHostSessionId: string | undefined;
   private readonly members = new Map<string, MutableLobbyMember>();
   private readonly lastRoomSyncAtBySession = new Map<string, number>();
-  /** Owner session for the non-persistent attacker-selection overlay. */
-  private boardSelectionSessionId: string | undefined;
   private phase: LobbyRoomState["phase"] = "lobby";
   private mapPlayerCount = 2;
   private mapCode = DEFAULT_MAP_CODE;
@@ -151,30 +149,6 @@ export class PvpRelayRoom extends RelayRoom {
       });
       this.broadcast("player-intent", { ...payload, command, playerId }, { except: client });
     });
-    this.onMessage("board-selection", (client, payload: Record<string, unknown> = {}) => {
-      const member = this.members.get(client.sessionId);
-      const state = this.latestHostSnapshot?.payload.state;
-      const turn = isRecord(state) && isRecord(state.turn) ? state.turn : undefined;
-      const playerId = member?.participating && member.seat !== null ? playerIdForSeat(member.seat) : undefined;
-      if (this.phase !== "playing" || !member?.connected || !playerId
-        || turn?.phase !== "action" || turn.currentPlayerId !== playerId) return;
-
-      if (payload.unitId === null) {
-        // A different tab/member must not be able to erase the active player's
-        // current target preview. Selection is presentation-only, but scoped.
-        if (this.boardSelectionSessionId !== client.sessionId) return;
-        this.boardSelectionSessionId = undefined;
-        this.broadcast("board-selection", { unitId: null });
-        return;
-      }
-
-      if (typeof payload.unitId !== "string" || !isRecord(state) || !isRecord(state.units)) return;
-      const unit = state.units[payload.unitId];
-      const exhausted = Array.isArray(turn.exhaustedUnitIds) && turn.exhaustedUnitIds.includes(payload.unitId);
-      if (!isRecord(unit) || unit.ownerId !== playerId || exhausted) return;
-      this.boardSelectionSessionId = client.sessionId;
-      this.broadcast("board-selection", { sessionId: client.sessionId, unitId: payload.unitId }, { except: client });
-    });
     this.onMessage("host-snapshot", (client, payload: Record<string, unknown> = {}) => {
       if (this.phase !== "playing" || client.sessionId !== this.hostSessionId) return;
       if (client.sessionId !== this.authoritativeHostSessionId) {
@@ -199,7 +173,6 @@ export class PvpRelayRoom extends RelayRoom {
         return;
       }
       const previousSequence = this.latestHostSnapshot?.sequence;
-      if (previousSequence !== undefined && previousSequence !== snapshot.sequence) this.clearBoardSelection();
       this.latestHostSnapshot = snapshot;
       if (previousSequence !== snapshot.sequence || typeof payload.resolvedCommandId === "string") {
         console.info("PvP host snapshot accepted", {
@@ -366,12 +339,6 @@ export class PvpRelayRoom extends RelayRoom {
     };
   }
 
-  private clearBoardSelection(): void {
-    if (!this.boardSelectionSessionId) return;
-    this.boardSelectionSessionId = undefined;
-    this.broadcast("board-selection", { unitId: null });
-  }
-
   private sendCachedSnapshot(client: Client, handoff = false): boolean {
     if (!this.latestHostSnapshot) return false;
     client.send("host-snapshot", {
@@ -491,7 +458,6 @@ export class PvpRelayRoom extends RelayRoom {
         participating: previous.participating,
         wasHost: oldSessionId === this.hostSessionId
       });
-      if (this.boardSelectionSessionId === oldSessionId) this.clearBoardSelection();
       this.members.delete(oldSessionId);
       this.lastRoomSyncAtBySession.delete(oldSessionId);
       previous.sessionId = client.sessionId;
@@ -576,7 +542,6 @@ export class PvpRelayRoom extends RelayRoom {
         phase: this.phase,
         wasHost: client.sessionId === this.hostSessionId
       });
-      if (this.boardSelectionSessionId === client.sessionId) this.clearBoardSelection();
       member.connected = false;
       member.ready = false;
       // Do not leave the match without an authority for the entire Colyseus
@@ -850,7 +815,6 @@ export class PvpRelayRoom extends RelayRoom {
     }
 
     this.phase = "playing";
-    this.clearBoardSelection();
     this.matchStartedAtEpochMs = Date.now();
     this.authoritativeHostSessionId = this.hostSessionId;
     this.latestHostSnapshot = undefined;
@@ -874,7 +838,6 @@ export class PvpRelayRoom extends RelayRoom {
 
   /** End the current online match for every member, not just the host's local board. */
   private returnToLobby(): void {
-    this.clearBoardSelection();
     this.phase = "lobby";
     this.matchStartedAtEpochMs = null;
     this.latestHostSnapshot = undefined;

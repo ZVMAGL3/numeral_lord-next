@@ -3,7 +3,6 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { Client, type Room } from "@colyseus/sdk";
 import {
   applyCommand,
-  canCounterattack,
   DEFAULT_LOBBY_SETTINGS,
   getActionableUnitIds,
   getLegalActionDestinationIds,
@@ -42,6 +41,8 @@ import { addMapToLibrary, loadMapLibrary, removeMapFromLibrary } from "./map-lib
 import { installedMapCatalogs, installedTerrainCatalog, installedTerrainMods } from "./installed-content";
 import { WorkshopClient, type WorkshopConnectionStatus } from "./workshop-client";
 import { requestReturnToLobby } from "./room-reset";
+import { useBoardInteraction } from "./board-interaction";
+import { usePendingCommand, type PendingResolution } from "./pending-command";
 import { toNetworkPayload } from "./network-payload";
 import {
   advanceMatchClocks,
@@ -220,23 +221,21 @@ const lobbyPreviewState = computed(() => {
 });
 const lobbyPreviewPoweredUnitIds = computed(() => lobbyPreviewState.value
   ? [...getPoweredUnitIds(lobbyPreviewState.value, installedTerrainCatalog)] : []);
-const selectedUnitId = ref<UnitId | null>(null);
-/** Ephemeral room-wide board focus; never written into GameState or notation. */
-const boardPreviewUnitId = ref<UnitId | null>(null);
-/** Cell captured at selection time; notation never infers an attacker from a later click. */
-const selectedSourceCellId = ref<CellId | null>(null);
-/** Only a real user selection can contribute a source-coordinate click to notation. */
-const selectedByUser = ref(false);
+/** Selection, legal destinations and defense frames are private per-client UI state. */
+const boardInteraction = useBoardInteraction(() => game.value, installedTerrainCatalog, coreUnitCatalog);
+const {
+  selectedUnitId,
+  selectedSourceCellId,
+  selectedByUser,
+  selectedUnit,
+  legalActionCellIds,
+  counterattackCellIds,
+  noCounterattackCellIds
+} = boardInteraction;
 const notice = ref("选择己方单位，再点击相邻格移动或攻击。");
 
-interface PendingRemoteAction {
-  readonly commandId: string;
-  readonly expectedSequence: number;
-  readonly sourceCellId: CellId;
-  readonly targetCellId: CellId;
-  readonly includeSourceClick: boolean;
-}
-let pendingRemoteAction: PendingRemoteAction | undefined;
+const pendingCommand = usePendingCommand();
+const isRemoteActionPending = pendingCommand.isPending;
 
 const notation = ref<readonly NotationEntry[]>([]);
 const notationDialogOpen = ref(false);
@@ -271,10 +270,6 @@ const matchResultTitle = computed(() => game.value.result?.winningTeamIds.length
   ? `${winningTeamLabel.value} 获胜`
   : "对局结束");
 const matchResultMessage = computed(() => game.value.result?.message ?? "胜负条件已满足，本局结束。");
-const selectedUnit = computed(() => selectedUnitId.value ? game.value.units[selectedUnitId.value] : undefined);
-const boardPreviewUnit = computed(() => boardPreviewUnitId.value
-  ? game.value.units[boardPreviewUnitId.value]
-  : undefined);
 const poweredUnitIds = computed(() => [...getPoweredUnitIds(game.value, installedTerrainCatalog)]);
 const actionableUnitIds = computed(() => [...getActionableUnitIds(game.value, installedTerrainCatalog, coreUnitCatalog)]);
 const selectedIsPowered = computed(() => selectedUnit.value ? poweredUnitIds.value.includes(selectedUnit.value.id) : false);
@@ -295,7 +290,7 @@ const missingLocalModIds = computed(() => lobbyState.value.requiredTerrainModIds
 ));
 const isSpectator = computed(() => lobbyState.value.phase === "playing" && relayPlayerId.value === null);
 const canActCurrentPlayer = computed(() => !relayRoom || (lobbyState.value.phase === "playing"
-  && relayPlayerId.value === currentPlayer.value?.id));
+  && relayPlayerId.value === currentPlayer.value?.id) && !isRemoteActionPending.value);
 const stepSecondsRemaining = computed(() => remainingTurnSeconds(matchClock.value, game.value.turn.phase, clockNow.value));
 const matchSecondsRemaining = computed(() => remainingMatchSeconds(matchClock.value, lobbyState.value.settings, clockNow.value));
 const stepClockLabel = computed(() => isMatchFinished.value
@@ -307,27 +302,6 @@ const matchClockLabel = computed(() => isMatchFinished.value
 const notationTuples = computed(() => notation.value.map((entry) => entry.tuple));
 const notationText = computed(() => JSON.stringify(notationTuples.value));
 const latestContinuation = computed(() => [...notation.value].reverse().find((entry) => entry.continuation)?.continuation);
-/** Local command validation stays local even though its visual preview is shared. */
-const localLegalActionCellIds = computed<readonly CellId[]>(() => selectedUnit.value
-  ? getLegalActionDestinationIds(game.value, selectedUnit.value.id, installedTerrainCatalog, coreUnitCatalog)
-  : []);
-/** Legal cells follow the focused attacker on every room client, including the host. */
-const legalActionCellIds = computed<readonly CellId[]>(() => {
-  const unit = boardPreviewUnit.value;
-  if (!unit || !isActionPhase.value || unit.ownerId !== currentPlayer.value?.id
-    || game.value.turn.exhaustedUnitIds.includes(unit.id)) return [];
-  return getLegalActionDestinationIds(game.value, unit.id, installedTerrainCatalog, coreUnitCatalog);
-});
-/** Only occupied legal destinations are attack targets; do not frame every unit globally. */
-const counterattackCellIds = computed<readonly CellId[]>(() => legalActionCellIds.value.filter((cellId) => {
-  const targetId = game.value.cells[cellId]?.unitId;
-  return Boolean(targetId && canCounterattack(game.value, targetId, installedTerrainCatalog, coreUnitCatalog));
-}));
-const noCounterattackCellIds = computed<readonly CellId[]>(() => legalActionCellIds.value.filter((cellId) => {
-  const targetId = game.value.cells[cellId]?.unitId;
-  return Boolean(targetId && !canCounterattack(game.value, targetId, installedTerrainCatalog, coreUnitCatalog));
-}));
-
 function resolveRelayEndpoint(): string {
   // A query override keeps the static preview deployable without bundling a
   // secret or rebuilding the client for each server address: `?relay=ws...`.
@@ -371,27 +345,11 @@ function broadcastSnapshot(resolution?: {
   }
 }
 
-/** Publish only transient selection feedback so all room clients render the same targets. */
-function publishBoardSelection(unitId: UnitId | null): void {
-  boardPreviewUnitId.value = unitId;
-  if (relayRoom && lobbyState.value.phase === "playing") {
-    relayRoom.send("board-selection", { unitId });
-  }
-}
-
-function submitRemoteCommand(command: GameCommand): boolean {
+function submitRemoteCommand(command: GameCommand, resolution: PendingResolution): boolean {
   if (!relayRoom || relayIsHost.value) return false;
-  if (command.type === "move-unit" || command.type === "attack-unit") {
-    const sourceCellId = selectedSourceCellId.value ?? game.value.units[command.unitId]?.cellId;
-    if (sourceCellId) {
-      pendingRemoteAction = {
-        commandId: command.commandId,
-        expectedSequence: command.expectedSequence,
-        sourceCellId,
-        targetCellId: command.type === "move-unit" ? command.destinationId : command.targetId,
-        includeSourceClick: selectedByUser.value
-      };
-    }
+  if (!pendingCommand.begin(command, resolution)) {
+    notice.value = "正在等待房主确认上一操作，请稍候。";
+    return true;
   }
   logConnection("intent.sent", {
     commandId: command.commandId,
@@ -399,13 +357,26 @@ function submitRemoteCommand(command: GameCommand): boolean {
     expectedSequence: command.expectedSequence,
     actorId: command.actorId
   });
-  relayRoom.send("player-intent", { playerId: relayPlayerId.value, command });
-  notice.value = "操作已发送给房主，等待权威棋盘同步。";
+  try {
+    relayRoom.send("player-intent", { playerId: relayPlayerId.value, command });
+  } catch (error) {
+    pendingCommand.clear(command.commandId);
+    const message = error instanceof Error ? error.message : String(error);
+    logConnection("intent.send-failed", { commandId: command.commandId, message: message.slice(0, 250) });
+    notice.value = "操作发送失败，已解除等待状态；请确认连接后重试。";
+    clearSelectionSilently();
+    return true;
+  }
+  notice.value = "操作已发送，等待房主确认。";
   clearSelectionSilently();
   return true;
 }
 
 function canCurrentClientAct(): boolean {
+  if (pendingCommand.isPending.value) {
+    notice.value = "正在等待房主确认上一操作，请稍候。";
+    return false;
+  }
   if (!relayRoom) return true;
   // The interval may not have fired yet when a click lands exactly at the
   // deadline. Resolve the timeout before accepting a host-side command.
@@ -499,7 +470,7 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string, r
       lobbyError.value = "";
       if (payload.phase === "lobby") {
         hasLiveSnapshot.value = false;
-        pendingRemoteAction = undefined;
+        pendingCommand.clear();
         matchClock.value = null;
         expiredStepSequence = null;
         lastSnapshotSyncAt = 0;
@@ -511,13 +482,6 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string, r
           : "选择参战位置并准备；只要参战玩家全部准备即可开始。";
       }
     });
-    room.onMessage("board-selection", (payload: { unitId?: unknown }) => {
-      const unitId = typeof payload.unitId === "string" && payload.unitId in game.value.units
-        ? payload.unitId as UnitId
-        : null;
-      boardPreviewUnitId.value = unitId;
-      logConnection("board.selection-received", { unitId });
-    });
     room.onMessage("lobby-error", (payload: { message?: string }) => {
       lobbyError.value = payload.message ?? "房间设置没有生效。";
       notice.value = lobbyError.value;
@@ -525,9 +489,8 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string, r
     });
     room.onMessage("intent-rejected", (payload: { commandId?: string; reason?: string }) => {
       logConnection("intent.rejected-relay", { commandId: payload.commandId, reason: payload.reason });
-      if (pendingRemoteAction && (!payload.commandId || payload.commandId === pendingRemoteAction.commandId)) {
-        pendingRemoteAction = undefined;
-      }
+      if (payload.commandId) pendingCommand.clear(payload.commandId);
+      else pendingCommand.clear();
       lastSnapshotSyncAt = 0;
       relayRoom?.send("room-sync", {});
       notice.value = "服务器未能转发这次行动，正在重新同步棋盘；请确认轮到自己后重试。";
@@ -636,19 +599,43 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string, r
           : payload.clock
         : startMatchClocks(payload.state, lobbyState.value.settings, receivedAt);
       expiredStepSequence = null;
-      const pending = pendingRemoteAction;
-      if (pending && payload.resolvedCommandId === pending.commandId) {
-        pendingRemoteAction = undefined;
+      const pending = payload.resolvedCommandId
+        ? pendingCommand.resolve(payload.resolvedCommandId)
+        : null;
+      if (pending) {
         if (payload.errorMessage) {
           clearSelectionSilently();
           notice.value = payload.errorMessage;
         } else {
-          recordAction(pending.sourceCellId, pending.targetCellId, payload.continuation?.cellId, pending.includeSourceClick);
-          continueActionAt(payload.continuation?.unitId ?? null);
-          if (!payload.continuation) notice.value = "行动完成。";
+          switch (pending.resolution.kind) {
+            case "action":
+              recordAction(
+                pending.resolution.sourceCellId,
+                pending.resolution.targetCellId,
+                payload.continuation?.cellId,
+                pending.resolution.includeSourceClick
+              );
+              continueActionAt(payload.continuation?.unitId ?? null);
+              if (!payload.continuation) notice.value = "行动完成。";
+              break;
+            case "reinforcement":
+              recordReinforcement(pending.resolution.cellId, 1);
+              notice.value = "房主已确认加点。";
+              break;
+            case "phase":
+              recordSpecial(pending.resolution.phase);
+              clearSelectionSilently();
+              notice.value = pending.resolution.phase === "action"
+                ? "房主已确认结束行动回合。"
+                : "房主已确认结束加点回合。";
+              break;
+          }
         }
       } else {
-        if (pending && payload.state.sequence > pending.expectedSequence) pendingRemoteAction = undefined;
+        const unresolved = pendingCommand.current.value;
+        if (unresolved && payload.state.sequence > unresolved.expectedSequence) {
+          pendingCommand.clear(unresolved.commandId);
+        }
         clearSelectionSilently();
         notice.value = "已收到房主的最新棋盘。";
       }
@@ -666,13 +653,13 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string, r
       relayStatus.value = "连接已断开";
       relayRoom = undefined;
       relayRoomId.value = "";
-      boardPreviewUnitId.value = null;
+      boardInteraction.clear();
       relayPlayerId.value = null;
       relayAccountId.value = null;
       relaySessionId.value = null;
       relayIsHost.value = false;
       hasLiveSnapshot.value = false;
-      pendingRemoteAction = undefined;
+      pendingCommand.clear();
       if (replacedByAnotherTab) {
         cancelReconnect();
         notice.value = "同一浏览器身份已在另一个标签页进入此房间；本标签页已退出。";
@@ -847,7 +834,7 @@ async function leaveToHome(): Promise<void> {
   hasLiveSnapshot.value = false;
   lastSnapshotSyncAt = 0;
   lobbyError.value = "";
-  pendingRemoteAction = undefined;
+  pendingCommand.clear();
   matchClock.value = null;
   clearSelectionSilently();
   clearReinforcementHold();
@@ -885,7 +872,7 @@ function joinRoom(): void {
 }
 
 function startLobbyMatch(payload: MatchStartPayload): void {
-  pendingRemoteAction = undefined;
+  pendingCommand.clear();
   const assignment = payload.assignments.find((candidate) => candidate.sessionId === relaySessionId.value);
   relayPlayerId.value = assignment?.playerId ?? null;
   if (missingLocalModIds.value.length > 0) {
@@ -977,7 +964,7 @@ function onCellClick(cellId: CellId): void {
   // With friendly fire enabled B may also be a legal attack target, so mixing
   // "switch selection" and "attack target" in one click is ambiguous. The
   // player must first cancel on a non-target cell, then explicitly select B.
-  if (!localLegalActionCellIds.value.includes(cellId)) {
+  if (!legalActionCellIds.value.includes(cellId)) {
     clearSelection();
     return;
   }
@@ -995,7 +982,12 @@ function onCellClick(cellId: CellId): void {
       type: "move-unit", commandId: createCommandId(), actorId: active.id,
       expectedSequence: game.value.sequence, unitId: actingUnitId, destinationId: cellId
     };
-  if (submitRemoteCommand(command)) return;
+  if (submitRemoteCommand(command, {
+    kind: "action",
+    sourceCellId,
+    targetCellId: cellId,
+    includeSourceClick
+  })) return;
   const result = applyCommand(game.value, command, installedTerrainCatalog, coreUnitCatalog, coreMatchConditionCatalog);
   if (!applyResult(result) || !result.accepted) return;
   recordAction(sourceCellId, cellId, result.outcome?.continuation?.cellId, includeSourceClick);
@@ -1023,10 +1015,7 @@ function selectOwnUnit(unitId: UnitId | null): void {
     notice.value = "该单位当前没有合法行动格；请在加点回合为通电兵投入点数。";
     return;
   }
-  selectedUnitId.value = unit.id;
-  selectedSourceCellId.value = unit.cellId;
-  selectedByUser.value = true;
-  publishBoardSelection(unit.id);
+  boardInteraction.select(unit.id);
   notice.value = poweredUnitIds.value.includes(unit.id)
     ? "通电兵已选中：移动时会在原格留下 1 点。"
     : "游兵已选中：行动后点数减 1；原本只有 1 点时，本回合将失去行动力。";
@@ -1069,6 +1058,10 @@ function isReinforcementTarget(cellId: CellId): boolean {
 
 function allocateHeldPoints(): void {
   const hold = reinforcementHold;
+  if (pendingCommand.isPending.value) {
+    clearReinforcementHold();
+    return;
+  }
   const player = currentPlayer.value;
   if (!hold || !player || !isReinforcementPhase.value || !isReinforcementTarget(hold.cellId)) return;
 
@@ -1077,6 +1070,14 @@ function allocateHeldPoints(): void {
   const shouldHaveSpent = Math.ceil(hold.initialPoints * (elapsed / 3_000) ** 3);
   const spent = hold.initialPoints - player.reinforcementPoints;
   const added = allocatePointsAt(hold.cellId, Math.max(1, shouldHaveSpent - spent), true);
+
+  // Remote clients can submit only one reinforcement command at a time.
+  // Stop the hold loop until the host confirms it, rather than queuing stale
+  // commands against the same expected sequence.
+  if (pendingCommand.isPending.value) {
+    clearReinforcementHold();
+    return;
+  }
 
   if (!isReinforcementPhase.value) {
     clearReinforcementHold();
@@ -1101,21 +1102,23 @@ function allocatePointsAt(cellId: CellId, requested: number, quiet = false): num
   if (!active || !unit) return 0;
 
   let completed = 0;
+  let submittedRemotely = false;
   for (let index = 0; index < requested; index += 1) {
     const command: GameCommand = {
       type: "reinforce-unit", commandId: createCommandId(), actorId: active.id,
       expectedSequence: game.value.sequence, unitId: unit.id
     };
-    if (submitRemoteCommand(command)) {
+    if (submitRemoteCommand(command, { kind: "reinforcement", cellId })) {
       completed += 1;
+      submittedRemotely = true;
       break;
     }
     const result = applyCommand(game.value, command, installedTerrainCatalog, coreUnitCatalog, coreMatchConditionCatalog);
     if (!applyResult(result, quiet) || !result.accepted) break;
     completed += 1;
   }
-  if (completed > 0) recordReinforcement(cellId, completed);
-  if (completed > 0 && !quiet) {
+  if (completed > 0 && !submittedRemotely) recordReinforcement(cellId, completed);
+  if (completed > 0 && !quiet && !submittedRemotely) {
     notice.value = isActionPhase.value
       ? `点数已用完，自动轮到 ${currentPlayer.value?.displayName ?? "下一位玩家"} 行动。`
       : `已向该单位投入 ${completed} 点。`;
@@ -1131,7 +1134,7 @@ function endActionPhase(): void {
     type: "end-action-phase", commandId: createCommandId(), actorId: active.id,
     expectedSequence: game.value.sequence
   };
-  if (submitRemoteCommand(command)) return;
+  if (submitRemoteCommand(command, { kind: "phase", phase: "action" })) return;
   const result = applyCommand(game.value, command, installedTerrainCatalog, coreUnitCatalog, coreMatchConditionCatalog);
   if (applyResult(result) && result.accepted) {
     recordSpecial("action");
@@ -1148,7 +1151,7 @@ function endReinforcementPhase(): void {
     type: "end-reinforcement-phase", commandId: createCommandId(), actorId: active.id,
     expectedSequence: game.value.sequence
   };
-  if (submitRemoteCommand(command)) return;
+  if (submitRemoteCommand(command, { kind: "phase", phase: "reinforcement" })) return;
   const result = applyCommand(game.value, command, installedTerrainCatalog, coreUnitCatalog, coreMatchConditionCatalog);
   if (applyResult(result) && result.accepted) {
     recordSpecial("reinforcement");
@@ -1167,7 +1170,7 @@ function resetMatch(): void {
     return;
   }
   clearReinforcementHold();
-  pendingRemoteAction = undefined;
+  pendingCommand.clear();
   const activePlayerIds = lobbyState.value.members
     .filter((member) => member.participating && member.seat !== null)
     .map((member) => `player-${member.seat}` as PlayerId);
@@ -1204,25 +1207,17 @@ async function copyNotation(): Promise<void> {
 
 function continueActionAt(unitId: UnitId | null): void {
   if (!isActionPhase.value) {
-    clearSelectionSilently();
+    boardInteraction.clear();
     return;
   }
-  if (!unitId || getLegalActionDestinationIds(game.value, unitId, installedTerrainCatalog, coreUnitCatalog).length === 0) {
-    clearSelectionSilently();
+  if (!boardInteraction.continueAt(unitId)) {
     return;
   }
-  selectedUnitId.value = unitId;
-  selectedSourceCellId.value = game.value.units[unitId]?.cellId ?? null;
-  selectedByUser.value = false;
-  publishBoardSelection(unitId);
   notice.value = "行动完成；该单位仍可行动，已自动继续选中。";
 }
 
 function clearSelectionSilently(): void {
-  selectedUnitId.value = null;
-  selectedSourceCellId.value = null;
-  selectedByUser.value = false;
-  publishBoardSelection(null);
+  boardInteraction.clear();
 }
 
 /** Selections are intentionally deferred until a move or attack succeeds. */
@@ -1261,7 +1256,7 @@ function applyResult(result: CommandResult, quiet = false, resolvedCommandId?: s
     if (!quiet) notice.value = result.error.message;
     return false;
   }
-  if (pendingRemoteAction) {
+  if (pendingCommand.isPending.value) {
     notice.value = "上一行动正在同步，请稍候。";
     return false;
   }
@@ -1495,7 +1490,7 @@ onBeforeUnmount(() => {
       <section class="board-wrap">
         <HexBoard
           :state="game"
-          :selected-unit-id="boardPreviewUnitId"
+          :selected-unit-id="selectedUnitId"
           :legal-action-cell-ids="legalActionCellIds"
           :counterattack-cell-ids="counterattackCellIds"
           :no-counterattack-cell-ids="noCounterattackCellIds"
@@ -1514,6 +1509,7 @@ onBeforeUnmount(() => {
         <div class="selected-info">
           <template v-if="isMatchFinished"><small>结算完成</small><strong>{{ matchResultTitle }}</strong><span>{{ matchResultMessage }}</span></template>
           <template v-else-if="isSpectator"><small>观战模式</small><strong>棋盘操作已锁定</strong><span>观战者会实时收到房主同步的棋盘，但不能提交移动、攻击或加点。</span></template>
+          <template v-else-if="isRemoteActionPending"><small>操作已提交</small><strong>等待房主确认</strong><span>棋盘仍显示最后一次确认状态；确认前不能继续操作。</span></template>
           <template v-else-if="isReinforcementPhase"><small>加点回合</small><strong>剩余 {{ currentPlayer?.reinforcementPoints ?? 0 }} 点</strong><span>点击通电兵加 1 点；长按会逐渐加速，最多 3 秒投入全部点数。</span></template>
           <template v-else-if="selectedUnit"><small>已选单位</small><strong>{{ selectedIsPowered ? "通电兵" : "游兵" }} · {{ selectedUnit.strength }} 点</strong><span>点击青色描边的相邻格移动或攻击。</span></template>
           <template v-else><small>尚未选择单位</small><span>点击带扩散光圈的当前可行动单位。</span></template>

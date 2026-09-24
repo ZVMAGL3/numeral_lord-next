@@ -3,12 +3,14 @@ import {
   DEFAULT_MAP_CODE,
   DEFAULT_MAP_DEFINITION,
   coreTerrainCatalog,
+  coreUnitCatalog,
   createMatchFromMapCode,
   legacyDemoMap,
   parseMapCode,
   serializeMapCode
 } from "@numeral-lord/core-content";
-import type { CellId, PlayerId } from "@numeral-lord/game-core";
+import { applyCommand, canCounterattack } from "@numeral-lord/game-core";
+import type { CellId, PlayerId, UnitId } from "@numeral-lord/game-core";
 import { oilFieldMod, oilFieldTerrainCatalog } from "@numeral-lord/oil-field-mod";
 
 const installedMapCatalogs = {
@@ -110,6 +112,43 @@ describe("shared map code", () => {
       soldiers: [[7, 1, 1]]
     }, installedMapCatalogs)).toThrow(/不可驻兵/);
     expect(() => parseMapCode(DEFAULT_MAP_CODE, { terrains: coreTerrainCatalog })).toThrow(/未知的地形或 Mod/);
+  });
+
+  it("loads neutral blockers without reactions and wild units with terrain-bound reactions", () => {
+    const map = {
+      ...DEFAULT_MAP_DEFINITION,
+      terrain: "M".repeat(81),
+      terrainLegend: { M: "core/plain" },
+      requiredTerrainModIds: [],
+      soldiers: [[0, 1, 3], [80, 2, 2]] as const,
+      specialUnits: [[1, "blocker", 4], [9, "wild", 2]] as const,
+      matchConditionIds: []
+    };
+    const code = serializeMapCode(map, { terrains: coreTerrainCatalog });
+    const parsed = parseMapCode(code, { terrains: coreTerrainCatalog });
+    expect(parsed.specialUnits).toEqual(map.specialUnits);
+    const state = createMatchFromMapCode(code, { terrains: coreTerrainCatalog });
+    expect(state.units["blocker-cell-1" as UnitId]).toMatchObject({ definitionId: "core/blocker", strength: 4 });
+    expect(state.units["wild-cell-9" as UnitId]).toMatchObject({ definitionId: "core/wild", strength: 2 });
+    expect(canCounterattack(state, "blocker-cell-1" as UnitId, coreTerrainCatalog, coreUnitCatalog)).toBe(false);
+    expect(canCounterattack(state, "wild-cell-9" as UnitId, coreTerrainCatalog, coreUnitCatalog)).toBe(true);
+    const attack = applyCommand(state, {
+      type: "attack-unit", commandId: "attack-neutral-blocker", actorId: "player-1" as PlayerId,
+      expectedSequence: state.sequence, unitId: "seat-1-cell-0" as UnitId, targetId: "1,0" as CellId
+    }, coreTerrainCatalog, coreUnitCatalog);
+    expect(attack.accepted).toBe(true);
+    if (attack.accepted) {
+      expect(attack.state.units["seat-1-cell-0" as UnitId]?.cellId).toBe("0,0");
+      expect(attack.state.units["blocker-cell-1" as UnitId]?.strength).toBe(1);
+      expect(attack.events.some((event) => event.type === "unit-exhausted")).toBe(true);
+      expect(attack.events.some((event) => event.type === "unit-counterattacked")).toBe(false);
+    }
+    expect(serializeMapCode(parsed, { terrains: coreTerrainCatalog })).toBe(code);
+  });
+
+  it("rejects neutral units on blocked terrain and overlapping player units", () => {
+    expect(() => serializeMapCode({ ...DEFAULT_MAP_DEFINITION, specialUnits: [[7, "wild", 1]] }, installedMapCatalogs)).toThrow(/不可驻兵/);
+    expect(() => serializeMapCode({ ...DEFAULT_MAP_DEFINITION, soldiers: [[10, 1, 1]], specialUnits: [[10, "blocker", 1]] }, installedMapCatalogs)).toThrow(/两个单位/);
   });
 
   it("upgrades the old row-major map object", () => {

@@ -29,6 +29,12 @@ let observer: ResizeObserver | undefined;
 let pulseTick: (() => void) | undefined;
 let actionPulses: ActionPulse[] = [];
 let interactionLayers: { legal: Container; counterattack: Container; selection: Container } | undefined;
+const pointers = new Map<number, { x: number; y: number }>();
+let cameraZoom = 1;
+let cameraPan = { x: 0, y: 0 };
+let dragOrigin: { x: number; y: number; panX: number; panY: number } | undefined;
+let pinchOrigin: { distance: number; zoom: number; x: number; y: number; panX: number; panY: number } | undefined;
+let cameraMovedAt = 0;
 const cellLayouts = new Map<CellId, { x: number; y: number; radius: number }>();
 const powered = computed(() => new Set(props.poweredUnitIds));
 const actionableUnits = computed(() => new Set(props.actionableUnitIds));
@@ -75,7 +81,14 @@ onMounted(async () => {
   instance.stage.sortableChildren = true;
   instance.stage.eventMode = props.preview ? "none" : "static";
   instance.stage.hitArea = instance.screen;
-  if (!props.preview) instance.stage.on("pointertap", onBoardBackgroundTap);
+  if (!props.preview) {
+    instance.stage.on("pointertap", onBoardBackgroundTap);
+    instance.stage.on("pointerdown", onCameraPointerDown);
+    instance.stage.on("pointermove", onCameraPointerMove);
+    instance.stage.on("pointerup", onCameraPointerUp);
+    instance.stage.on("pointerupoutside", onCameraPointerUp);
+    instance.stage.on("pointercancel", onCameraPointerUp);
+  }
   host.appendChild(instance.canvas);
   // Keep the resolved Texture objects: repeated redraws must not ask Pixi to
   // resolve the same URL again (which also avoids noisy cache-miss warnings).
@@ -110,6 +123,12 @@ onBeforeUnmount(() => {
   if (pulseTick) instance.ticker.remove(pulseTick);
   pulseTick = undefined;
   instance.stage.off("pointertap", onBoardBackgroundTap);
+  instance.stage.off("pointerdown", onCameraPointerDown);
+  instance.stage.off("pointermove", onCameraPointerMove);
+  instance.stage.off("pointerup", onCameraPointerUp);
+  instance.stage.off("pointerupoutside", onCameraPointerUp);
+  instance.stage.off("pointercancel", onCameraPointerUp);
+  pointers.clear();
   actionPulses = [];
   interactionLayers = undefined;
   cellLayouts.clear();
@@ -164,6 +183,7 @@ function draw(): void {
     drawTerrainLayer(cell.terrainId, x, y, radius);
     const unit = cell.unitId ? props.state.units[cell.unitId] : undefined;
     const player = unit ? props.state.players[unit.ownerId] : undefined;
+    const neutralColor = unit?.definitionId === "core/wild" ? 0xc28a4c : 0x8491a4;
 
     // This transparent hit layer stays below the unit / stronghold layers;
     // interactions remain on the hex while the visual layers are noninteractive.
@@ -185,11 +205,11 @@ function draw(): void {
 
     // Unit layer: a powered formation fills its cell. A roaming unit uses the
     // same old-system tile texture at 58%, making it readable at a glance.
-    if (unit && player) {
+    if (unit) {
       // Powered units occupy the terrain layer's footprint without spilling
       // over its hex edge; roaming units remain deliberately smaller.
       const unitScale = isPowered ? 0.96 : 0.58;
-      addHexFill(x, y, radius * unitScale * 0.98, colorNumber(player.color), isExhausted ? 0.62 : 0.96);
+      addHexFill(x, y, radius * unitScale * 0.98, player ? colorNumber(player.color) : neutralColor, isExhausted ? 0.62 : 0.96);
       addLegacySprite(legacyTextureUrls.plain, x, y, radius, unitScale, 0xffffff, isExhausted ? 0.16 : 0.24);
     }
 
@@ -218,16 +238,16 @@ function draw(): void {
       app.stage.addChild(pulse);
     }
 
-    if (unit && player) {
-      const canAct = actionableUnits.value.has(unit.id);
+    if (unit) {
+      const canAct = player ? actionableUnits.value.has(unit.id) : false;
       const strength = new Text({
-        text: String(unit.strength),
+        text: player ? String(unit.strength) : `${unit.definitionId === "core/wild" ? "野" : "挡"}${unit.strength}`,
         style: {
           // Preserve the old game's `aliceblue` active treatment, but keep
           // inactive units in a dim white rather than a muddy mid-grey.
           fill: canAct ? 0xffffff : 0xdce5ef,
           fontFamily: "Arial",
-          fontSize: Math.round(radius * (isPowered ? 0.6 : 0.44)),
+          fontSize: Math.round(radius * (isPowered ? 0.6 : player ? 0.44 : 0.28)),
           fontWeight: "900",
         }
       });
@@ -249,6 +269,7 @@ function draw(): void {
     app.stage.addChild(layer);
   }
   interactionLayers = { legal, counterattack, selection };
+  applyCamera(width, height);
   drawInteractionOverlay();
   updateActionPulses(performance.now());
 }
@@ -298,7 +319,66 @@ function drawInteractionOverlay(): void {
 
 /** Pixi's stage receives taps outside every hex hit layer. */
 function onBoardBackgroundTap(event: { readonly target: unknown }): void {
+  if (performance.now() - cameraMovedAt < 250) return;
   if (event.target === app?.stage) emit("backgroundClick");
+}
+
+function onBoardWheel(event: WheelEvent): void {
+  if (props.preview) return;
+  cameraZoom = Math.max(0.55, Math.min(3.2, cameraZoom * (event.deltaY < 0 ? 1.12 : 0.89)));
+  cameraMovedAt = performance.now();
+  applyCamera();
+}
+
+function applyCamera(width?: number, height?: number): void {
+  if (!app || props.preview) return;
+  const { width: hostWidth, height: hostHeight } = canvasHost.value?.getBoundingClientRect() ?? { width: 0, height: 0 };
+  const w = width ?? hostWidth, h = height ?? hostHeight;
+  app.stage.scale.set(cameraZoom);
+  app.stage.position.set((1 - cameraZoom) * w / 2 + cameraPan.x, (1 - cameraZoom) * h / 2 + cameraPan.y);
+}
+
+function onCameraPointerDown(event: { pointerId: number; global: { x: number; y: number } }): void {
+  pointers.set(event.pointerId, { x: event.global.x, y: event.global.y });
+  if (pointers.size === 1) dragOrigin = { x: event.global.x, y: event.global.y, panX: cameraPan.x, panY: cameraPan.y };
+  else if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()];
+    if (a && b) pinchOrigin = { distance: Math.hypot(a.x - b.x, a.y - b.y), zoom: cameraZoom,
+      x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, panX: cameraPan.x, panY: cameraPan.y };
+    dragOrigin = undefined;
+  }
+}
+
+function onCameraPointerMove(event: { pointerId: number; global: { x: number; y: number } }): void {
+  if (!pointers.has(event.pointerId)) return;
+  pointers.set(event.pointerId, { x: event.global.x, y: event.global.y });
+  const values = [...pointers.values()];
+  if (values.length >= 2 && pinchOrigin) {
+    const a = values[0]!, b = values[1]!;
+    const distance = Math.hypot(a.x - b.x, a.y - b.y);
+    const zoom = pinchOrigin.distance > 0 ? Math.max(0.55, Math.min(3.2, pinchOrigin.zoom * distance / pinchOrigin.distance)) : cameraZoom;
+    const centerX = (a.x + b.x) / 2, centerY = (a.y + b.y) / 2;
+    cameraZoom = zoom;
+    cameraPan = { x: pinchOrigin.panX + centerX - pinchOrigin.x, y: pinchOrigin.panY + centerY - pinchOrigin.y };
+    cameraMovedAt = performance.now();
+    applyCamera();
+  } else if (values.length === 1 && dragOrigin) {
+    const pointer = values[0]!;
+    const dx = pointer.x - dragOrigin.x, dy = pointer.y - dragOrigin.y;
+    if (Math.abs(dx) + Math.abs(dy) > 4) cameraMovedAt = performance.now();
+    cameraPan = { x: dragOrigin.panX + dx, y: dragOrigin.panY + dy };
+    applyCamera();
+  }
+}
+
+function onCameraPointerUp(event: { pointerId: number }): void {
+  pointers.delete(event.pointerId);
+  if (pointers.size < 2) pinchOrigin = undefined;
+  if (pointers.size === 1) {
+    const entry = [...pointers.entries()][0];
+    const point = entry?.[1];
+    if (point) dragOrigin = { x: point.x, y: point.y, panX: cameraPan.x, panY: cameraPan.y };
+  } else if (!pointers.size) dragOrigin = undefined;
 }
 
 /** Draw terrain as a filled legacy sprite, with optional terrain detail above it. */
@@ -384,7 +464,7 @@ function updateActionPulses(now: number): void {
 function bindCellInteraction(graphic: Graphics, cellId: CellId): void {
   graphic.eventMode = "static";
   graphic.cursor = "pointer";
-  graphic.on("pointertap", () => emit("cellClick", cellId));
+  graphic.on("pointertap", () => { if (performance.now() - cameraMovedAt >= 250) emit("cellClick", cellId); });
   graphic.on("pointerdown", () => emit("cellPressStart", cellId));
   graphic.on("pointerup", () => emit("cellPressEnd", cellId));
   graphic.on("pointerupoutside", () => emit("cellPressEnd", cellId));
@@ -401,10 +481,12 @@ function hexagon(centerX: number, centerY: number, radius: number): number[] {
 }
 </script>
 
-<template><div ref="canvasHost" class="board-canvas" :class="{ preview }" :aria-label="preview ? '当前地图预览' : '本地战棋演示地图'" /></template>
+<template><div ref="canvasHost" class="board-canvas" :class="{ preview }" :aria-label="preview ? '当前地图预览' : '本地战棋演示地图'" @wheel.prevent="onBoardWheel"><span v-if="!preview" class="board-gesture-hint">拖动平移 · 滚轮 / 双指缩放</span></div></template>
 
 <style scoped>
-.board-canvas { width: 100%; height: 100%; min-height: 390px; overflow: hidden; border: 1px solid rgba(160, 191, 223, .42); border-radius: 20px; background: #182638; }
+.board-canvas { position:relative; width: 100%; height: 100%; min-height: 390px; overflow: hidden; border: 1px solid rgba(160, 191, 223, .42); border-radius: 20px; background: #182638; touch-action: none; cursor: grab; }
 .board-canvas.preview { min-height: 0; border-radius: 12px; pointer-events: none; }
+.board-gesture-hint { position:absolute; z-index:1; top:8px; left:50%; transform:translateX(-50%); padding:4px 8px; border:1px solid rgba(147,177,207,.16); border-radius:999px; color:rgba(178,200,219,.58); background:rgba(11,20,32,.35); font-size:9px; pointer-events:none; white-space:nowrap; }
+.board-canvas.preview .board-gesture-hint { display:none; }
 .board-canvas :deep(canvas) { display: block; width: 100%; height: 100%; }
 </style>

@@ -10,6 +10,7 @@ const attack: CapabilityBinding = { id: "core/attack", config: { movesIntoTarget
 const attackRange: CapabilityBinding = { id: "core/attack-range", config: { min: 1, max: 1 } };
 const counterattack: CapabilityBinding = { id: "core/counterattack" };
 const counterattackLimit: CapabilityBinding = { id: "core/counterattack-limit", config: { maxPerActionPhase: 1 } };
+const terrainBoundCounterattack: CapabilityBinding = { id: "core/terrain-bound-counterattack" };
 /** Action result loses one point, but never falls below one; a one-point action exhausts the unit. */
 const actionStrengthDecay: CapabilityBinding = {
   id: "core/action-strength-decay",
@@ -31,6 +32,7 @@ export const coreUnitMod = defineMod({
     { id: "core/attack-range", target: "unit", defaultConfig: { min: 1, max: 1 } },
     { id: "core/counterattack", target: "unit", defaultConfig: {} },
     { id: "core/counterattack-limit", target: "unit", defaultConfig: { maxPerActionPhase: 1 } },
+    { id: "core/terrain-bound-counterattack", target: "unit", defaultConfig: {} },
     {
       id: "core/action-strength-decay",
       target: "unit",
@@ -55,6 +57,14 @@ export const coreUnitMod = defineMod({
       poweredIncome,
       exhaustAfterAttack
     ]
+  }, {
+    id: "core/wild",
+    displayName: "野怪",
+    capabilities: [counterattack, counterattackLimit, terrainBoundCounterattack]
+  }, {
+    id: "core/blocker",
+    displayName: "阻挡",
+    capabilities: []
   }],
   commandRules: [],
   victoryConditions: []

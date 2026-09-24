@@ -21,6 +21,8 @@ import type { ModSettings } from "@numeral-lord/game-sdk";
 
 /** A soldier is [row-major cell index, one-based map seat, strength, optional unit id]. */
 export type MapSoldier = readonly [number, number, number, string?];
+/** A map-placed neutral defender: wild units react; blockers never do. */
+export type MapSpecialUnit = readonly [number, "wild" | "blocker", number];
 
 /** A directed, named relation between two row-major map cells. */
 export interface MapCellLink {
@@ -50,6 +52,8 @@ export interface MapDefinition {
   readonly cellLinks?: readonly MapCellLink[];
   readonly players: number;
   readonly soldiers: readonly MapSoldier[];
+  /** Optional neutral map pieces, stored as [cell index, kind, strength]. */
+  readonly specialUnits?: readonly MapSpecialUnit[];
   readonly teams: readonly number[];
   readonly matchConditionIds: readonly string[];
 }
@@ -242,6 +246,14 @@ export function createMatchFromMapDefinition(definition: MapDefinition, options:
     cells[cellId] = { ...cells[cellId]!, unitId };
   }
 
+  for (const [cellIndex, kind, strength] of map.specialUnits ?? []) {
+    const cellId = toCellId({ row: Math.floor(cellIndex / map.columns), column: cellIndex % map.columns });
+    const ownerId = (kind === "wild" ? "__neutral_wild__" : "__neutral_blocker__") as PlayerId;
+    const unitId = `${kind}-cell-${cellIndex}` as UnitId;
+    units[unitId] = { id: unitId, definitionId: `core/${kind}`, ownerId, cellId, strength };
+    cells[cellId] = { ...cells[cellId]!, unitId };
+  }
+
   const firstActive = Array.from({ length: map.players }, (_, index) => `player-${index + 1}` as PlayerId)
     .find((playerId) => active.has(playerId)) ?? ("player-1" as PlayerId);
   const initialState: GameState = {
@@ -356,6 +368,20 @@ function validateMapDefinition(input: unknown, catalogs: MapCatalogs): MapDefini
       ? [cellIndex as number, seat as number, strength as number]
       : [cellIndex as number, seat as number, strength as number, definitionId]);
   }
+  const specialUnits: MapSpecialUnit[] = [];
+  if (data.specialUnits !== undefined && !Array.isArray(data.specialUnits)) throw new Error("中立单位数据无效。");
+  for (const candidate of (data.specialUnits ?? []) as unknown[]) {
+    if (!Array.isArray(candidate) || candidate.length !== 3) throw new Error("中立单位格式应为 [格索引, wild|blocker, 点数]。");
+    const [cellIndex, kind, strength] = candidate as unknown[];
+    if (!Number.isInteger(cellIndex) || (cellIndex as number) < 0 || (cellIndex as number) >= data.terrain.length) throw new Error("中立单位格索引超出地图。");
+    if (kind !== "wild" && kind !== "blocker") throw new Error("中立单位类型只能是 wild 或 blocker。");
+    if (!Number.isInteger(strength) || (strength as number) < 1 || (strength as number) > 65535) throw new Error("中立单位点数无效。");
+    if (occupied.has(cellIndex as number)) throw new Error("同一个格子不能放置两个单位。");
+    const terrainId = terrainLegend[data.terrain[cellIndex as number]!]!;
+    if (terrainCatalog[terrainId] && !hasTerrainCapability(terrainCatalog[terrainId]!, "core/occupiable")) throw new Error("山地或虚无等不可驻兵地形不能放置单位。");
+    occupied.add(cellIndex as number);
+    specialUnits.push([cellIndex as number, kind, strength as number]);
+  }
   const teams = data.teams === undefined
     ? Array.from({ length: players }, (_, index) => index + 1)
     : data.teams;
@@ -385,6 +411,7 @@ function validateMapDefinition(input: unknown, catalogs: MapCatalogs): MapDefini
     ...(cellLinks.length ? { cellLinks } : {}),
     players,
     soldiers,
+    ...(specialUnits.length ? { specialUnits } : {}),
     teams: [...teams] as number[],
     matchConditionIds: [...matchConditionIds] as string[]
   };

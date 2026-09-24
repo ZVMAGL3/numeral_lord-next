@@ -79,6 +79,7 @@ function readConnectionLog(): string[] {
 const connectionLog = ref<string[]>(readConnectionLog());
 const connectionLogDialogOpen = ref(false);
 const connectionLogCopyMessage = ref("");
+const gameOptionsOpen = ref(false);
 const connectionLogText = computed(() => connectionLog.value.join("\n"));
 
 function logConnection(event: string, detail: Record<string, unknown> = {}): void {
@@ -153,7 +154,7 @@ const commandTimeline = createCommandTimeline();
 const isRepairing = ref(false);
 const playerName = ref(loadOrCreateLocalValue(PLAYER_NAME_STORAGE_KEY, randomPlayerName));
 const configuredMaps = ref(loadMapLibrary());
-const selectedMapLibraryId = ref(DEFAULT_MAP_DEFINITION.id);
+const selectedMapLibraryId = ref(configuredMaps.value[0]?.definition.id ?? "");
 const mapActionMessage = ref("");
 const mapActionError = ref(false);
 const mapLibraryRef = ref<InstanceType<typeof MapLibrary> | null>(null);
@@ -272,6 +273,7 @@ let reinforcementHold: ReinforcementHold | undefined;
 
 const players = computed(() => (Object.values(game.value.players) as PlayerState[])
   .sort((left, right) => left.seat - right.seat));
+const activePlayerCount = computed(() => players.value.length);
 const currentPlayer = computed(() => game.value.players[game.value.turn.currentPlayerId]);
 const isMatchFinished = computed(() => game.value.turn.phase === "finished");
 const winningTeamLabel = computed(() => {
@@ -485,7 +487,8 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string, r
     const options = {
       name: playerName.value,
       accountId: relayAccountKey,
-      installedModIds: installedTerrainMods.map((mod) => mod.id)
+      installedModIds: installedTerrainMods.map((mod) => mod.id),
+      ...(mode === "create" ? { mapCode: configuredMaps.value.find((map) => map.definition.id === selectedMapLibraryId.value)?.code } : {})
     };
     const room = mode === "join" && requestedRoomId
       ? await client.joinById(requestedRoomId, options)
@@ -861,7 +864,7 @@ function saveWorkshopMap(code: string): void {
   try {
     const next = addMapToLibrary(configuredMaps.value, code);
     configuredMaps.value = next;
-    selectedMapLibraryId.value = next.at(-1)?.definition.id ?? DEFAULT_MAP_DEFINITION.id;
+    selectedMapLibraryId.value = next.at(-1)?.definition.id ?? "";
     workshopActionError.value = false;
     workshopActionMessage.value = `「${next.at(-1)?.definition.name ?? "地图"}」已保存到我的地图配置。`;
   } catch (error) {
@@ -890,7 +893,7 @@ function addConfiguredMap(rawCode: string): void {
   try {
     const next = addMapToLibrary(configuredMaps.value, rawCode);
     configuredMaps.value = next;
-    selectedMapLibraryId.value = next.at(-1)?.definition.id ?? DEFAULT_MAP_DEFINITION.id;
+    selectedMapLibraryId.value = next.at(-1)?.definition.id ?? "";
     mapActionMessage.value = `「${next.at(-1)?.definition.name ?? "地图"}」已保存到本机。`;
     mapActionError.value = false;
     mapLibraryRef.value?.clearCodeDraft();
@@ -916,7 +919,7 @@ function saveConfiguredMap(definition: import("@numeral-lord/core-content").MapD
 function removeConfiguredMap(id: string): void {
   const removed = configuredMaps.value.find((map) => map.definition.id === id);
   configuredMaps.value = removeMapFromLibrary(configuredMaps.value, id);
-  selectedMapLibraryId.value = DEFAULT_MAP_DEFINITION.id;
+  selectedMapLibraryId.value = configuredMaps.value[0]?.definition.id ?? "";
   mapActionMessage.value = removed ? `「${removed.definition.name}」已从本机移除。` : "";
   mapActionError.value = false;
 }
@@ -975,6 +978,15 @@ async function leaveToHome(): Promise<void> {
 }
 
 function createRoom(): void {
+  const map = configuredMaps.value.find((entry) => entry.definition.id === selectedMapLibraryId.value) ?? configuredMaps.value[0];
+  if (!map) {
+    mapActionError.value = true;
+    mapActionMessage.value = "先导入或创建一张地图，再创建对战房间。";
+    void router.push("/maps");
+    return;
+  }
+  lobbyState.value = { ...lobbyState.value, mapCode: map.code, mapName: map.definition.name,
+    mapPlayerCount: map.definition.players, requiredTerrainModIds: map.definition.requiredTerrainModIds };
   void connectRelay("create");
 }
 
@@ -1443,11 +1455,16 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="app-shell">
-    <header class="topbar">
+  <main class="app-shell" :class="{ 'game-shell': showGame }">
+    <header class="topbar" :class="{ 'game-topbar': showGame }">
       <div class="brand-block">
         <button v-if="!showHome && !showMaps && !showWorkshop" class="topbar-back" @click="requestHome"><span aria-hidden="true">←</span> 返回主页</button>
-        <p class="eyebrow">NUMERAL LORD · EARLY ACCESS</p><h1>Numeral Lord</h1>
+        <template v-if="!showGame"><p class="eyebrow">NUMERAL LORD · EARLY ACCESS</p><h1>Numeral Lord</h1></template>
+      </div>
+      <div v-if="showGame" class="match-scoreboard" aria-label="对局状态">
+        <div><span>人数</span><strong>{{ activePlayerCount }}</strong></div>
+        <div><span>回合</span><strong>{{ game.turn.round }}</strong></div>
+        <div class="scoreboard-current" :style="{ '--player-color': currentPlayer?.color }"><span>{{ currentPlayer?.displayName }} · {{ phaseLabel }}</span><strong>{{ currentPlayer?.reinforcementPoints ?? 0 }} <small>点</small></strong><em>步 {{ stepClockLabel }} · 局 {{ matchClockLabel }}</em></div>
       </div>
       <div class="topbar-meta">
         <div v-if="showHome" class="turn-pill"><span class="turn-dot" />选择入口，开启对局</div>
@@ -1457,9 +1474,17 @@ onBeforeUnmount(() => {
         <div v-else-if="relayStatus === '连接中…'" class="turn-pill"><span class="turn-dot" />正在连接 PvP 房间…</div>
         <div v-else-if="showLobby" class="turn-pill"><span class="turn-dot" />准备房间 · 地图 {{ lobbyState.mapPlayerCount }} 个玩家位</div>
         <div v-else-if="showGameLoading" class="turn-pill"><span class="turn-dot" />正在同步对局棋盘…</div>
-        <div v-else class="turn-pill" :style="{ '--player-color': currentPlayer?.color }"><span class="turn-dot" />第 {{ game.turn.round }} 回合 · {{ currentPlayer?.displayName }} · {{ phaseLabel }} · 步 {{ stepClockLabel }} · 局 {{ matchClockLabel }}</div>
-        <div v-if="!showHome && !showMaps && !showWorkshop" class="network-pill" :class="{ connected: relayStatus === '已连接' }">PvP {{ relayStatus }}<span v-if="relayRoomId"> · 房间 {{ relayRoomId }}</span><span v-if="relayIsHost"> · 房主</span><span v-else-if="isSpectator"> · 观战</span><span v-else-if="relayPlayerId"> · {{ relayPlayerId }}</span></div>
-        <button v-if="!showHome && !showMaps && !showWorkshop" class="connection-log-trigger" type="button" @click="connectionLogCopyMessage = ''; connectionLogDialogOpen = true">连接日志</button>
+        <div v-if="!showHome && !showMaps && !showWorkshop && !showGame" class="network-pill" :class="{ connected: relayStatus === '已连接' }">PvP {{ relayStatus }}<span v-if="relayRoomId"> · 房间 {{ relayRoomId }}</span><span v-if="relayIsHost"> · 房主</span><span v-else-if="isSpectator"> · 观战</span><span v-else-if="relayPlayerId"> · {{ relayPlayerId }}</span></div>
+        <button v-if="!showHome && !showMaps && !showWorkshop && !showGame" class="connection-log-trigger" type="button" @click="connectionLogCopyMessage = ''; connectionLogDialogOpen = true">连接日志</button>
+        <div v-if="showGame" class="game-options" @click.stop>
+          <button class="game-options-trigger" type="button" aria-label="对局选项" :aria-expanded="gameOptionsOpen" @click="gameOptionsOpen = !gameOptionsOpen">⚙</button>
+          <div v-if="gameOptionsOpen" class="game-options-menu" role="menu">
+            <div class="game-options-status" :class="{ connected: relayStatus === '已连接' }"><span class="turn-dot" />PvP {{ relayStatus }}<small v-if="relayRoomId">房间 {{ relayRoomId }}<template v-if="relayIsHost"> · 房主</template><template v-else-if="isSpectator"> · 观战</template><template v-else-if="relayPlayerId"> · {{ relayPlayerId }}</template></small></div>
+            <button type="button" role="menuitem" @click="connectionLogCopyMessage = ''; connectionLogDialogOpen = true; gameOptionsOpen = false">连接日志</button>
+            <button type="button" role="menuitem" @click="openNotationDialog(); gameOptionsOpen = false">查看 / 复制本地棋谱</button>
+            <button v-if="relayStatus !== '已连接' || relayIsHost" type="button" role="menuitem" @click="resetMatch(); gameOptionsOpen = false">{{ relayRoomId ? '返回准备房间' : '重置演示对局' }}</button>
+          </div>
+        </div>
       </div>
     </header>
 
@@ -1596,8 +1621,6 @@ onBeforeUnmount(() => {
         </div>
         <button v-if="isActionPhase" class="secondary" :disabled="!canActCurrentPlayer" @click="endActionPhase">结束行动，进入加点</button>
         <button v-else-if="isReinforcementPhase" class="primary" :disabled="!canActCurrentPlayer" @click="endReinforcementPhase">结束加点，轮到下一位</button>
-        <button v-if="relayStatus !== '已连接' || relayIsHost" class="ghost" @click="resetMatch">{{ relayRoomId ? '返回准备房间' : '重置演示对局' }}</button>
-        <button class="ghost notation-trigger" @click="openNotationDialog">查看 / 复制本地棋谱</button>
       </aside>
     </section>
     <footer>Numeral Lord · 多人战棋测试版</footer>

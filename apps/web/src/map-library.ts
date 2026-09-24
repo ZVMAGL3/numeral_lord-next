@@ -1,6 +1,4 @@
 import {
-  DEFAULT_MAP_CODE,
-  DEFAULT_MAP_DEFINITION,
   parseMapCode,
   serializeMapCode,
   type MapDefinition
@@ -24,12 +22,6 @@ export function missingTerrainMods(map: ConfiguredMap): string[] {
 
 const libraryCatalogs = { ...installedMapCatalogs, allowUnknownTerrainMods: true };
 
-const defaultMap: ConfiguredMap = {
-  code: DEFAULT_MAP_CODE,
-  definition: DEFAULT_MAP_DEFINITION,
-  isDefault: true
-};
-
 /** Local-only map library. Room selection sends a complete code to every client. */
 export function loadMapLibrary(): ConfiguredMap[] {
   let saved: unknown;
@@ -38,8 +30,8 @@ export function loadMapLibrary(): ConfiguredMap[] {
   } catch {
     saved = [];
   }
-  const maps = [defaultMap];
-  const seen = new Set([defaultMap.definition.id]);
+  const maps: ConfiguredMap[] = [];
+  const seen = new Set<string>();
   if (!Array.isArray(saved)) return maps;
   for (const value of saved.slice(0, MAX_CUSTOM_MAPS)) {
     if (typeof value !== "string") continue;
@@ -61,7 +53,7 @@ export function addMapToLibrary(current: readonly ConfiguredMap[], rawCode: stri
   if (current.some((map) => map.definition.id === definition.id)) {
     throw new Error(`地图「${definition.name}」已经在地图库中。`);
   }
-  if (current.length - 1 >= MAX_CUSTOM_MAPS) throw new Error("本机最多可保存 32 张自定义地图。");
+  if (current.length >= MAX_CUSTOM_MAPS) throw new Error("本机最多可保存 32 张自定义地图。");
   const next = [...current, { code: serializeMapCode(definition, libraryCatalogs), definition, isDefault: false }];
   persistCustomMaps(next);
   return next;
@@ -71,9 +63,8 @@ export function saveMapToLibrary(current: readonly ConfiguredMap[], rawCode: str
   if (rawCode.length > 128_000) throw new Error("地图数据过长。");
   const definition = parseMapCode(rawCode, libraryCatalogs);
   const existing = current.find((map) => map.definition.id === definition.id);
-  if (existing?.isDefault) throw new Error("不能覆盖内置默认地图；请先创建副本。");
   const exists = existing !== undefined;
-  if (!exists && current.length - 1 >= MAX_CUSTOM_MAPS) throw new Error("本机最多可保存 32 张自定义地图。");
+  if (!exists && current.length >= MAX_CUSTOM_MAPS) throw new Error("本机最多可保存 32 张自定义地图。");
   const entry: ConfiguredMap = { code: serializeMapCode(definition, libraryCatalogs), definition, isDefault: false };
   const next = exists
     ? current.map((map) => map.definition.id === definition.id ? entry : map)
@@ -83,7 +74,7 @@ export function saveMapToLibrary(current: readonly ConfiguredMap[], rawCode: str
 }
 
 export function removeMapFromLibrary(current: readonly ConfiguredMap[], id: string): ConfiguredMap[] {
-  const next = current.filter((map) => map.isDefault || map.definition.id !== id);
+  const next = current.filter((map) => map.definition.id !== id);
   persistCustomMaps(next);
   return next;
 }

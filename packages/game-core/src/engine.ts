@@ -123,6 +123,7 @@ const UNIT_CAPABILITY = {
   attackRange: "core/attack-range",
   counterattack: "core/counterattack",
   counterattackLimit: "core/counterattack-limit",
+  terrainBoundCounterattack: "core/terrain-bound-counterattack",
   actionStrengthDecay: "core/action-strength-decay",
   poweredActionThreshold: "core/powered-action-threshold",
   poweredIncome: "core/powered-income",
@@ -826,6 +827,8 @@ export function canCounterattack(
   if (!cell) return false;
   const terrain = terrains[cell.terrainId];
   if (!terrain) return false;
+  if (hasUnitCapability(definition, UNIT_CAPABILITY.terrainBoundCounterattack)
+    && !getTerrainCapability(terrain, CAPABILITY.counterattackTerrainLimit)) return false;
   const used = state.turn.counterattacksUsed[cell.id] ?? 0;
   return used < getCounterattackLimit(terrain, definition);
 }
@@ -1432,7 +1435,11 @@ function requireTerrain(catalog: TerrainCatalog, terrainId: string): TerrainSpec
 }
 
 function areSameTeam(state: GameState, left: PlayerId, right: PlayerId): boolean {
-  return state.players[left]?.teamId === state.players[right]?.teamId;
+  const leftTeam = state.players[left]?.teamId;
+  const rightTeam = state.players[right]?.teamId;
+  // Neutral map pieces deliberately have reserved owner ids absent from the
+  // player roster. Two missing lookups must not make them appear allied.
+  return leftTeam !== undefined && rightTeam !== undefined && leftTeam === rightTeam;
 }
 
 function getConfiguredMax(

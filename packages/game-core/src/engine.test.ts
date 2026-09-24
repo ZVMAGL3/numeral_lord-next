@@ -491,6 +491,43 @@ describe("core turn rules", () => {
     expect(result.events.some((event) => event.type === "unit-counterattacked")).toBe(false);
   });
 
+  it("matches legacy failed-defense combat: defender loses strength, counters once, and kills attacker", () => {
+    const state = fixture();
+    const attackerId = id("p1-scout");
+    const defenderId = id("p2-home");
+    const targetCell = toCellId({ column: 2, row: 1 });
+    const defenderHome = toCellId({ column: 3, row: 1 });
+    const { unitId: ignoredTarget, ...emptyTarget } = state.cells[targetCell]!;
+    const { unitId: ignoredOldHome, ...emptyHome } = state.cells[defenderHome]!;
+    void ignoredTarget;
+    void ignoredOldHome;
+    const battleState: GameState = {
+      ...state,
+      cells: {
+        ...state.cells,
+        [targetCell]: { ...emptyTarget, terrainId: "plain", unitId: defenderId },
+        [defenderHome]: emptyHome
+      },
+      units: {
+        ...state.units,
+        [attackerId]: { ...state.units[attackerId]!, strength: 3 },
+        [defenderId]: { ...state.units[defenderId]!, cellId: targetCell, strength: 3 }
+      }
+    };
+    expect(getPoweredUnitIds(battleState, terrains).has(attackerId)).toBe(true);
+    const result = applyCommand(battleState, {
+      type: "attack-unit", commandId: "legacy-defense-break", actorId: p1, expectedSequence: 0,
+      unitId: attackerId, targetId: targetCell
+    }, terrains, unitCatalog);
+    expect(result.accepted).toBe(true);
+    if (!result.accepted) return;
+    expect(result.state.units[attackerId]).toBeUndefined();
+    expect(result.state.units[defenderId]?.strength).toBe(1);
+    expect(result.state.turn.counterattacksUsed[defenderId]).toBe(1);
+    expect(canCounterattack(result.state, defenderId, terrains, unitCatalog)).toBe(false);
+    expect(result.events.map((event) => event.type)).toContain("unit-counterattacked");
+  });
+
   it("keeps enemy stronghold exhaustion ahead of power gained from a capture", () => {
     const state = fixture();
     const sourceCell = toCellId({ column: 1, row: 1 });
@@ -559,8 +596,8 @@ describe("core turn rules", () => {
     if (!result.accepted) return;
     expect(result.state.cells[targetCell]?.unitId).toBe(targetId);
     expect(result.state.units[id("p1-scout")]?.cellId).toBe(toCellId({ column: 1, row: 1 }));
-    expect(result.state.turn.exhaustedUnitIds).toEqual([]);
-    expect(result.events.some((event) => event.type === "unit-exhausted")).toBe(false);
+    expect(result.state.turn.exhaustedUnitIds).toContain(id("p1-scout"));
+    expect(result.events.some((event) => event.type === "unit-exhausted")).toBe(true);
   });
 
   it("does not exhaust a powered roamer after attacking", () => {
@@ -874,8 +911,7 @@ describe("core turn rules", () => {
     expect(result.accepted).toBe(true);
     if (!result.accepted) return;
     expect(result.state.units[id("p2-home")]?.strength).toBe(1);
-    expect(result.state.units[artilleryId]?.cellId).toBe(toCellId({ column: 1, row: 1 }));
-    expect(result.state.units[artilleryId]?.strength).toBe(1);
+    expect(result.state.units[artilleryId]).toBeUndefined();
     expect(result.state.turn.counterattacksUsed[id("p2-home")]).toBe(1);
     expect(result.events.map((event) => event.type)).toContain("unit-counterattacked");
   });

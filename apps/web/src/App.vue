@@ -302,18 +302,17 @@ const matchClockLabel = computed(() => isMatchFinished.value
 const notationTuples = computed(() => notation.value.map((entry) => entry.tuple));
 const notationText = computed(() => JSON.stringify(notationTuples.value));
 const latestContinuation = computed(() => [...notation.value].reverse().find((entry) => entry.continuation)?.continuation);
-/** Only blue-outlined cells are valid commands for the selected unit. */
+/** Blue cells are valid actions for the local selection; defense frames are
+ * derived from the shared match state so both clients see the same readiness. */
 const legalActionCellIds = computed<readonly CellId[]>(() => selectedUnit.value
   ? getLegalActionDestinationIds(game.value, selectedUnit.value.id, installedTerrainCatalog, coreUnitCatalog)
   : []);
-const counterattackCellIds = computed<readonly CellId[]>(() => legalActionCellIds.value.filter((cellId) => {
-  const defenderId = game.value.cells[cellId]?.unitId;
-  return defenderId !== undefined && canCounterattack(game.value, defenderId, installedTerrainCatalog, coreUnitCatalog);
-}));
-const noCounterattackCellIds = computed<readonly CellId[]>(() => legalActionCellIds.value.filter((cellId) => {
-  const defenderId = game.value.cells[cellId]?.unitId;
-  return defenderId !== undefined && !canCounterattack(game.value, defenderId, installedTerrainCatalog, coreUnitCatalog);
-}));
+const counterattackCellIds = computed<readonly CellId[]>(() => Object.values(game.value.units)
+  .filter((unit) => canCounterattack(game.value, unit.id, installedTerrainCatalog, coreUnitCatalog))
+  .map((unit) => unit.cellId));
+const noCounterattackCellIds = computed<readonly CellId[]>(() => Object.values(game.value.units)
+  .filter((unit) => !canCounterattack(game.value, unit.id, installedTerrainCatalog, coreUnitCatalog))
+  .map((unit) => unit.cellId));
 
 function resolveRelayEndpoint(): string {
   // A query override keeps the static preview deployable without bundling a
@@ -1459,7 +1458,7 @@ onBeforeUnmount(() => {
           <span class="player-color" :style="{ background: player.color }" />
           <div><strong>{{ player.displayName }}</strong><small>队伍 {{ player.teamId }} · 座位 {{ player.seat }}</small></div><b>{{ player.reinforcementPoints }} 点</b>
         </article>
-        <div class="legend"><p><i class="legend-token powered" />通电兵：每回合 +1；1 点不能行动</p><p><i class="legend-token roaming" />游兵：行动 -1；1 点作最后一次行动后失活</p><p><i class="legend-token exhausted" />失活：本回合不能继续行动</p><p><i class="counter-frame-key" /><i class="counter-frame-key safe" />攻击目标红框会反击，白框不会</p></div>
+        <div class="legend"><p><i class="legend-token powered" />通电兵：每回合 +1；1 点不能行动</p><p><i class="legend-token roaming" />游兵：行动 -1；1 点作最后一次行动后失活</p><p><i class="legend-token exhausted" />失活：本回合不能继续行动</p><p><i class="counter-frame-key" /><i class="counter-frame-key safe" />红框可反击，白框本回合不能反击</p></div>
       </aside>
 
       <section class="board-wrap">

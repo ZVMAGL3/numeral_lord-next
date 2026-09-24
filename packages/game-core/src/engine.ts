@@ -591,7 +591,9 @@ function attackUnit(
   let continuationUnitId = resolveAttack(
     draft, attacker, defender, targetCell.id, attackStrength, powered, movesIntoTarget, events
   );
-  if (departureGarrison) {
+  // A failed attack may leave its attacker on the source tile (or the
+  // defender may counterattack and kill it there); those are not departures.
+  if (departureGarrison && !draft.units[defender.id]) {
     leaveDepartureGarrison(draft, sourceCell.id, attacker, departureGarrison, units, events);
   }
   applyCounterattack(draft, defender.id, continuationUnitId, terrains, units, events);
@@ -626,7 +628,11 @@ function attackUnit(
   // destination terrain's enter capability above, using post-capture power.
   const attackerStayedAtSource = movesIntoTarget && continuationUnitId
     && draft.units[continuationUnitId]?.cellId !== targetCell.id;
-  if ((!movesIntoTarget || attackerStayedAtSource) && !powered && continuationUnitId
+  if (attackerStayedAtSource && continuationUnitId && draft.units[continuationUnitId]) {
+    if (exhaustUnitForCurrentPhase(draft, continuationUnitId)) {
+      events.push({ type: "unit-exhausted", message: "攻击未能推进，单位本回合失去行动力。" });
+    }
+  } else if (!movesIntoTarget && !powered && continuationUnitId
     && draft.units[continuationUnitId]
     && hasUnitCapability(attackerDefinition, UNIT_CAPABILITY.attackExhaustion)) {
     if (exhaustUnitForCurrentPhase(draft, continuationUnitId)) {
@@ -737,18 +743,29 @@ function resolveAttack(
   const destinationCell = draft.cells[destinationId];
   if (!sourceCell || !destinationCell) return undefined;
 
-  if (movesIntoTarget && powered) {
-    draft.units[attacker.id] = { ...attacker, strength: 1 };
-    draft.cells[attacker.cellId] = { ...sourceCell, unitId: attacker.id };
-  }
-
-  if (attackStrength > defender.strength) {
+  // `attackStrength` is the stack's post-action strength. Legacy combat
+  // compares one point above it (the action's consumed point is refunded for
+  // the strike), but the surviving stack still loses that point on advance.
+  if (attackStrength + 1 > defender.strength) {
     const survivorStrength = attackStrength - defender.strength;
     delete draft.units[defender.id];
     if (!movesIntoTarget) {
       draft.cells[destinationId] = withCellUnit(destinationCell, undefined);
       events.push({ type: "unit-attacked", message: "远程进攻成功，敌方单位被消灭。" });
       return attacker.id;
+    }
+    if (powered) {
+      draft.units[attacker.id] = { ...attacker, strength: 1 };
+      draft.cells[attacker.cellId] = { ...sourceCell, unitId: attacker.id };
+    }
+    if (survivorStrength < 1) {
+      if (!powered) {
+        delete draft.units[attacker.id];
+        draft.cells[attacker.cellId] = withCellUnit(sourceCell, undefined);
+      }
+      draft.cells[destinationId] = withCellUnit(destinationCell, undefined);
+      events.push({ type: "unit-attacked", message: "进攻成功，但兵力相抵，攻击单位未能推进。" });
+      return undefined;
     }
     if (!powered) {
       delete draft.units[attacker.id];
@@ -766,22 +783,11 @@ function resolveAttack(
     return survivorId;
   }
 
-  if (attackStrength === defender.strength) {
-    delete draft.units[defender.id];
-    draft.cells[destinationId] = withCellUnit(destinationCell, undefined);
-    if (movesIntoTarget && !powered) {
-      delete draft.units[attacker.id];
-      draft.cells[attacker.cellId] = withCellUnit(sourceCell, undefined);
-    }
-    events.push({ type: "unit-attacked", message: movesIntoTarget ? "双方兵力相抵，单位同时消灭。" : "远程攻击消灭了敌方单位。" });
-    return movesIntoTarget && !powered ? undefined : attacker.id;
-  }
-
   draft.units[defender.id] = {
     ...defender,
     strength: defender.strength - attackStrength
   };
-  events.push({ type: "unit-attacked", message: "进攻失败，防守方损失部分兵力。" });
+  events.push({ type: "unit-attacked", message: "进攻未能击破防守，防守方损失兵力。" });
   // A failed melee attack does not move the attacker. Keeping its id alive
   // lets the defender's configured reaction resolve normally; if there is no
   // reaction available, the unpowered attacker remains at its source and is
@@ -810,17 +816,14 @@ function applyCounterattack(
     ...draft.turn,
     counterattacksUsed: { ...draft.turn.counterattacksUsed, [defender.id]: used + 1 }
   };
-  const remainingStrength = attacker.strength - defender.strength;
-  if (remainingStrength > 0) {
-    draft.units[attacker.id] = { ...attacker, strength: remainingStrength };
-    events.push({ type: "unit-counterattacked", message: "防守单位发动反击，进攻单位损失兵力。" });
-    return;
-  }
-
+  // Legacy defense is a binary reaction: a defender that still has its
+  // counterattack removes a failed attacker; it does not exchange the
+  // defender's post-hit strength as damage. The attack itself already reduced
+  // the defender by the legacy-adjusted amount in resolveAttack().
   const attackerCell = draft.cells[attacker.cellId];
   if (attackerCell) draft.cells[attacker.cellId] = withCellUnit(attackerCell, undefined);
   delete draft.units[attacker.id];
-  events.push({ type: "unit-counterattacked", message: "防守单位发动反击，进攻单位被消灭。" });
+  events.push({ type: "unit-counterattacked", message: "防守方反击，攻击单位被消灭。" });
 }
 
 /** Shared rule/query for both combat resolution and the red/white target hint. */

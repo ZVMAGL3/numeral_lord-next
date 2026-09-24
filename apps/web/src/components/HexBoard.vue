@@ -135,8 +135,12 @@ function draw(): void {
   const { columns, rows } = props.state.board;
   const horizontalUnit = Math.sqrt(3);
   const padding = props.preview ? 14 : 44;
-  const minimumRadius = props.preview ? 5 : 21;
-  const radius = Math.max(minimumRadius, Math.min((width - padding) / (horizontalUnit * (columns + 0.5)), (height - padding) / (1.5 * (rows - 1) + 2)));
+  // Never enforce a gameplay-sized minimum here: on narrow phones that made
+  // the board wider than its clipped canvas, hiding the outer columns.
+  const radius = Math.max(1, Math.min(
+    (width - padding) / (horizontalUnit * (columns + 0.5)),
+    (height - padding) / (1.5 * (rows - 1) + 2)
+  ));
   const boardWidth = horizontalUnit * radius * (columns + 0.5);
   const boardHeight = 2 * radius + 1.5 * radius * (rows - 1);
   const offsetX = (width - boardWidth) / 2 + horizontalUnit * radius / 2;
@@ -158,17 +162,12 @@ function draw(): void {
     // interactions remain on the hex while the visual layers are noninteractive.
     // Legal action outline follows the same 0.98 terrain footprint, instead
     // of the previous radius-1 inset that made attack targets look smaller.
-    const isCounterattackTarget = counterattackCells.value.has(cell.id);
-    const isSafeAttackTarget = noCounterattackCells.value.has(cell.id);
-    const targetFrameColor = isCounterattackTarget ? 0xf0525f : 0xffffff;
     const tile = new Graphics().poly(hexagon(x, y, radius * 0.98))
       .fill({ color: 0xffffff, alpha: 0.001 })
       .stroke({
-        color: isCounterattackTarget || isSafeAttackTarget
-          ? targetFrameColor
-          : legalActions.value.has(cell.id) ? 0x67e8f9 : 0x8ba2c1,
-        width: isCounterattackTarget || isSafeAttackTarget ? 4 : legalActions.value.has(cell.id) ? 3 : 1,
-        alpha: isCounterattackTarget || isSafeAttackTarget || legalActions.value.has(cell.id) ? 1 : 0.45
+        color: legalActions.value.has(cell.id) ? 0x67e8f9 : 0x8ba2c1,
+        width: legalActions.value.has(cell.id) ? 3 : 1,
+        alpha: legalActions.value.has(cell.id) ? 1 : 0.45
       });
     if (props.preview) tile.eventMode = "none";
     else bindCellInteraction(tile, cell.id);
@@ -191,6 +190,17 @@ function draw(): void {
     // composed separately; this is only the castle artwork layer.
     if (cell.terrainId === "core/stronghold") {
       addLegacySprite(legacyTextureUrls.stronghold, x, y, radius, 0.98);
+    }
+
+    // Defense readiness is shared board information, not local selection
+    // feedback. Draw it above both terrain and unit artwork on every client.
+    if (unit && (counterattackCells.value.has(cell.id) || noCounterattackCells.value.has(cell.id))) {
+      const canReact = counterattackCells.value.has(cell.id);
+      const defenseFrame = new Graphics().poly(hexagon(x, y, radius * 0.98))
+        .stroke({ color: canReact ? 0xf0525f : 0xffffff, width: Math.max(3, radius * 0.075), alpha: 1 });
+      defenseFrame.zIndex = 25;
+      defenseFrame.eventMode = "none";
+      app.stage.addChild(defenseFrame);
     }
 
     if (!props.preview && unit && actionableUnits.value.has(unit.id)) {

@@ -41,6 +41,7 @@ import { addMapToLibrary, loadMapLibrary, removeMapFromLibrary } from "./map-lib
 import { installedMapCatalogs, installedTerrainCatalog, installedTerrainMods } from "./installed-content";
 import { WorkshopClient, type WorkshopConnectionStatus } from "./workshop-client";
 import { requestReturnToLobby } from "./room-reset";
+import { toNetworkPayload } from "./network-payload";
 import {
   advanceMatchClocks,
   clockExpiration,
@@ -331,13 +332,20 @@ function broadcastSnapshot(resolution?: {
   readonly errorMessage?: string;
 }): void {
   if (relayRoom && relayIsHost.value && lobbyState.value.phase === "playing") {
-    logConnection("snapshot.sent", { sequence: game.value.sequence, phase: game.value.turn.phase });
-    relayRoom.send("host-snapshot", {
-      state: game.value,
-      clock: matchClock.value,
-      hostSentAtEpochMs: Date.now(),
-      ...resolution
-    });
+    try {
+      relayRoom.send("host-snapshot", toNetworkPayload({
+        state: game.value,
+        clock: matchClock.value,
+        hostSentAtEpochMs: Date.now(),
+        ...resolution
+      }));
+      logConnection("snapshot.sent", { sequence: game.value.sequence, phase: game.value.turn.phase });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logConnection("snapshot.send-failed", { sequence: game.value.sequence, message: message.slice(0, 250) });
+      notice.value = "棋盘同步失败，已记录错误；请复制连接日志。";
+      console.error("PvP snapshot encoding failed", error);
+    }
   }
 }
 

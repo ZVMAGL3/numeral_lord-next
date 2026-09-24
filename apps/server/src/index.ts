@@ -194,7 +194,9 @@ export class PvpRelayRoom extends RelayRoom {
       const clientSequence = payload.sequence;
       if (typeof clientSequence !== "number" || !Number.isSafeInteger(clientSequence) || clientSequence < 0) return;
       if (!this.latestHostSnapshot) {
-        this.sendMatchStart(client);
+        // The client already received match-start to enter play. Replaying it
+        // on every check resets its local board and can make the match
+        // impossible to advance while the host's first snapshot is missing.
         this.requestHostSnapshot(client.sessionId);
       } else if (clientSequence < this.latestHostSnapshot.sequence) {
         this.sendCachedSnapshot(client);
@@ -447,6 +449,15 @@ export class PvpRelayRoom extends RelayRoom {
     if (previous) {
       const oldSessionId = previous.sessionId;
       const oldClient = this.clients.find((candidate) => candidate.sessionId === oldSessionId);
+      console.info("PvP member identity resumed", {
+        roomId: this.roomId,
+        phase: this.phase,
+        oldSessionId,
+        newSessionId: client.sessionId,
+        seat: previous.seat,
+        participating: previous.participating,
+        wasHost: oldSessionId === this.hostSessionId
+      });
       this.members.delete(oldSessionId);
       this.lastRoomSyncAtBySession.delete(oldSessionId);
       previous.sessionId = client.sessionId;
@@ -492,6 +503,14 @@ export class PvpRelayRoom extends RelayRoom {
       installedModIds,
       joinOrder: this.nextJoinOrder++
     };
+    console.info("PvP new room member joined", {
+      roomId: this.roomId,
+      phase: this.phase,
+      sessionId: client.sessionId,
+      seat: member.seat,
+      participating: member.participating,
+      accountMatched: false
+    });
     this.members.set(client.sessionId, member);
     if (!this.hostSessionId) this.hostSessionId = client.sessionId;
     this.broadcastRoomState();

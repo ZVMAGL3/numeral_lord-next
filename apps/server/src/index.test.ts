@@ -360,6 +360,20 @@ describe("PvpRelayRoom lobby contract", () => {
     expect(lastSent<{ state: { sequence: number } }>(player, "host-snapshot").state.sequence).toBe(8);
   });
 
+  it("requests a missing initial host snapshot without replaying match-start", () => {
+    const room = createRoom(2);
+    const host = join(room, "host");
+    room.receive("lobby-ready", host, { ready: true });
+    const player = join(room, "player");
+    player.sent.length = 0;
+    host.sent.length = 0;
+
+    room.receive("snapshot-check", player, { sequence: 0 });
+
+    expect(player.sent.some((event) => event.type === "match-start")).toBe(false);
+    expect(host.sent.some((event) => event.type === "snapshot-request")).toBe(true);
+  });
+
   it("recognizes a refreshed account and preserves its seat without a duplicate spectator", () => {
     const room = createRoom(2);
     const original = join(room, "old", "棋手", "stable-account");
@@ -385,6 +399,26 @@ describe("PvpRelayRoom lobby contract", () => {
     expect(lastBroadcast<LobbyRoomState>(room, "room-state").members.find(
       (member) => member.sessionId === "new"
     )?.seat).toBe(1);
+  });
+
+  it("restores a refreshed participant's seat during a live match", () => {
+    const room = createRoom(2);
+    const host = join(room, "host", "房主");
+    const player = join(room, "player-old", "棋手", "stable-account");
+    room.receive("lobby-ready", host, { ready: true });
+    room.receive("lobby-ready", player, { ready: true });
+
+    const refreshed = join(room, "player-new", "棋手", "stable-account");
+
+    expect(lastSent<Record<string, unknown>>(refreshed, "room-role")).toMatchObject({
+      sessionId: "player-new",
+      seat: 2,
+      participating: true,
+      playerId: "player-2"
+    });
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").members.filter(
+      (member) => member.accountId === "stable-account"
+    )).toHaveLength(1);
   });
 
   it("room-sync returns authoritative lobby context without requesting a game snapshot", () => {

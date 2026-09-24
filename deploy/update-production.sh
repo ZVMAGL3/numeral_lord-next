@@ -14,9 +14,12 @@ RUNTIME=/opt/numeral-lord-runtime/current/bin
 }
 [[ "$(realpath -m "$APP_DIR")" == /opt/numeral-lord-next ]] || exit 1
 ACTIVE_CONNECTIONS="$(ss -Hnt state established '( sport = :2567 )' | wc -l)"
-if [[ "$ACTIVE_CONNECTIONS" -gt 0 ]]; then
+if [[ "$ACTIVE_CONNECTIONS" -gt 0 && "${ALLOW_ACTIVE_CONNECTIONS:-0}" != 1 ]]; then
   echo "Production has $ACTIVE_CONNECTIONS active TCP connection(s); refusing to interrupt live rooms." >&2
   exit 1
+fi
+if [[ "$ACTIVE_CONNECTIONS" -gt 0 ]]; then
+  echo "Explicit test-deployment override: restarting with $ACTIVE_CONNECTIONS active connection(s)." >&2
 fi
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -43,6 +46,21 @@ if [[ -d "$APP_DIR/apps/server/data" ]]; then
   cp -a "$APP_DIR/apps/server/data" "$CANDIDATE/apps/server/data"
 fi
 chown -R numeral-lord:numeral-lord "$CANDIDATE"
+
+# PostgreSQL is local-only: peer auth maps this Linux service account to the
+# same database role. The database already exists; this only ensures the app
+# role can create its own prefixed tables in that database.
+sudo -u postgres psql -v ON_ERROR_STOP=1 -d numeral_lord <<'SQL'
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'numeral-lord') THEN
+    CREATE ROLE "numeral-lord" LOGIN;
+  END IF;
+END
+$$;
+GRANT CONNECT ON DATABASE numeral_lord TO "numeral-lord";
+GRANT USAGE, CREATE ON SCHEMA public TO "numeral-lord";
+SQL
 
 cp -a "$UNIT" "$UNIT_BACKUP"
 systemctl stop numeral-lord.service

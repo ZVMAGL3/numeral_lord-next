@@ -14,9 +14,12 @@ import type {
 } from "@numeral-lord/content-schema";
 import { parseMapCode, serializeMapCode } from "@numeral-lord/core-content";
 import { Room, type Client } from "colyseus";
+import { Pool } from "pg";
+import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+import { readFileSync, statSync } from "node:fs";
 import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 const MAX_MAPS = 200;
 const MAX_TERRAIN_MODS = 100;
@@ -26,6 +29,7 @@ const MAX_SOURCE_FILES = 16;
 const MAX_DATABASE_BYTES = 32 * 1024 * 1024;
 const PUBLICATION_COOLDOWN_MS = 3_000;
 const MAX_PUBLICATIONS_PER_SESSION = 10;
+const DATABASE_MIGRATION_LOCK = 918273645;
 
 interface WorkshopDatabase {
   readonly version: 1;
@@ -183,6 +187,384 @@ export class WorkshopStore {
   }
 }
 
+/** PostgreSQL persistence used by the public service; JSON remains the local-dev fallback. */
+export class PostgresWorkshopStore {
+  private readonly pool: Pool;
+  private loading: Promise<void> | undefined;
+
+  constructor(private readonly dataDirectory = process.env.WORKSHOP_DATA_DIR ?? join(process.cwd(), "data", "workshop")) {
+    this.pool = new Pool({
+      ...(process.env.DATABASE_URL ? { connectionString: process.env.DATABASE_URL } : {}),
+      ...(process.env.PGHOST ? { host: process.env.PGHOST } : {}),
+      ...(process.env.PGPORT ? { port: Number(process.env.PGPORT) } : {}),
+      ...(process.env.PGDATABASE ? { database: process.env.PGDATABASE } : {}),
+      ...(process.env.PGUSER ? { user: process.env.PGUSER } : {}),
+      max: 8,
+      connectionTimeoutMillis: 5_000,
+      idleTimeoutMillis: 30_000
+    });
+  }
+
+  async load(): Promise<void> {
+    this.loading ??= this.initialize();
+    return this.loading;
+  }
+
+  async list(): Promise<WorkshopCatalog> {
+    await this.load();
+    const [maps, terrainMods] = await Promise.all([
+      this.pool.query<{ entry: string }>("SELECT entry FROM nl_workshop_maps ORDER BY created_at DESC, id"),
+      this.pool.query<{ entry: string }>("SELECT entry FROM nl_workshop_terrain_mods ORDER BY created_at DESC, id")
+    ]);
+    return {
+      maps: maps.rows.map(({ entry }) => {
+        const { code: _code, ...summary } = parseStoredEntry<WorkshopMapEntry>(entry);
+        return summary;
+      }),
+      terrainMods: terrainMods.rows.map(({ entry }) => {
+        const { sourceFiles: _sourceFiles, ...summary } = parseStoredEntry<WorkshopTerrainModEntry>(entry);
+        return summary;
+      })
+    };
+  }
+
+  async get(request: WorkshopGetRequest): Promise<WorkshopDetail | undefined> {
+    await this.load();
+    if (request.kind === "map") {
+      const result = await this.pool.query<{ entry: string }>(
+        "SELECT entry FROM nl_workshop_maps WHERE id = $1", [request.id]
+      );
+      return result.rows[0] ? { kind: "map", entry: parseStoredEntry<WorkshopMapEntry>(result.rows[0].entry) } : undefined;
+    }
+    if (request.kind === "terrain-mod") {
+      const result = await this.pool.query<{ entry: string }>(
+        "SELECT entry FROM nl_workshop_terrain_mods WHERE id = $1", [request.id]
+      );
+      return result.rows[0] ? { kind: "terrain-mod", entry: parseStoredEntry<WorkshopTerrainModEntry>(result.rows[0].entry) } : undefined;
+    }
+    throw new WorkshopInputError("工坊内容类型无效。");
+  }
+
+  async publishMap(input: unknown, authorName: string): Promise<WorkshopPublished> {
+    await this.load();
+    const payload = validateMapRequest(input);
+    let map;
+    let code;
+    try {
+      map = parseMapCode(payload.code, { allowUnknownTerrainMods: true });
+      code = serializeMapCode(map, { allowUnknownTerrainMods: true });
+    } catch (error) {
+      throw new WorkshopInputError(error instanceof Error ? error.message : "地图码无效。");
+    }
+    const entry: WorkshopMapEntry = {
+      id: randomUUID(), mapId: map.id, name: map.name, description: payload.description,
+      authorName: normalizeAuthorName(authorName), createdAt: new Date().toISOString(),
+      players: map.players, requiredTerrainModIds: map.requiredTerrainModIds, code
+    };
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock($1)", [DATABASE_MIGRATION_LOCK]);
+      const count = await client.query<{ count: string }>("SELECT count(*)::text AS count FROM nl_workshop_maps");
+      if (Number(count.rows[0]?.count ?? 0) >= MAX_MAPS) throw new WorkshopInputError("工坊地图已达到容量上限。");
+      const existing = await client.query("SELECT 1 FROM nl_workshop_maps WHERE code = $1 LIMIT 1", [code]);
+      if (existing.rowCount) throw new WorkshopInputError("这份地图码已经发布过了。");
+      await client.query("INSERT INTO nl_workshop_maps (id, code, entry, created_at) VALUES ($1, $2, $3, $4)",
+        [entry.id, code, JSON.stringify(entry), entry.createdAt]);
+      await client.query("COMMIT");
+      return { kind: "map", id: entry.id };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      if (error instanceof WorkshopInputError) throw error;
+      throw new Error("Failed to persist workshop map.", { cause: error });
+    } finally {
+      client.release();
+    }
+  }
+
+  async publishTerrainMod(input: unknown, authorName: string): Promise<WorkshopPublished> {
+    await this.load();
+    const payload = validateTerrainModRequest(input);
+    const entry: WorkshopTerrainModEntry = {
+      id: randomUUID(), modId: payload.id, name: payload.name, version: payload.version,
+      description: payload.description, terrainIds: payload.terrainIds, sourceFiles: payload.sourceFiles,
+      authorName: normalizeAuthorName(authorName), createdAt: new Date().toISOString()
+    };
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock($1)", [DATABASE_MIGRATION_LOCK]);
+      const count = await client.query<{ count: string }>("SELECT count(*)::text AS count FROM nl_workshop_terrain_mods");
+      if (Number(count.rows[0]?.count ?? 0) >= MAX_TERRAIN_MODS) throw new WorkshopInputError("工坊地块 Mod 已达到容量上限。");
+      const existing = await client.query("SELECT 1 FROM nl_workshop_terrain_mods WHERE mod_id = $1 AND version = $2 LIMIT 1",
+        [entry.modId, entry.version]);
+      if (existing.rowCount) throw new WorkshopInputError("相同 ID 和版本的地块 Mod 已发布。");
+      await client.query("INSERT INTO nl_workshop_terrain_mods (id, mod_id, version, entry, created_at) VALUES ($1, $2, $3, $4, $5)",
+        [entry.id, entry.modId, entry.version, JSON.stringify(entry), entry.createdAt]);
+      await client.query("COMMIT");
+      return { kind: "terrain-mod", id: entry.id };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      if (error instanceof WorkshopInputError) throw error;
+      throw new Error("Failed to persist workshop terrain Mod.", { cause: error });
+    } finally {
+      client.release();
+    }
+  }
+
+  async close(): Promise<void> {
+    await this.pool.end();
+  }
+
+  private async initialize(): Promise<void> {
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS nl_schema_migrations (
+        name text PRIMARY KEY,
+        completed_at timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE TABLE IF NOT EXISTS nl_workshop_maps (
+        id text PRIMARY KEY,
+        code text NOT NULL UNIQUE,
+        entry text NOT NULL CHECK (jsonb_typeof(entry::jsonb) = 'object'),
+        created_at timestamptz NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS nl_workshop_maps_created_idx ON nl_workshop_maps (created_at DESC);
+      CREATE TABLE IF NOT EXISTS nl_workshop_terrain_mods (
+        id text PRIMARY KEY,
+        mod_id text NOT NULL,
+        version text NOT NULL,
+        entry text NOT NULL CHECK (jsonb_typeof(entry::jsonb) = 'object'),
+        UNIQUE(mod_id, version),
+        created_at timestamptz NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS nl_workshop_mods_created_idx ON nl_workshop_terrain_mods (created_at DESC);
+    `);
+    await this.importLegacyJsonOnce();
+  }
+
+  /** Merge legacy JSON entries once; never overwrite or truncate existing database rows. */
+  private async importLegacyJsonOnce(): Promise<void> {
+    const migrationName = "legacy_workshop_json_v1";
+    const done = await this.pool.query("SELECT 1 FROM nl_schema_migrations WHERE name = $1", [migrationName]);
+    if (done.rowCount) return;
+    const file = join(this.dataDirectory, "workshop.json");
+    let decoded: unknown;
+    try {
+      const size = (await stat(file)).size;
+      if (size > MAX_DATABASE_BYTES) throw new Error("Workshop database exceeds its size limit.");
+      decoded = JSON.parse(await readFile(file, "utf8"));
+    } catch (error) {
+      if (!hasCode(error, "ENOENT")) throw error;
+      decoded = undefined;
+    }
+    if (decoded !== undefined && (!isRecord(decoded) || decoded.version !== 1 || !Array.isArray(decoded.maps)
+      || !Array.isArray(decoded.terrainMods) || decoded.maps.length > MAX_MAPS || decoded.terrainMods.length > MAX_TERRAIN_MODS)) {
+      throw new Error("Legacy workshop JSON has an invalid format; refusing to mark it imported.");
+    }
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock($1)", [DATABASE_MIGRATION_LOCK]);
+      const recheck = await client.query("SELECT 1 FROM nl_schema_migrations WHERE name = $1", [migrationName]);
+      if (!recheck.rowCount && decoded !== undefined) {
+        const data = decoded as unknown as WorkshopDatabase;
+        for (const entry of data.maps) {
+          await client.query("INSERT INTO nl_workshop_maps (id, code, entry, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+            [entry.id, entry.code, JSON.stringify(entry), entry.createdAt]);
+        }
+        for (const entry of data.terrainMods) {
+          await client.query("INSERT INTO nl_workshop_terrain_mods (id, mod_id, version, entry, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+            [entry.id, entry.modId, entry.version, JSON.stringify(entry), entry.createdAt]);
+        }
+      }
+      await client.query("INSERT INTO nl_schema_migrations (name) VALUES ($1) ON CONFLICT DO NOTHING", [migrationName]);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+}
+
+/** Local development uses the same portable JSON records inside a SQLite file. */
+export class SqliteWorkshopStore {
+  private database: DatabaseSync | undefined;
+  private loading: Promise<void> | undefined;
+
+  constructor(
+    private readonly databasePath = process.env.LOCAL_DATABASE_PATH ?? join(process.cwd(), "data", "numeral-lord.sqlite"),
+    private readonly legacyDataDirectory = process.env.WORKSHOP_DATA_DIR ?? join(process.cwd(), "data", "workshop")
+  ) {}
+
+  async load(): Promise<void> {
+    this.loading ??= this.initialize();
+    return this.loading;
+  }
+
+  async list(): Promise<WorkshopCatalog> {
+    await this.load();
+    const maps = this.database!.prepare("SELECT entry FROM nl_workshop_maps ORDER BY created_at DESC, id").all() as { entry: string }[];
+    const terrainMods = this.database!.prepare("SELECT entry FROM nl_workshop_terrain_mods ORDER BY created_at DESC, id").all() as { entry: string }[];
+    return {
+      maps: maps.map(({ entry }) => {
+        const { code: _code, ...summary } = parseStoredEntry<WorkshopMapEntry>(entry);
+        return summary;
+      }),
+      terrainMods: terrainMods.map(({ entry }) => {
+        const { sourceFiles: _sourceFiles, ...summary } = parseStoredEntry<WorkshopTerrainModEntry>(entry);
+        return summary;
+      })
+    };
+  }
+
+  async get(request: WorkshopGetRequest): Promise<WorkshopDetail | undefined> {
+    await this.load();
+    if (request.kind === "map") {
+      const row = this.database!.prepare("SELECT entry FROM nl_workshop_maps WHERE id = ?").get(request.id) as { entry: string } | undefined;
+      return row ? { kind: "map", entry: parseStoredEntry<WorkshopMapEntry>(row.entry) } : undefined;
+    }
+    if (request.kind === "terrain-mod") {
+      const row = this.database!.prepare("SELECT entry FROM nl_workshop_terrain_mods WHERE id = ?").get(request.id) as { entry: string } | undefined;
+      return row ? { kind: "terrain-mod", entry: parseStoredEntry<WorkshopTerrainModEntry>(row.entry) } : undefined;
+    }
+    throw new WorkshopInputError("工坊内容类型无效。");
+  }
+
+  async publishMap(input: unknown, authorName: string): Promise<WorkshopPublished> {
+    await this.load();
+    const payload = validateMapRequest(input);
+    let map;
+    let code;
+    try {
+      map = parseMapCode(payload.code, { allowUnknownTerrainMods: true });
+      code = serializeMapCode(map, { allowUnknownTerrainMods: true });
+    } catch (error) {
+      throw new WorkshopInputError(error instanceof Error ? error.message : "地图码无效。");
+    }
+    const entry: WorkshopMapEntry = {
+      id: randomUUID(), mapId: map.id, name: map.name, description: payload.description,
+      authorName: normalizeAuthorName(authorName), createdAt: new Date().toISOString(),
+      players: map.players, requiredTerrainModIds: map.requiredTerrainModIds, code
+    };
+    const database = this.database!;
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      const count = database.prepare("SELECT count(*) AS count FROM nl_workshop_maps").get() as { count: number };
+      if (count.count >= MAX_MAPS) throw new WorkshopInputError("工坊地图已达到容量上限。");
+      const existing = database.prepare("SELECT 1 FROM nl_workshop_maps WHERE code = ? LIMIT 1").get(code);
+      if (existing) throw new WorkshopInputError("这份地图码已经发布过了。");
+      database.prepare("INSERT INTO nl_workshop_maps (id, code, entry, created_at) VALUES (?, ?, ?, ?)")
+        .run(entry.id, code, JSON.stringify(entry), entry.createdAt);
+      database.exec("COMMIT");
+      return { kind: "map", id: entry.id };
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async publishTerrainMod(input: unknown, authorName: string): Promise<WorkshopPublished> {
+    await this.load();
+    const payload = validateTerrainModRequest(input);
+    const entry: WorkshopTerrainModEntry = {
+      id: randomUUID(), modId: payload.id, name: payload.name, version: payload.version,
+      description: payload.description, terrainIds: payload.terrainIds, sourceFiles: payload.sourceFiles,
+      authorName: normalizeAuthorName(authorName), createdAt: new Date().toISOString()
+    };
+    const database = this.database!;
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      const count = database.prepare("SELECT count(*) AS count FROM nl_workshop_terrain_mods").get() as { count: number };
+      if (count.count >= MAX_TERRAIN_MODS) throw new WorkshopInputError("工坊地块 Mod 已达到容量上限。");
+      const existing = database.prepare("SELECT 1 FROM nl_workshop_terrain_mods WHERE mod_id = ? AND version = ? LIMIT 1")
+        .get(entry.modId, entry.version);
+      if (existing) throw new WorkshopInputError("相同 ID 和版本的地块 Mod 已发布。");
+      database.prepare("INSERT INTO nl_workshop_terrain_mods (id, mod_id, version, entry, created_at) VALUES (?, ?, ?, ?, ?)")
+        .run(entry.id, entry.modId, entry.version, JSON.stringify(entry), entry.createdAt);
+      database.exec("COMMIT");
+      return { kind: "terrain-mod", id: entry.id };
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  close(): void {
+    this.database?.close();
+    this.database = undefined;
+  }
+
+  private async initialize(): Promise<void> {
+    await mkdir(dirname(this.databasePath), { recursive: true });
+    this.database = new DatabaseSync(this.databasePath);
+    this.database.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA foreign_keys = ON;
+      PRAGMA busy_timeout = 5000;
+      CREATE TABLE IF NOT EXISTS nl_schema_migrations (
+        name TEXT PRIMARY KEY,
+        completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS nl_workshop_maps (
+        id TEXT PRIMARY KEY,
+        code TEXT NOT NULL UNIQUE,
+        entry TEXT NOT NULL CHECK (json_valid(entry) AND json_type(entry) = 'object'),
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS nl_workshop_maps_created_idx ON nl_workshop_maps (created_at DESC);
+      CREATE TABLE IF NOT EXISTS nl_workshop_terrain_mods (
+        id TEXT PRIMARY KEY,
+        mod_id TEXT NOT NULL,
+        version TEXT NOT NULL,
+        entry TEXT NOT NULL CHECK (json_valid(entry) AND json_type(entry) = 'object'),
+        created_at TEXT NOT NULL,
+        UNIQUE (mod_id, version)
+      );
+      CREATE INDEX IF NOT EXISTS nl_workshop_mods_created_idx ON nl_workshop_terrain_mods (created_at DESC);
+    `);
+    this.importLegacyJsonOnce();
+  }
+
+  /** Merge legacy JSON entries once; never overwrite or truncate existing database rows. */
+  private importLegacyJsonOnce(): void {
+    const database = this.database!;
+    const migrationName = "legacy_workshop_json_v1";
+    if (database.prepare("SELECT 1 FROM nl_schema_migrations WHERE name = ?").get(migrationName)) return;
+    const file = join(this.legacyDataDirectory, "workshop.json");
+    let decoded: unknown;
+    try {
+      const size = statSync(file).size;
+      if (size > MAX_DATABASE_BYTES) throw new Error("Workshop database exceeds its size limit.");
+      decoded = JSON.parse(readFileSync(file, "utf8"));
+    } catch (error) {
+      if (!hasCode(error, "ENOENT")) throw error;
+      decoded = undefined;
+    }
+    if (decoded !== undefined && (!isRecord(decoded) || decoded.version !== 1 || !Array.isArray(decoded.maps)
+      || !Array.isArray(decoded.terrainMods) || decoded.maps.length > MAX_MAPS || decoded.terrainMods.length > MAX_TERRAIN_MODS)) {
+      throw new Error("Legacy workshop JSON has an invalid format; refusing to mark it imported.");
+    }
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      if (decoded !== undefined) {
+        const data = decoded as unknown as WorkshopDatabase;
+        const mapInsert = database.prepare("INSERT OR IGNORE INTO nl_workshop_maps (id, code, entry, created_at) VALUES (?, ?, ?, ?)");
+        const modInsert = database.prepare("INSERT OR IGNORE INTO nl_workshop_terrain_mods (id, mod_id, version, entry, created_at) VALUES (?, ?, ?, ?, ?)");
+        for (const entry of data.maps) mapInsert.run(entry.id, entry.code, JSON.stringify(entry), entry.createdAt);
+        for (const entry of data.terrainMods) modInsert.run(entry.id, entry.modId, entry.version, JSON.stringify(entry), entry.createdAt);
+      }
+      database.prepare("INSERT OR IGNORE INTO nl_schema_migrations (name) VALUES (?)").run(migrationName);
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+}
+
 /**
  * Read/publish protocol over the existing Colyseus transport. Uploaded source
  * never leaves this room as executable code: it is stored and returned only
@@ -268,7 +650,9 @@ export class WorkshopRoom extends Room {
   }
 }
 
-const sharedWorkshopStore = new WorkshopStore();
+const sharedWorkshopStore = process.env.DATABASE_URL || process.env.PGHOST
+  ? new PostgresWorkshopStore()
+  : new SqliteWorkshopStore();
 
 function validateMapRequest(input: unknown): PublishMapRequest {
   if (!isRecord(input) || typeof input.code !== "string" || byteLength(input.code) === 0
@@ -343,6 +727,10 @@ function isSafeRelativePath(path: string): boolean {
 
 function byteLength(value: string): number {
   return Buffer.byteLength(value, "utf8");
+}
+
+function parseStoredEntry<T>(value: string): T {
+  return JSON.parse(value) as T;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

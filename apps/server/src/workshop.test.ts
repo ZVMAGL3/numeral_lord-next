@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import { WorkshopInputError, WorkshopStore } from "./workshop.js";
+import { SqliteWorkshopStore, WorkshopInputError, WorkshopStore } from "./workshop.js";
 
 let dataDirectory: string;
 let store: WorkshopStore;
@@ -45,6 +45,29 @@ describe("workshop persistence and inert previews", () => {
     const persisted = new WorkshopStore(dataDirectory);
     expect((await persisted.list()).maps).toEqual(catalog.maps);
     expect(JSON.parse(await readFile(join(dataDirectory, "workshop.json"), "utf8"))).toMatchObject({ version: 1 });
+  });
+
+  it("imports the legacy JSON once and persists the same portable records in local SQLite", async () => {
+    await store.publishMap({ code: DEFAULT_MAP_CODE, description: "旧 JSON 地图" }, "旧作者");
+    const sqlitePath = join(dataDirectory, "local.sqlite");
+    const sqlite = new SqliteWorkshopStore(sqlitePath, dataDirectory);
+    try {
+      const firstRead = await sqlite.list();
+      expect(firstRead.maps).toMatchObject([{ mapId: "1001", name: "昏晓", authorName: "旧作者" }]);
+      const customCode = JSON.stringify({ ...(JSON.parse(DEFAULT_MAP_CODE) as object), id: "sqlite-custom-map" });
+      await sqlite.publishMap({ code: customCode, description: "本地数据库地图" }, "本地玩家");
+    } finally {
+      sqlite.close();
+    }
+
+    const reopened = new SqliteWorkshopStore(sqlitePath, dataDirectory);
+    try {
+      expect((await reopened.list()).maps.map((map) => map.name)).toEqual(["昏晓", "昏晓"]);
+      await expect(reopened.publishMap({ code: DEFAULT_MAP_CODE, description: "重复" }, "其他作者"))
+        .rejects.toThrow(/已经发布/);
+    } finally {
+      reopened.close();
+    }
   });
 
   it("keeps a Mod as source text only, without evaluating it", async () => {

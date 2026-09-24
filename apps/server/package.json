@@ -8,7 +8,8 @@
     "start": "pnpm --filter @numeral-lord/game-core build && tsx src/index.ts",
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "export:workshop": "tsx scripts/export-workshop.ts"
   },
   "dependencies": {
     "@numeral-lord/content-schema": "workspace:*",
@@ -16,9 +17,11 @@
     "@numeral-lord/game-core": "workspace:*",
     "@numeral-lord/game-sdk": "workspace:*",
     "@numeral-lord/oil-field-mod": "workspace:*",
-    "colyseus": "0.18.7"
+    "colyseus": "0.18.7",
+    "pg": "8.23.0"
   },
   "devDependencies": {
+    "@types/pg": "8.15.5",
     "tsx": "4.23.15",
     "typescript": "5.9.3",
     "vitest": "5.0.1"

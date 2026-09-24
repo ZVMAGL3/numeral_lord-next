@@ -439,7 +439,7 @@ function installSelectedTerrain(): void {
       <div>
         <p class="eyebrow">COMMUNITY WORKSHOP</p>
         <h2>创意工坊</h2>
-        <p>浏览地图与结构化地块 Mod。地块 Mod 安装后会以数据形式加载，由游戏内核支持的能力规则执行。</p>
+        <p>浏览地图与结构化地块 Mod。订阅并安装的地块 Mod 会保存在本机数据库；每天首次连接工坊时检查新版本。</p>
       </div>
       <button class="back-button" type="button" @click="emit('back')">← 返回主页</button>
     </header>
@@ -456,7 +456,7 @@ function installSelectedTerrain(): void {
     <p v-if="actionMessage" class="action-message" :class="{ error: actionError }" role="status">{{ actionMessage }}</p>
 
     <div class="workshop-toolbar">
-      <div><strong>{{ category === 'terrain' ? '地块扩展' : '地图作品' }}</strong><p>{{ category === 'terrain' ? '查看结构化属性与包含地块。安装后由游戏内核执行已支持的能力。' : '地图作品是一段可保存的地图码；开局前需要装齐所依赖的地块 Mod。' }}</p></div>
+      <div><strong>{{ category === 'terrain' ? '地块扩展' : '地图作品' }}</strong><p>{{ category === 'terrain' ? '查看结构化属性与包含地块。订阅并安装后每日检查版本，由游戏内核执行已支持的能力。' : '地图作品是一段可保存的地图码；开局前需要装齐所依赖的地块 Mod。' }}</p></div>
       <button v-if="publishingEnabled && viewMode === 'browse'" class="outline-button publish-entry" type="button" @click="openPublish">＋ {{ category === 'terrain' ? '发布地块 Mod' : '发布地图作品' }}</button>
       <span v-else-if="!publishingEnabled" class="read-only-note">公网测试版仅开放浏览，暂不接受发布</span>
     </div>
@@ -501,7 +501,7 @@ function installSelectedTerrain(): void {
           <pre v-if="selectedDefinitionJson" class="definition-preview"><code>{{ selectedDefinitionJson }}</code></pre>
           <p v-else class="source-empty">{{ selectedTerrain.definition === undefined ? '此旧版作品没有结构化属性对象，暂时无法安装；作者可以按新格式重新发布。' : '正在加载作品详情…' }}</p>
           <div class="detail-actions">
-            <button class="primary-button" type="button" :disabled="selectedTerrain.installed || !selectedTerrain.definition || working" @click="installSelectedTerrain">{{ selectedTerrain.installed ? '已安装到本机' : selectedTerrain.definition ? '下载并安装 Mod' : '需要重新发布' }}</button>
+            <button class="primary-button" type="button" :disabled="selectedTerrain.installed || !selectedTerrain.definition || working" @click="installSelectedTerrain">{{ selectedTerrain.installed ? '已订阅并安装' : selectedTerrain.definition ? '订阅并安装 Mod' : '需要重新发布' }}</button>
           </div>
           <p v-if="downloadMessage" class="copy-message" role="status">{{ downloadMessage }}</p>
         </article>

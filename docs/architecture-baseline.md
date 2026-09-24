@@ -39,7 +39,7 @@
 
 移动只有一条全局规则：单位必须绑定在带有 `occupiable` 的格子；缺少该能力的山地、虚无等格子一律不能进入。`power-network` 是公共规则模块：它读取地形的 `power-conductor`、`power-source` 和单位的供电接收能力，计算连接结果。`powered` 与 `roaming` 是派生状态，不作为独立兵种存档。`adjacent-hostile-exhaustion` 是另一套独立规则：被占据据点的六个相邻格会令非同队、刚完成移动或近战攻击并落入该范围的单位在本回合耗尽行动力；据点格自身不受此效果影响。
 
-旧版 `map.js` 的 1001 地图保存在 `packages/core-content/src/legacy-demo-map.ts`，作为内置首图「昏晓」。`packages/core-content/src/map-code.ts` 把它转换为版本化 JSON 地图码：地形仍是行优先字符串，并由地形图例将 `M/P/S/O/F/V` 映射到已注册的核心或 Mod 地形；兵力项使用 `[格索引, 从 1 开始的玩家位, 兵力]`。地图码还声明名称、玩家位、队伍及胜负条件。`parseMapCode` 校验导入内容，`createMatchFromMapCode` 在浏览器、服务端和 AI 侧构建相同的 `GameState`。首版地图库只在浏览器本机保存自定义地图码；房主选择后服务端将完整码随房间状态共享给所有成员。可视化编辑与 Mod 依赖包管理仍待实现。
+旧版 `map.js` 的 1001 地图保存在 `packages/core-content/src/legacy-demo-map.ts`，作为内置首图「昏晓」。`packages/core-content/src/map-code.ts` 把它转换为版本化 JSON 地图码：地形仍是行优先字符串，并由地形图例将 `M/P/S/O/F/V` 映射到已注册的核心或 Mod 地形；兵力项使用 `[格索引, 从 1 开始的玩家位, 兵力]`。地图码还声明名称、玩家位、队伍及胜负条件。`parseMapCode` 校验导入内容，`createMatchFromMapCode` 在浏览器、服务端和 AI 侧构建相同的 `GameState`。地图库以预览卡片浏览，个人地图码保存在浏览器本地；地图编辑器使用同一份版本化地图格式，房主选择后服务端将完整码随房间状态共享给所有成员。Mod 对象与订阅清单保存在浏览器 IndexedDB；连接创意工坊时每日最多检查一次已订阅 Mod 的新版本。中立野生单位尚无核心规则/地图码表示，当前编辑器只允许玩家位兵力与不可驻兵阻挡地形。
 
 收益也不再绑死在据点：`core/powered-income` 是单位能力，`core/roamer` 配置为每个通电单位在拥有者行动回合开始时产生 1 点；油田继续以地形的 `income-source` 独立提供 2 点。油田刻意不带 `power-conductor`，因此其中的单位始终不因油田而通电；其 `core/departure-garrison` 则在占据者离开时生成一名 1 点 `core/roamer`，并立即把该留守兵写入本回合的 `turn.exhaustedUnitIds`。行动过程中占领、断电或失去单位只影响下一次该玩家行动开始时的结算，不能改写本回合已经拿到的点数。
 

@@ -67,6 +67,21 @@ export function addMapToLibrary(current: readonly ConfiguredMap[], rawCode: stri
   return next;
 }
 
+export function saveMapToLibrary(current: readonly ConfiguredMap[], rawCode: string): ConfiguredMap[] {
+  if (rawCode.length > 128_000) throw new Error("地图数据过长。");
+  const definition = parseMapCode(rawCode, libraryCatalogs);
+  const existing = current.find((map) => map.definition.id === definition.id);
+  if (existing?.isDefault) throw new Error("不能覆盖内置默认地图；请先创建副本。");
+  const exists = existing !== undefined;
+  if (!exists && current.length - 1 >= MAX_CUSTOM_MAPS) throw new Error("本机最多可保存 32 张自定义地图。");
+  const entry: ConfiguredMap = { code: serializeMapCode(definition, libraryCatalogs), definition, isDefault: false };
+  const next = exists
+    ? current.map((map) => map.definition.id === definition.id ? entry : map)
+    : [...current, entry];
+  persistCustomMaps(next);
+  return next;
+}
+
 export function removeMapFromLibrary(current: readonly ConfiguredMap[], id: string): ConfiguredMap[] {
   const next = current.filter((map) => map.isDefault || map.definition.id !== id);
   persistCustomMaps(next);

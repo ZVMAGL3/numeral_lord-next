@@ -3,7 +3,7 @@ import { oilFieldMod, oilFieldTerrainCatalog } from "@numeral-lord/oil-field-mod
 import type { TerrainModDefinition } from "@numeral-lord/content-schema";
 import type { ModDefinition } from "@numeral-lord/game-sdk";
 import { reactive } from "vue";
-import { loadInstalledTerrainModObjects, persistInstalledTerrainModObject } from "./mod-installation";
+import { loadInstalledTerrainModObjects, persistInstalledTerrainModObject, subscribeToTerrainMod } from "./mod-installation";
 
 /** Runtime mod registry. Published packages are hydrated from IndexedDB objects. */
 export const installedTerrainMods = reactive<ModDefinition[]>([oilFieldMod]);
@@ -69,6 +69,7 @@ export async function hydrateInstalledTerrainMods(): Promise<void> {
   const definitions = await loadInstalledTerrainModObjects();
   for (const definition of definitions) {
     if (definition.id === "core-terrain" || definition.id.startsWith("core-")) continue;
+    await subscribeToTerrainMod(definition);
     registerTerrainModObject(definition);
   }
 }

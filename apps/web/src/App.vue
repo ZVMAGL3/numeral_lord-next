@@ -30,7 +30,8 @@ import {
   DEFAULT_MAP_DEFINITION,
   coreMatchConditionCatalog,
   coreUnitCatalog,
-  createMatchFromMapCode
+  createMatchFromMapCode,
+  serializeMapCode
 } from "@numeral-lord/core-content";
 import HexBoard from "./components/HexBoard.vue";
 import HomeScreen from "./components/HomeScreen.vue";
@@ -38,7 +39,7 @@ import LobbyPanel from "./components/LobbyPanel.vue";
 import MapLibrary from "./components/MapLibrary.vue";
 import WorkshopPanel from "./components/WorkshopPanel.vue";
 import type { MapSubmission, MapWorkshopEntry, TerrainModEntry, TerrainModSubmission } from "./components/WorkshopPanel.vue";
-import { addMapToLibrary, loadMapLibrary, removeMapFromLibrary } from "./map-library";
+import { addMapToLibrary, loadMapLibrary, removeMapFromLibrary, saveMapToLibrary } from "./map-library";
 import {
   hydrateInstalledTerrainMods,
   installTerrainModObject,
@@ -48,6 +49,7 @@ import {
   terrainModDefinitionObject
 } from "./installed-content";
 import { WorkshopClient, type WorkshopConnectionStatus } from "./workshop-client";
+import { loadModSubscriptions, markModUpdateCheck, shouldCheckModUpdates, subscribeToTerrainMod, updateSubscribedMod } from "./mod-installation";
 import { requestReturnToLobby } from "./room-reset";
 import { useBoardInteraction } from "./board-interaction";
 import { createCommandTimeline, type CommandEnvelope } from "./command-sync";
@@ -736,8 +738,7 @@ function openMapLibrary(): void {
   void router.push("/maps");
 }
 
-function openWorkshop(): void {
-  void router.push("/workshop");
+function ensureWorkshopClient(): void {
   if (!workshopClient) {
     workshopClient = new WorkshopClient(resolveRelayEndpoint(), {
       catalog: (catalog) => {
@@ -747,6 +748,7 @@ function openWorkshop(): void {
           ...entry,
           installed: installedIds.has(entry.modId)
         }));
+        void requestSubscribedModUpdates(catalog.terrainMods);
       },
       detail: (detail) => {
         if (detail.kind === "map") {
@@ -755,6 +757,7 @@ function openWorkshop(): void {
         } else {
           remoteTerrainMods.value = remoteTerrainMods.value.map((entry) => entry.id === detail.entry.id
             ? { ...entry, ...detail.entry } : entry);
+          if (detail.entry.definition) void autoUpdateSubscribedMod(detail.entry.definition);
         }
       },
       published: (published) => {
@@ -771,8 +774,13 @@ function openWorkshop(): void {
       status: (status) => { workshopStatus.value = status; }
     });
   }
+}
+
+function openWorkshop(): void {
+  void router.push("/workshop");
+  ensureWorkshopClient();
   const name = playerName.value.trim().slice(0, 24) || randomPlayerName();
-  void workshopClient.connect({ name });
+  void workshopClient?.connect({ name });
 }
 
 function selectWorkshopMap(id: string): void {
@@ -789,6 +797,7 @@ function selectWorkshopTerrainMod(id: string): void {
 
 async function installWorkshopTerrainMod(definition: import("@numeral-lord/content-schema").TerrainModDefinition): Promise<void> {
   try {
+    await subscribeToTerrainMod(definition);
     await installTerrainModObject(definition);
     remoteTerrainMods.value = remoteTerrainMods.value.map((entry) => entry.modId === definition.id
       ? { ...entry, installed: true } : entry);
@@ -797,6 +806,54 @@ async function installWorkshopTerrainMod(definition: import("@numeral-lord/conte
   } catch (error) {
     workshopActionError.value = true;
     workshopActionMessage.value = error instanceof Error ? error.message : "Mod 安装失败。";
+  }
+}
+
+function compareVersions(left: string, right: string): number {
+  const a = left.split(/[.+-]/).map((part) => Number(part) || 0);
+  const b = right.split(/[.+-]/).map((part) => Number(part) || 0);
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const delta = (a[index] ?? 0) - (b[index] ?? 0);
+    if (delta) return Math.sign(delta);
+  }
+  return 0;
+}
+
+async function requestSubscribedModUpdates(entries: readonly import("./workshop-client").WorkshopTerrainModSummary[]): Promise<void> {
+  try {
+    if (!await shouldCheckModUpdates()) return;
+    const subscriptions = await loadModSubscriptions();
+    const latest = new Map<string, string>();
+    for (const entry of entries) {
+      if (!latest.has(entry.modId) || compareVersions(entry.version, latest.get(entry.modId)!) > 0) latest.set(entry.modId, entry.version);
+    }
+    const installedVersions = new Map(installedTerrainMods.map((mod) => [mod.id, mod.version]));
+    for (const subscription of subscriptions) {
+      const version = latest.get(subscription.id);
+      if (version && compareVersions(version, installedVersions.get(subscription.id) ?? subscription.installedVersion) > 0) {
+        const entry = entries.find((candidate) => candidate.modId === subscription.id && candidate.version === version);
+        if (entry) workshopClient?.requestDetail("terrain-mod", entry.id);
+      }
+    }
+    await markModUpdateCheck();
+  } catch (error) {
+    logConnection("mods.update-check.failed", { message: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function autoUpdateSubscribedMod(definition: import("@numeral-lord/content-schema").TerrainModDefinition): Promise<void> {
+  try {
+    const subscriptions = await loadModSubscriptions();
+    if (!subscriptions.some((entry) => entry.id === definition.id)) return;
+    const current = installedTerrainMods.find((mod) => mod.id === definition.id)?.version;
+    if (current && compareVersions(definition.version, current) <= 0) return;
+    await updateSubscribedMod(definition);
+    await installTerrainModObject(definition);
+    logConnection("mods.updated", { modId: definition.id, version: definition.version });
+    remoteTerrainMods.value = remoteTerrainMods.value.map((entry) => entry.modId === definition.id
+      ? { ...entry, installed: true } : entry);
+  } catch (error) {
+    logConnection("mods.update.failed", { modId: definition.id, message: error instanceof Error ? error.message : String(error) });
   }
 }
 
@@ -839,6 +896,19 @@ function addConfiguredMap(rawCode: string): void {
     mapLibraryRef.value?.clearCodeDraft();
   } catch (error) {
     mapActionMessage.value = error instanceof Error ? error.message : "地图码无法导入。";
+    mapActionError.value = true;
+  }
+}
+
+function saveConfiguredMap(definition: import("@numeral-lord/core-content").MapDefinition): void {
+  try {
+    const next = saveMapToLibrary(configuredMaps.value, serializeMapCode(definition, { ...installedMapCatalogs, allowUnknownTerrainMods: true }));
+    configuredMaps.value = next;
+    selectedMapLibraryId.value = definition.id;
+    mapActionMessage.value = `「${definition.name}」已保存到当前浏览器。`;
+    mapActionError.value = false;
+  } catch (error) {
+    mapActionMessage.value = error instanceof Error ? error.message : "地图无法保存。";
     mapActionError.value = true;
   }
 }
@@ -1337,6 +1407,11 @@ onMounted(async () => {
   try {
     await hydrateInstalledTerrainMods();
     logConnection("mods.hydrated", { count: installedTerrainMods.length });
+    if ((await loadModSubscriptions()).length) {
+      ensureWorkshopClient();
+      const name = playerName.value.trim().slice(0, 24) || randomPlayerName();
+      void workshopClient?.connect({ name });
+    }
   } catch (error) {
     logConnection("mods.hydrate-failed", { message: String(error).slice(0, 250) });
     notice.value = "本地 Mod 缓存读取失败；内置内容仍可使用。";
@@ -1407,6 +1482,7 @@ onBeforeUnmount(() => {
       @back="requestHome"
       @select="selectedMapLibraryId = $event"
       @add="addConfiguredMap"
+      @save="saveConfiguredMap"
       @remove="removeConfiguredMap"
     />
 

@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
+import { reactive } from "vue";
 import { DEFAULT_MAP_CODE, createMatchFromMapCode } from "@numeral-lord/core-content";
 import { installedMapCatalogs } from "./installed-content.js";
 import { toNetworkPayload } from "./network-payload.js";
 
 describe("Colyseus network payload normalization", () => {
   it("converts null-prototype Mod settings throughout a game snapshot", () => {
-    const game = createMatchFromMapCode(DEFAULT_MAP_CODE, installedMapCatalogs);
+    const game = reactive(createMatchFromMapCode(DEFAULT_MAP_CODE, installedMapCatalogs));
     expect(Object.getPrototypeOf(game.settings.modSettings)).toBeNull();
+    expect(() => game.settings.modSettings?.hasOwnProperty("mod/oil-field"))
+      .toThrow(/hasOwnProperty is not a function/);
 
     const payload = toNetworkPayload({ state: game, clock: { startedAtEpochMs: 1 } });
 

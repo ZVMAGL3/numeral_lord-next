@@ -491,7 +491,7 @@ describe("core turn rules", () => {
     expect(result.events.some((event) => event.type === "unit-counterattacked")).toBe(false);
   });
 
-  it("matches legacy failed-defense combat: defender loses strength, counters once, and kills attacker", () => {
+  it("matches the legacy 5-vs-7 powered attack: attack with 4, lose to 7 counter, and clear the source", () => {
     const state = fixture();
     const attackerId = id("p1-scout");
     const defenderId = id("p2-home");
@@ -510,8 +510,8 @@ describe("core turn rules", () => {
       },
       units: {
         ...state.units,
-        [attackerId]: { ...state.units[attackerId]!, strength: 3 },
-        [defenderId]: { ...state.units[defenderId]!, cellId: targetCell, strength: 3 }
+        [attackerId]: { ...state.units[attackerId]!, strength: 5 },
+        [defenderId]: { ...state.units[defenderId]!, cellId: targetCell, strength: 7 }
       }
     };
     expect(getPoweredUnitIds(battleState, terrains).has(attackerId)).toBe(true);
@@ -522,7 +522,8 @@ describe("core turn rules", () => {
     expect(result.accepted).toBe(true);
     if (!result.accepted) return;
     expect(result.state.units[attackerId]).toBeUndefined();
-    expect(result.state.units[defenderId]?.strength).toBe(1);
+    expect(result.state.cells[toCellId({ column: 1, row: 1 })]?.unitId).toBeUndefined();
+    expect(result.state.units[defenderId]?.strength).toBe(3);
     expect(result.state.turn.counterattacksUsed[defenderId]).toBe(1);
     expect(canCounterattack(result.state, defenderId, terrains, unitCatalog)).toBe(false);
     expect(result.events.map((event) => event.type)).toContain("unit-counterattacked");
@@ -627,6 +628,8 @@ describe("core turn rules", () => {
     if (!result.accepted) return;
     const arrivedUnitId = result.state.cells[targetCell]?.unitId;
     expect(arrivedUnitId).toBeDefined();
+    expect(result.state.cells[toCellId({ column: 1, row: 1 })]?.unitId).toBe(id("p1-scout"));
+    expect(result.state.units[id("p1-scout")]?.strength).toBe(1);
     expect(result.state.turn.exhaustedUnitIds).not.toContain(arrivedUnitId);
     expect(result.state.units[arrivedUnitId!]?.strength).toBe(3);
   });

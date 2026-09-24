@@ -221,6 +221,8 @@ const lobbyPreviewState = computed(() => {
 const lobbyPreviewPoweredUnitIds = computed(() => lobbyPreviewState.value
   ? [...getPoweredUnitIds(lobbyPreviewState.value, installedTerrainCatalog)] : []);
 const selectedUnitId = ref<UnitId | null>(null);
+/** Ephemeral room-wide board focus; never written into GameState or notation. */
+const boardPreviewUnitId = ref<UnitId | null>(null);
 /** Cell captured at selection time; notation never infers an attacker from a later click. */
 const selectedSourceCellId = ref<CellId | null>(null);
 /** Only a real user selection can contribute a source-coordinate click to notation. */
@@ -270,6 +272,9 @@ const matchResultTitle = computed(() => game.value.result?.winningTeamIds.length
   : "对局结束");
 const matchResultMessage = computed(() => game.value.result?.message ?? "胜负条件已满足，本局结束。");
 const selectedUnit = computed(() => selectedUnitId.value ? game.value.units[selectedUnitId.value] : undefined);
+const boardPreviewUnit = computed(() => boardPreviewUnitId.value
+  ? game.value.units[boardPreviewUnitId.value]
+  : undefined);
 const poweredUnitIds = computed(() => [...getPoweredUnitIds(game.value, installedTerrainCatalog)]);
 const actionableUnitIds = computed(() => [...getActionableUnitIds(game.value, installedTerrainCatalog, coreUnitCatalog)]);
 const selectedIsPowered = computed(() => selectedUnit.value ? poweredUnitIds.value.includes(selectedUnit.value.id) : false);
@@ -302,17 +307,26 @@ const matchClockLabel = computed(() => isMatchFinished.value
 const notationTuples = computed(() => notation.value.map((entry) => entry.tuple));
 const notationText = computed(() => JSON.stringify(notationTuples.value));
 const latestContinuation = computed(() => [...notation.value].reverse().find((entry) => entry.continuation)?.continuation);
-/** Blue cells are valid actions for the local selection; defense frames are
- * derived from the shared match state so both clients see the same readiness. */
-const legalActionCellIds = computed<readonly CellId[]>(() => selectedUnit.value
+/** Local command validation stays local even though its visual preview is shared. */
+const localLegalActionCellIds = computed<readonly CellId[]>(() => selectedUnit.value
   ? getLegalActionDestinationIds(game.value, selectedUnit.value.id, installedTerrainCatalog, coreUnitCatalog)
   : []);
-const counterattackCellIds = computed<readonly CellId[]>(() => Object.values(game.value.units)
-  .filter((unit) => canCounterattack(game.value, unit.id, installedTerrainCatalog, coreUnitCatalog))
-  .map((unit) => unit.cellId));
-const noCounterattackCellIds = computed<readonly CellId[]>(() => Object.values(game.value.units)
-  .filter((unit) => !canCounterattack(game.value, unit.id, installedTerrainCatalog, coreUnitCatalog))
-  .map((unit) => unit.cellId));
+/** Legal cells follow the focused attacker on every room client, including the host. */
+const legalActionCellIds = computed<readonly CellId[]>(() => {
+  const unit = boardPreviewUnit.value;
+  if (!unit || !isActionPhase.value || unit.ownerId !== currentPlayer.value?.id
+    || game.value.turn.exhaustedUnitIds.includes(unit.id)) return [];
+  return getLegalActionDestinationIds(game.value, unit.id, installedTerrainCatalog, coreUnitCatalog);
+});
+/** Only occupied legal destinations are attack targets; do not frame every unit globally. */
+const counterattackCellIds = computed<readonly CellId[]>(() => legalActionCellIds.value.filter((cellId) => {
+  const targetId = game.value.cells[cellId]?.unitId;
+  return Boolean(targetId && canCounterattack(game.value, targetId, installedTerrainCatalog, coreUnitCatalog));
+}));
+const noCounterattackCellIds = computed<readonly CellId[]>(() => legalActionCellIds.value.filter((cellId) => {
+  const targetId = game.value.cells[cellId]?.unitId;
+  return Boolean(targetId && !canCounterattack(game.value, targetId, installedTerrainCatalog, coreUnitCatalog));
+}));
 
 function resolveRelayEndpoint(): string {
   // A query override keeps the static preview deployable without bundling a
@@ -354,6 +368,14 @@ function broadcastSnapshot(resolution?: {
       notice.value = "棋盘同步失败，已记录错误；请复制连接日志。";
       console.error("PvP snapshot encoding failed", error);
     }
+  }
+}
+
+/** Publish only transient selection feedback so all room clients render the same targets. */
+function publishBoardSelection(unitId: UnitId | null): void {
+  boardPreviewUnitId.value = unitId;
+  if (relayRoom && lobbyState.value.phase === "playing") {
+    relayRoom.send("board-selection", { unitId });
   }
 }
 
@@ -488,6 +510,13 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string, r
           ? "房主已结束对局，全员返回准备房间。请重新准备。"
           : "选择参战位置并准备；只要参战玩家全部准备即可开始。";
       }
+    });
+    room.onMessage("board-selection", (payload: { unitId?: unknown }) => {
+      const unitId = typeof payload.unitId === "string" && payload.unitId in game.value.units
+        ? payload.unitId as UnitId
+        : null;
+      boardPreviewUnitId.value = unitId;
+      logConnection("board.selection-received", { unitId });
     });
     room.onMessage("lobby-error", (payload: { message?: string }) => {
       lobbyError.value = payload.message ?? "房间设置没有生效。";
@@ -637,6 +666,7 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string, r
       relayStatus.value = "连接已断开";
       relayRoom = undefined;
       relayRoomId.value = "";
+      boardPreviewUnitId.value = null;
       relayPlayerId.value = null;
       relayAccountId.value = null;
       relaySessionId.value = null;
@@ -947,7 +977,7 @@ function onCellClick(cellId: CellId): void {
   // With friendly fire enabled B may also be a legal attack target, so mixing
   // "switch selection" and "attack target" in one click is ambiguous. The
   // player must first cancel on a non-target cell, then explicitly select B.
-  if (!legalActionCellIds.value.includes(cellId)) {
+  if (!localLegalActionCellIds.value.includes(cellId)) {
     clearSelection();
     return;
   }
@@ -973,9 +1003,7 @@ function onCellClick(cellId: CellId): void {
 }
 
 function clearSelection(): void {
-  selectedUnitId.value = null;
-  selectedSourceCellId.value = null;
-  selectedByUser.value = false;
+  clearSelectionSilently();
   notice.value = "已取消选择。";
 }
 
@@ -998,6 +1026,7 @@ function selectOwnUnit(unitId: UnitId | null): void {
   selectedUnitId.value = unit.id;
   selectedSourceCellId.value = unit.cellId;
   selectedByUser.value = true;
+  publishBoardSelection(unit.id);
   notice.value = poweredUnitIds.value.includes(unit.id)
     ? "通电兵已选中：移动时会在原格留下 1 点。"
     : "游兵已选中：行动后点数减 1；原本只有 1 点时，本回合将失去行动力。";
@@ -1185,6 +1214,7 @@ function continueActionAt(unitId: UnitId | null): void {
   selectedUnitId.value = unitId;
   selectedSourceCellId.value = game.value.units[unitId]?.cellId ?? null;
   selectedByUser.value = false;
+  publishBoardSelection(unitId);
   notice.value = "行动完成；该单位仍可行动，已自动继续选中。";
 }
 
@@ -1192,6 +1222,7 @@ function clearSelectionSilently(): void {
   selectedUnitId.value = null;
   selectedSourceCellId.value = null;
   selectedByUser.value = false;
+  publishBoardSelection(null);
 }
 
 /** Selections are intentionally deferred until a move or attack succeeds. */
@@ -1464,7 +1495,7 @@ onBeforeUnmount(() => {
       <section class="board-wrap">
         <HexBoard
           :state="game"
-          :selected-unit-id="selectedUnitId"
+          :selected-unit-id="boardPreviewUnitId"
           :legal-action-cell-ids="legalActionCellIds"
           :counterattack-cell-ids="counterattackCellIds"
           :no-counterattack-cell-ids="noCounterattackCellIds"

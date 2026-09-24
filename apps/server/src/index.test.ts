@@ -360,6 +360,45 @@ describe("PvpRelayRoom lobby contract", () => {
     expect(lastSent<{ state: { sequence: number } }>(player, "host-snapshot").state.sequence).toBe(8);
   });
 
+  it("relays only the active participant's ephemeral attacker selection and clears it on board updates", () => {
+    const room = createRoom(2);
+    const host = join(room, "host");
+    const peer = join(room, "peer");
+    room.receive("lobby-ready", host, { ready: true });
+    room.receive("lobby-ready", peer, { ready: true });
+    const state = createMatchFromMapCode(DEFAULT_MAP_CODE, installedMapCatalogs);
+    room.receive("host-snapshot", host, { state });
+
+    const active = state.turn.currentPlayerId === "player-1" ? host : peer;
+    const inactive = active === host ? peer : host;
+    const activePlayerId = state.turn.currentPlayerId;
+    const attacker = Object.values(state.units).find((unit) => unit.ownerId === activePlayerId);
+    expect(attacker).toBeDefined();
+    if (!attacker) return;
+
+    room.broadcasts.length = 0;
+    room.receive("board-selection", inactive, { unitId: attacker.id });
+    expect(room.broadcasts.some((event) => event.type === "board-selection")).toBe(false);
+
+    room.receive("board-selection", active, { unitId: attacker.id });
+    expect(lastBroadcast<{ unitId: string; sessionId: string }>(room, "board-selection")).toEqual({
+      sessionId: active.sessionId,
+      unitId: attacker.id
+    });
+    expect(inactive.sent.some((event) => event.type === "board-selection")).toBe(true);
+
+    room.broadcasts.length = 0;
+    room.receive("board-selection", inactive, { unitId: null });
+    expect(room.broadcasts.some((event) => event.type === "board-selection")).toBe(false);
+    room.receive("board-selection", active, { unitId: null });
+    expect(lastBroadcast<{ unitId: null }>(room, "board-selection")).toEqual({ unitId: null });
+
+    room.receive("board-selection", active, { unitId: attacker.id });
+    room.broadcasts.length = 0;
+    room.receive("host-snapshot", host, { state: { ...state, sequence: state.sequence + 1 } });
+    expect(lastBroadcast<{ unitId: null }>(room, "board-selection")).toEqual({ unitId: null });
+  });
+
   it("requests a missing initial host snapshot without replaying match-start", () => {
     const room = createRoom(2);
     const host = join(room, "host");

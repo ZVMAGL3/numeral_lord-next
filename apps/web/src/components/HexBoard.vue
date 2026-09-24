@@ -7,9 +7,9 @@ const props = defineProps<{
   state: GameState;
   selectedUnitId: UnitId | null;
   legalActionCellIds: readonly CellId[];
-  /** Enemy attack targets with an available reaction this action phase. */
+  /** Occupied legal attack targets with an available reaction. */
   counterattackCellIds?: readonly CellId[];
-  /** Enemy attack targets that cannot react (capability, limit, or exhausted). */
+  /** Occupied legal attack targets that cannot react (capability, limit, or exhausted). */
   noCounterattackCellIds?: readonly CellId[];
   actionableUnitIds: readonly UnitId[];
   poweredUnitIds: readonly UnitId[];
@@ -192,8 +192,8 @@ function draw(): void {
       addLegacySprite(legacyTextureUrls.stronghold, x, y, radius, 0.98);
     }
 
-    // Defense readiness is shared board information, not local selection
-    // feedback. Draw it above both terrain and unit artwork on every client.
+    // Counterattack readiness is shown only on this selected attacker's legal
+    // occupied destinations, and is shared so every room client sees the same.
     if (unit && (counterattackCells.value.has(cell.id) || noCounterattackCells.value.has(cell.id))) {
       const canReact = counterattackCells.value.has(cell.id);
       const defenseFrame = new Graphics().poly(hexagon(x, y, radius * 0.98))

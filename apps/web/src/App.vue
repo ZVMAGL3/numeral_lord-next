@@ -196,6 +196,7 @@ const matchClock = ref<MatchClockSnapshot | null>(null);
 let clockTimer: ReturnType<typeof setInterval> | undefined;
 let expiredStepSequence: number | null = null;
 let lastSnapshotSyncAt = 0;
+let lastSnapshotCheckAt = 0;
 const initialMapPlayerCount = DEFAULT_MAP_DEFINITION.players;
 const lobbyState = ref<LobbyRoomState>({
   phase: "lobby",
@@ -354,6 +355,12 @@ function submitRemoteCommand(command: GameCommand): boolean {
       };
     }
   }
+  logConnection("intent.sent", {
+    commandId: command.commandId,
+    commandType: command.type,
+    expectedSequence: command.expectedSequence,
+    actorId: command.actorId
+  });
   relayRoom.send("player-intent", { playerId: relayPlayerId.value, command });
   notice.value = "操作已发送给房主，等待权威棋盘同步。";
   clearSelectionSilently();
@@ -471,6 +478,23 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string, r
       notice.value = lobbyError.value;
       logConnection("room.error", { message: lobbyError.value.slice(0, 250) });
     });
+    room.onMessage("intent-rejected", (payload: { commandId?: string; reason?: string }) => {
+      logConnection("intent.rejected-relay", { commandId: payload.commandId, reason: payload.reason });
+      if (pendingRemoteAction && (!payload.commandId || payload.commandId === pendingRemoteAction.commandId)) {
+        pendingRemoteAction = undefined;
+      }
+      lastSnapshotSyncAt = 0;
+      relayRoom?.send("room-sync", {});
+      notice.value = "服务器未能转发这次行动，正在重新同步棋盘；请确认轮到自己后重试。";
+    });
+    room.onMessage("snapshot-rejected", (payload: { reason?: string }) => {
+      logConnection("snapshot.rejected-relay", {
+        reason: payload.reason,
+        sequence: game.value.sequence,
+        host: relayIsHost.value
+      });
+      if (relayIsHost.value) relayRoom?.send("room-sync", {});
+    });
     room.onMessage("match-start", (payload: MatchStartPayload) => {
       logConnection("match.start", { assignments: payload.assignments.length, roomId: room.roomId });
       startLobbyMatch(payload);
@@ -498,6 +522,13 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string, r
     });
     room.onMessage("player-intent", (payload: { playerId?: string; command?: GameCommand }) => {
       if (!relayIsHost.value || !payload.command) return;
+      logConnection("intent.received", {
+        commandId: payload.command.commandId,
+        commandType: payload.command.type,
+        expectedSequence: payload.command.expectedSequence,
+        actorId: payload.command.actorId,
+        sequence: game.value.sequence
+      });
       tickClocks();
       const active = currentPlayer.value;
       if (!active || payload.command.actorId !== active.id) {
@@ -528,6 +559,15 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string, r
       handoff?: boolean;
     }) => {
       if (!payload.state || (relayIsHost.value && payload.handoff !== true)) return;
+      if (payload.state.sequence < game.value.sequence) {
+        logConnection("snapshot.ignored-stale", {
+          sequence: payload.state.sequence,
+          currentSequence: game.value.sequence,
+          handoff: payload.handoff === true
+        });
+        if (relayIsHost.value && payload.handoff) broadcastSnapshot();
+        return;
+      }
       if (missingLocalModIds.value.length > 0) {
         logConnection("snapshot.missing-mods", { missingModIds: missingLocalModIds.value });
         notice.value = `当前设备缺少地块 Mod：${missingLocalModIds.value.join("、")}。安装后才能进入对局。`;
@@ -541,10 +581,6 @@ async function connectRelay(mode: "create" | "join", requestedRoomId?: string, r
       });
       // A promoted/reconnected host must adopt the server's last accepted
       // snapshot before it starts broadcasting. Ordinary echoes are ignored.
-      if (payload.handoff && hasLiveSnapshot.value && payload.state.sequence < game.value.sequence) {
-        if (relayIsHost.value) broadcastSnapshot();
-        return;
-      }
       game.value = payload.state;
       hasLiveSnapshot.value = true;
       lastSnapshotSyncAt = 0;
@@ -1225,6 +1261,14 @@ function tickClocks(): void {
     logConnection("snapshot.sync-request", { roomId: relayRoom.roomId, initial: false, sequence: game.value.sequence });
     relayRoom.send("room-sync", {});
     lastSnapshotSyncAt = clockNow.value;
+  }
+  // Reconcile missed updates with a tiny sequence check. The relay only sends
+  // the full cached board when this client is actually behind.
+  if (relayRoom && lobbyState.value.phase === "playing" && hasLiveSnapshot.value
+    && !relayIsHost.value && clockNow.value - lastSnapshotCheckAt >= 3_000) {
+    relayRoom.send("snapshot-check", { sequence: game.value.sequence });
+    lastSnapshotCheckAt = clockNow.value;
+    logConnection("snapshot.check", { sequence: game.value.sequence });
   }
   if (!relayRoom || !relayIsHost.value || lobbyState.value.phase !== "playing" || isMatchFinished.value) return;
   const expiration = clockExpiration(matchClock.value, game.value.turn.phase, lobbyState.value.settings, clockNow.value);

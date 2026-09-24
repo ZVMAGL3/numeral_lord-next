@@ -117,24 +117,92 @@ export class PvpRelayRoom extends RelayRoom {
     this.onMessage("player-intent", (client, payload: Record<string, unknown> = {}) => {
       const member = this.members.get(client.sessionId);
       if (this.phase !== "playing" || this.authoritativeHostSessionId !== this.hostSessionId
-        || !member?.participating || member.seat === null) return;
+        || !member?.participating || member.seat === null) {
+        const commandId = isRecord(payload.command) && typeof payload.command.commandId === "string"
+          ? payload.command.commandId
+          : undefined;
+        console.warn("PvP intent rejected by relay", {
+          roomId: this.roomId,
+          sessionId: client.sessionId,
+          phase: this.phase,
+          isAuthoritativeHost: this.authoritativeHostSessionId === this.hostSessionId,
+          participating: member?.participating ?? false,
+          seat: member?.seat ?? null,
+          commandId
+        });
+        client.send("intent-rejected", { commandId, reason: "room-not-ready-or-player-ineligible" });
+        return;
+      }
       const playerId = playerIdForSeat(member.seat);
       const command = isRecord(payload.command)
         ? { ...payload.command, actorId: playerId }
         : payload.command;
+      console.info("PvP intent relayed", {
+        roomId: this.roomId,
+        sessionId: client.sessionId,
+        seat: member.seat,
+        playerId,
+        commandType: isRecord(command) ? command.type : typeof command,
+        commandId: isRecord(command) ? command.commandId : undefined,
+        expectedSequence: isRecord(command) ? command.expectedSequence : undefined,
+        hostSessionId: this.hostSessionId
+      });
       this.broadcast("player-intent", { ...payload, command, playerId }, { except: client });
     });
     this.onMessage("host-snapshot", (client, payload: Record<string, unknown> = {}) => {
-      if (this.phase !== "playing" || client.sessionId !== this.hostSessionId
-        || client.sessionId !== this.authoritativeHostSessionId) return;
+      if (this.phase !== "playing" || client.sessionId !== this.hostSessionId) return;
+      if (client.sessionId !== this.authoritativeHostSessionId) {
+        console.warn("PvP host snapshot rejected: host is not authoritative", {
+          roomId: this.roomId,
+          sessionId: client.sessionId,
+          authoritativeHostSessionId: this.authoritativeHostSessionId
+        });
+        client.send("snapshot-rejected", { reason: "host-not-authoritative" });
+        return;
+      }
       const receivedAtEpochMs = Date.now();
       const snapshot = this.validateSnapshot(payload, receivedAtEpochMs);
-      if (!snapshot) return;
+      if (!snapshot) {
+        console.warn("PvP host snapshot ignored", {
+          roomId: this.roomId,
+          sessionId: client.sessionId,
+          receivedSequence: isRecord(payload.state) ? payload.state.sequence : undefined,
+          cachedSequence: this.latestHostSnapshot?.sequence,
+          reason: "invalid-or-stale"
+        });
+        return;
+      }
+      const previousSequence = this.latestHostSnapshot?.sequence;
       this.latestHostSnapshot = snapshot;
+      if (previousSequence !== snapshot.sequence || typeof payload.resolvedCommandId === "string") {
+        console.info("PvP host snapshot accepted", {
+          roomId: this.roomId,
+          sessionId: client.sessionId,
+          previousSequence: previousSequence ?? null,
+          sequence: snapshot.sequence,
+          resolvedCommandId: typeof payload.resolvedCommandId === "string" ? payload.resolvedCommandId : undefined
+        });
+      }
       this.broadcast("host-snapshot", {
         ...snapshot.payload,
         serverSentAtEpochMs: receivedAtEpochMs
       }, { except: client });
+    });
+    this.onMessage("snapshot-check", (client, payload: Record<string, unknown> = {}) => {
+      if (this.phase !== "playing" || !this.members.has(client.sessionId)
+        || client.sessionId === this.hostSessionId) return;
+      const clientSequence = payload.sequence;
+      if (typeof clientSequence !== "number" || !Number.isSafeInteger(clientSequence) || clientSequence < 0) return;
+      if (!this.latestHostSnapshot) {
+        this.sendMatchStart(client);
+        this.requestHostSnapshot(client.sessionId);
+      } else if (clientSequence < this.latestHostSnapshot.sequence) {
+        this.sendCachedSnapshot(client);
+      } else if (clientSequence > this.latestHostSnapshot.sequence) {
+        // The cached relay copy can lag only during host handoff or a missed
+        // publication. Ask the authority to refresh it; never roll the client back.
+        this.requestHostSnapshot(client.sessionId);
+      }
     });
     this.onMessage("lobby-ready", (client, payload: Record<string, unknown> = {}) => {
       const member = this.members.get(client.sessionId);

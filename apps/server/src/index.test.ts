@@ -345,6 +345,21 @@ describe("PvpRelayRoom lobby contract", () => {
     });
   });
 
+  it("sends the cached board only when a client's sequence check shows it is behind", () => {
+    const room = createRoom(2);
+    const host = join(room, "host");
+    room.receive("lobby-ready", host, { ready: true });
+    room.receive("host-snapshot", host, { state: { sequence: 8 } });
+    const player = join(room, "player");
+    player.sent.length = 0;
+
+    room.receive("snapshot-check", player, { sequence: 8 });
+    expect(player.sent.some((event) => event.type === "host-snapshot")).toBe(false);
+
+    room.receive("snapshot-check", player, { sequence: 7 });
+    expect(lastSent<{ state: { sequence: number } }>(player, "host-snapshot").state.sequence).toBe(8);
+  });
+
   it("recognizes a refreshed account and preserves its seat without a duplicate spectator", () => {
     const room = createRoom(2);
     const original = join(room, "old", "棋手", "stable-account");

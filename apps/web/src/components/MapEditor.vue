@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import type { MapDefinition } from "@numeral-lord/core-content";
-import { installedTerrainMods } from "../installed-content";
+import { getPoweredUnitIds, fromCellId, type CellId } from "@numeral-lord/game-core";
+import { createMatchFromMapDefinition } from "@numeral-lord/core-content";
+import HexBoard from "./HexBoard.vue";
+import { installedMapCatalogs, installedTerrainMods } from "../installed-content";
 
 const props = defineProps<{ initial?: MapDefinition | null }>();
 const emit = defineEmits<{ save: [definition: MapDefinition]; cancel: [] }>();
@@ -52,17 +55,43 @@ watch(players, (value) => {
   teams.value = Array.from({ length: value }, (_, i) => teams.value[i] ?? i + 1);
   soldiers.value = soldiers.value.filter((u) => u.seat <= value);
 });
-const radius = computed(() => Math.min(30, 720 / (Math.sqrt(3) * (width.value + .5)), 560 / (1.5 * (height.value - 1) + 2)));
-const boardMetrics = computed(() => {
-  const r = radius.value, w = Math.sqrt(3) * r * (width.value + .5), h = 2 * r + 1.5 * r * (height.value - 1);
-  return { viewBox: `0 0 ${w + r} ${h + 2 * r}`, r, offsetX: r + (w - Math.sqrt(3) * r * width.value) / 2, offsetY: r };
+const previewDefinition = computed<MapDefinition>(() => {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const legend: Record<string, string> = {}, terrainSymbols = new Map<string, string>();
+  const terrainCode = terrain.value.map((terrainId) => {
+    let symbol = terrainSymbols.get(terrainId);
+    if (!symbol) {
+      symbol = alphabet[terrainSymbols.size] ?? "A";
+      terrainSymbols.set(terrainId, symbol);
+      legend[symbol] = terrainId;
+    }
+    return symbol;
+  }).join("");
+  return {
+    version: 1,
+    id: props.initial?.id ?? "map-editor-preview",
+    name: name.value || "地图预览",
+    columns: width.value,
+    terrain: terrainCode,
+    terrainLegend: legend,
+    requiredTerrainModIds: [...new Set(terrain.value.map((terrainId) => terrainLookup.value.get(terrainId)?.modId).filter((id): id is string => Boolean(id)))],
+    ...(props.initial?.modSettings ? { modSettings: props.initial.modSettings } : {}),
+    ...(props.initial?.cellLinks ? { cellLinks: props.initial.cellLinks } : {}),
+    players: players.value,
+    soldiers: soldiers.value.map(({ index, seat, strength }) => [index, seat, strength] as const),
+    ...(specialUnits.value.length ? { specialUnits: specialUnits.value.map(({ index, kind, strength }) => [index, kind, strength] as const) } : {}),
+    teams: teams.value,
+    matchConditionIds: []
+  };
 });
-const cells = computed(() => terrain.value.map((id, index) => {
-  const row = Math.floor(index / width.value), column = index % width.value, { r, offsetX, offsetY } = boardMetrics.value;
-  const x = offsetX + Math.sqrt(3) * r * (column + ((row + 1) % 2) * .5), y = offsetY + 1.5 * r * row;
-  const points = Array.from({ length: 6 }, (_, n) => `${x + r * Math.cos(Math.PI / 180 * (60 * n - 30))},${y + r * Math.sin(Math.PI / 180 * (60 * n - 30))}`).join(" ");
-  return { index, x, y, points, terrain: terrainLookup.value.get(id), soldier: soldiers.value.find((u) => u.index === index), special: specialUnits.value.find((u) => u.index === index) };
-}));
+const previewState = computed(() => createMatchFromMapDefinition(previewDefinition.value, installedMapCatalogs));
+const previewPoweredUnitIds = computed(() => [...getPoweredUnitIds(previewState.value, installedMapCatalogs.terrains)]);
+
+function paintCellId(cellId: CellId): void {
+  const { column, row } = fromCellId(cellId);
+  const index = row * width.value + column;
+  if (index >= 0 && index < terrain.value.length) paintCell(index);
+}
 function paintCell(index: number): void {
   if (performance.now() - editorDraggingAt < 220) return;
   if (placementMode.value === "terrain") {
@@ -86,7 +115,8 @@ function paintCell(index: number): void {
 }
 function onEditorPointerDown(event: PointerEvent): void {
   editorPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-  (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
+  // Leave pointer ownership with the Pixi canvas as well so its cell tap can
+  // be delivered while this wrapper tracks pan and pinch gestures.
   if (editorPointers.size === 1) editorDrag = { x: event.clientX, y: event.clientY, panX: editorPan.value.x, panY: editorPan.value.y };
   else if (editorPointers.size === 2) {
     const [a, b] = [...editorPointers.values()];
@@ -145,16 +175,10 @@ function createId(): string { return typeof crypto.randomUUID === "function" ? c
   <section class="editor-shell">
     <header class="editor-head"><div><p class="eyebrow">MAP EDITOR</p><h2>{{ initial ? '编辑地图' : '创建地图' }}</h2><p>地图铺展在工作区；绘制工具和规则设置固定在侧栏。</p></div><button class="quiet-button" @click="emit('cancel')">返回地图库</button></header>
     <div class="editor-layout">
-      <div class="board-workspace" :style="{ '--columns': width, '--rows': height }" @pointerdown="onEditorPointerDown" @pointermove="onEditorPointerMove" @pointerup="onEditorPointerUp" @pointercancel="onEditorPointerUp" @wheel.prevent="onEditorWheel">
-        <svg class="editor-board" :style="{ transform: `translate(${editorPan.x}px, ${editorPan.y}px) scale(${editorZoom})` }" :viewBox="boardMetrics.viewBox" role="img" aria-label="六边形地图编辑棋盘">
-          <g v-for="cell in cells" :key="cell.index" class="hex-cell" @click="paintCell(cell.index)">
-            <polygon :points="cell.points" :fill="cell.terrain?.color ?? '#63985d'" :class="{ blocked: cell.terrain?.blocked }" />
-            <polygon v-if="cell.terrain?.id === 'core/ocean'" :points="cell.points" class="water-mark" />
-            <g v-if="cell.soldier" class="unit-marker" :transform="`translate(${cell.x} ${cell.y})`"><polygon :points="`0,${-boardMetrics.r*.62} ${boardMetrics.r*.54},${-boardMetrics.r*.31} ${boardMetrics.r*.54},${boardMetrics.r*.31} 0,${boardMetrics.r*.62} ${-boardMetrics.r*.54},${boardMetrics.r*.31} ${-boardMetrics.r*.54},${-boardMetrics.r*.31}`" :class="`seat-${cell.soldier.seat}`"/><text y="4">{{ cell.soldier.strength }}</text></g>
-            <g v-else-if="cell.special" class="unit-marker" :transform="`translate(${cell.x} ${cell.y})`"><polygon :points="`0,${-boardMetrics.r*.62} ${boardMetrics.r*.54},${-boardMetrics.r*.31} ${boardMetrics.r*.54},${boardMetrics.r*.31} 0,${boardMetrics.r*.62} ${-boardMetrics.r*.54},${boardMetrics.r*.31} ${-boardMetrics.r*.54},${-boardMetrics.r*.31}`" :class="cell.special.kind"/><text y="4">{{ cell.special.kind === 'wild' ? '野' : '挡' }}</text><text class="unit-strength" :y="boardMetrics.r*.56">{{ cell.special.strength }}</text></g>
-            <text v-else-if="cell.terrain?.blocked" class="blocked-mark" :x="cell.x" :y="cell.y + 4">×</text>
-          </g>
-        </svg>
+      <div class="board-workspace" @pointerdown="onEditorPointerDown" @pointermove="onEditorPointerMove" @pointerup="onEditorPointerUp" @pointercancel="onEditorPointerUp" @wheel.prevent="onEditorWheel">
+        <div class="editor-board" :style="{ transform: `translate(${editorPan.x}px, ${editorPan.y}px) scale(${editorZoom})` }">
+          <HexBoard preview editable :state="previewState" :selected-unit-id="null" :legal-action-cell-ids="[]" :actionable-unit-ids="[]" :powered-unit-ids="previewPoweredUnitIds" @cell-click="paintCellId" />
+        </div>
         <div class="board-caption">{{ width }} × {{ height }} 格 <span>·</span> {{ soldiers.length + specialUnits.length }} 个初始单位 <span>·</span> 点击六边格应用当前工具</div>
       </div>
       <aside class="editor-tools">
@@ -174,6 +198,6 @@ function createId(): string { return typeof crypto.randomUUID === "function" ? c
 </template>
 
 <style scoped>
-.editor-shell{--ink:#e8f2f9;min-height:min(82vh,900px);padding:clamp(14px,2vw,24px);border:1px solid rgba(134,177,205,.27);border-radius:20px;background:#101723;color:var(--ink);overflow:hidden}.editor-head{position:relative;z-index:2;display:flex;justify-content:space-between;gap:16px;align-items:start;margin-bottom:12px}.eyebrow{margin:0 0 4px;color:#7de6d3;font-size:10px;font-weight:900;letter-spacing:.18em}.editor-head h2{margin:0;font-size:clamp(24px,3vw,34px)}.editor-head p:last-child{margin:5px 0 0;color:#8ba2b9;font-size:11px}.quiet-button,.save-button{width:auto;margin:0;padding:9px 13px;border:1px solid rgba(143,188,206,.32);border-radius:9px;color:#cde6f1;background:rgba(18,47,65,.76);white-space:nowrap}.editor-layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:14px;min-height:650px;height:min(74vh,800px)}.board-workspace{position:relative;display:grid;place-items:center;min-width:0;min-height:0;overflow:hidden;border-radius:13px;background-color:#0b111b;background-image:radial-gradient(ellipse at center,rgba(38,60,83,.45),transparent 70%),repeating-linear-gradient(0deg,transparent 0 17px,rgba(124,152,178,.028) 18px 19px)}.editor-board{width:100%;height:100%;padding:10px;overflow:visible}.hex-cell{cursor:pointer}.hex-cell polygon:first-child{stroke:#25344a;stroke-width:1;transition:filter .12s}.hex-cell:hover polygon:first-child{filter:brightness(1.28);stroke:#a5f5e3;stroke-width:2}.hex-cell polygon.blocked{stroke:#111b2b}.water-mark{fill:none;stroke:#72b5fb;stroke-width:2;stroke-dasharray:5 4;opacity:.32;pointer-events:none}.unit-marker{pointer-events:none}.unit-marker polygon{stroke:#b9e5ff;stroke-width:1.8}.unit-marker text{fill:white;text-anchor:middle;font-weight:900;font-size:12px;paint-order:stroke;stroke:#223044;stroke-width:2px}.unit-marker .seat-1{fill:#be5f6a}.unit-marker .seat-2{fill:#69aa57}.unit-marker .seat-3{fill:#5688cd}.unit-marker .seat-4{fill:#c4984a}.unit-marker .wild{fill:#a56d36;stroke:#f4d08d}.unit-marker .blocker{fill:#4c586d;stroke:#c2ccd9}.unit-marker .unit-strength{font-size:8px;stroke-width:1px}.blocked-mark{fill:#c5d2e1;text-anchor:middle;font-size:18px;font-weight:900;pointer-events:none}.board-caption{position:absolute;left:15px;bottom:12px;color:#90a8bd;font-size:10px}.board-caption span{padding:0 4px;color:#536a80}.editor-tools{display:flex;flex-direction:column;gap:11px;min-width:0;max-height:100%;overflow:auto;padding:14px;border:1px solid rgba(135,175,202,.24);border-radius:14px;background:rgba(10,22,35,.94)}.side-title{display:flex;justify-content:space-between;color:#e7f3fa;font-size:14px;font-weight:800}.side-title small{color:#6698b5;font-size:9px;letter-spacing:.12em}.editor-tools label{display:grid;gap:5px;color:#a9c1d2;font-size:10px}.editor-tools input,.editor-tools select{box-sizing:border-box;width:100%;min-height:36px;padding:7px;border:1px solid rgba(136,177,204,.31);border-radius:8px;background:#0c1b2b;color:#d6e8f0}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.tool-tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:5px}.tool-tabs button{margin:0;padding:8px 4px;color:#a9bdcf;background:#152b3d;font-size:10px}.tool-tabs button.active{border-color:#78dfd0;color:#cdf7ef;background:#22545b}.terrain-picker{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;max-height:190px;overflow:auto}.terrain-picker button{display:flex;align-items:center;gap:7px;margin:0;padding:7px;border:1px solid rgba(128,172,195,.2);border-radius:8px;color:#dbe9f2;background:rgba(32,59,77,.38);font-size:10px;text-align:left}.terrain-picker button.active{border-color:#74dfcf}.terrain-picker i{width:18px;height:18px;flex:none;border:1px solid rgba(255,255,255,.2);border-radius:50%}.terrain-picker small{margin-left:auto;color:#82bdbb}.unit-tools{display:grid;gap:9px}.unit-tools p,.compat-note{margin:0;color:#8fa9bc;font-size:10px;line-height:1.55}.team-settings{padding-top:8px;border-top:1px solid rgba(140,180,202,.15);color:#dcebf4;font-size:11px}.team-settings summary{cursor:pointer}.team-settings label{grid-template-columns:1fr 90px;align-items:center;margin-top:7px}.team-settings input{min-height:30px}.team-settings small{display:block;margin-top:7px;color:#8199ad}.compat-note{padding:9px;border-radius:8px;background:rgba(176,135,71,.1);color:#d8bc8d}.form-error{margin:0;color:#f2a9b4;font-size:11px}.editor-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:auto}.save-button{border:0;color:#092332;background:linear-gradient(120deg,#81e9ce,#70c9e7);font-weight:800}.save-button:hover,.quiet-button:hover{filter:brightness(1.08)}@media(max-width:900px){.editor-layout{grid-template-columns:minmax(0,1fr) 280px}}@media(max-width:720px){.editor-shell{padding:12px}.editor-head{align-items:center}.editor-head p:last-child{max-width:42ch}.editor-layout{display:flex;height:auto;min-height:0;flex-direction:column}.board-workspace{height:min(58vh,560px);min-height:320px}.editor-tools{width:auto;max-height:none}.terrain-picker{max-height:160px}}@media(max-width:480px){.editor-head{align-items:flex-start}.editor-head>button{padding:8px;font-size:10px}.board-workspace{min-height:280px}.editor-board{padding:4px}}
-.board-workspace{touch-action:none;cursor:grab}.editor-board{transform-origin:center center;transition:transform .04s linear}
+.editor-shell{--ink:#e8f2f9;min-height:min(82vh,900px);padding:clamp(14px,2vw,24px);border:1px solid rgba(134,177,205,.27);border-radius:20px;background:#101723;color:var(--ink);overflow:hidden}.editor-head{position:relative;z-index:2;display:flex;justify-content:space-between;gap:16px;align-items:start;margin-bottom:12px}.eyebrow{margin:0 0 4px;color:#7de6d3;font-size:10px;font-weight:900;letter-spacing:.18em}.editor-head h2{margin:0;font-size:clamp(24px,3vw,34px)}.editor-head p:last-child{margin:5px 0 0;color:#8ba2b9;font-size:11px}.quiet-button,.save-button{width:auto;margin:0;padding:9px 13px;border:1px solid rgba(143,188,206,.32);border-radius:9px;color:#cde6f1;background:rgba(18,47,65,.76);white-space:nowrap}.editor-layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:14px;min-height:650px;height:min(74vh,800px)}.board-workspace{position:relative;display:grid;place-items:center;min-width:0;min-height:0;overflow:hidden;border-radius:13px;background-color:#0b111b;background-image:radial-gradient(ellipse at center,rgba(38,60,83,.45),transparent 70%),repeating-linear-gradient(0deg,transparent 0 17px,rgba(124,152,178,.028) 18px 19px)}.editor-board{position:absolute;inset:0;width:100%;height:100%;transform-origin:center center;transition:transform .04s linear}.board-caption{position:absolute;left:15px;bottom:12px;color:#90a8bd;font-size:10px;pointer-events:none}.board-caption span{padding:0 4px;color:#536a80}.editor-tools{display:flex;flex-direction:column;gap:11px;min-width:0;max-height:100%;overflow:auto;padding:14px;border:1px solid rgba(135,175,202,.24);border-radius:14px;background:rgba(10,22,35,.94)}.side-title{display:flex;justify-content:space-between;color:#e7f3fa;font-size:14px;font-weight:800}.side-title small{color:#6698b5;font-size:9px;letter-spacing:.12em}.editor-tools label{display:grid;gap:5px;color:#a9c1d2;font-size:10px}.editor-tools input,.editor-tools select{box-sizing:border-box;width:100%;min-height:36px;padding:7px;border:1px solid rgba(136,177,204,.31);border-radius:8px;background:#0c1b2b;color:#d6e8f0}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.tool-tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:5px}.tool-tabs button{margin:0;padding:8px 4px;color:#a9bdcf;background:#152b3d;font-size:10px}.tool-tabs button.active{border-color:#78dfd0;color:#cdf7ef;background:#22545b}.terrain-picker{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;max-height:190px;overflow:auto}.terrain-picker button{display:flex;align-items:center;gap:7px;margin:0;padding:7px;border:1px solid rgba(128,172,195,.2);border-radius:8px;color:#dbe9f2;background:rgba(32,59,77,.38);font-size:10px;text-align:left}.terrain-picker button.active{border-color:#74dfcf}.terrain-picker i{width:18px;height:18px;flex:none;border:1px solid rgba(255,255,255,.2);border-radius:50%}.terrain-picker small{margin-left:auto;color:#82bdbb}.unit-tools{display:grid;gap:9px}.unit-tools p,.compat-note{margin:0;color:#8fa9bc;font-size:10px;line-height:1.55}.team-settings{padding-top:8px;border-top:1px solid rgba(140,180,202,.15);color:#dcebf4;font-size:11px}.team-settings summary{cursor:pointer}.team-settings label{grid-template-columns:1fr 90px;align-items:center;margin-top:7px}.team-settings input{min-height:30px}.team-settings small{display:block;margin-top:7px;color:#8199ad}.compat-note{padding:9px;border-radius:8px;background:rgba(176,135,71,.1);color:#d8bc8d}.form-error{margin:0;color:#f2a9b4;font-size:11px}.editor-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:auto}.save-button{border:0;color:#092332;background:linear-gradient(120deg,#81e9ce,#70c9e7);font-weight:800}.save-button:hover,.quiet-button:hover{filter:brightness(1.08)}@media(max-width:900px){.editor-layout{grid-template-columns:minmax(0,1fr) 280px}}@media(max-width:720px){.editor-shell{padding:12px}.editor-head{align-items:center}.editor-head p:last-child{max-width:42ch}.editor-layout{display:flex;height:auto;min-height:0;flex-direction:column}.board-workspace{height:min(58vh,560px);min-height:320px}.editor-tools{width:auto;max-height:none}.terrain-picker{max-height:160px}}@media(max-width:480px){.editor-head{align-items:flex-start}.editor-head>button{padding:8px;font-size:10px}.board-workspace{min-height:280px}}
+.board-workspace{touch-action:none;cursor:grab}.board-workspace:active{cursor:grabbing}.editor-board :deep(.board-canvas){width:100%;height:100%;min-height:0;background:transparent}.editor-board :deep(canvas){width:100%;height:100%}
 </style>

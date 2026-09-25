@@ -15,6 +15,8 @@ const props = defineProps<{
   poweredUnitIds: readonly UnitId[];
   /** Read-only compact rendering used by the lobby map preview. */
   preview?: boolean;
+  /** Use the real terrain/unit renderer while forwarding clicks to a map editor. */
+  editable?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -79,7 +81,7 @@ onMounted(async () => {
   // promise. Do not continue touching an instance already disposed below.
   if (app !== instance || !canvasHost.value) return;
   instance.stage.sortableChildren = true;
-  instance.stage.eventMode = props.preview ? "none" : "static";
+  instance.stage.eventMode = props.preview && !props.editable ? "none" : "static";
   instance.stage.hitArea = instance.screen;
   if (!props.preview) {
     instance.stage.on("pointertap", onBoardBackgroundTap);
@@ -196,8 +198,12 @@ function draw(): void {
         width: 1,
         alpha: 0.45
       });
-    if (props.preview) tile.eventMode = "none";
-    else bindCellInteraction(tile, cell.id);
+    if (props.preview && !props.editable) tile.eventMode = "none";
+    else if (props.editable) {
+      tile.eventMode = "static";
+      tile.cursor = "pointer";
+      tile.on("pointertap", () => emit("cellClick", cell.id));
+    } else bindCellInteraction(tile, cell.id);
     app.stage.addChild(tile);
 
     const isPowered = unit ? powered.value.has(unit.id) : false;
@@ -481,11 +487,12 @@ function hexagon(centerX: number, centerY: number, radius: number): number[] {
 }
 </script>
 
-<template><div ref="canvasHost" class="board-canvas" :class="{ preview }" :aria-label="preview ? '当前地图预览' : '本地战棋演示地图'" @wheel.prevent="onBoardWheel"><span v-if="!preview" class="board-gesture-hint">拖动平移 · 滚轮 / 双指缩放</span></div></template>
+<template><div ref="canvasHost" class="board-canvas" :class="{ preview, editable }" :aria-label="preview ? '当前地图预览' : '本地战棋演示地图'" @wheel.prevent="onBoardWheel"><span v-if="!preview && !editable" class="board-gesture-hint">拖动平移 · 滚轮 / 双指缩放</span></div></template>
 
 <style scoped>
 .board-canvas { position:relative; width: 100%; height: 100%; min-height: 390px; overflow: hidden; border: 1px solid rgba(160, 191, 223, .42); border-radius: 20px; background: #182638; touch-action: none; cursor: grab; }
 .board-canvas.preview { min-height: 0; border-radius: 12px; pointer-events: none; }
+.board-canvas.editable { min-height: 0; border: 0; border-radius: 0; pointer-events: auto; }
 .board-gesture-hint { position:absolute; z-index:1; top:8px; left:50%; transform:translateX(-50%); padding:4px 8px; border:1px solid rgba(147,177,207,.16); border-radius:999px; color:rgba(178,200,219,.58); background:rgba(11,20,32,.35); font-size:9px; pointer-events:none; white-space:nowrap; }
 .board-canvas.preview .board-gesture-hint { display:none; }
 .board-canvas :deep(canvas) { display: block; width: 100%; height: 100%; }

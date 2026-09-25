@@ -1613,11 +1613,11 @@ onBeforeUnmount(() => {
         <div class="panel-heading"><span>对局操作</span><small>本地即时结算 · 操作同步</small></div>
         <div class="selected-info">
           <template v-if="isMatchFinished"><small>结算完成</small><strong>{{ matchResultTitle }}</strong><span>{{ matchResultMessage }}</span></template>
-          <template v-else-if="isSpectator"><small>观战模式</small><strong>棋盘操作已锁定</strong><span>观战者会实时收到参战玩家的操作同步，但不能提交移动、攻击或加点。</span></template>
+          <template v-else-if="isSpectator"><small>观战模式</small><strong>只读观战</strong><span>棋盘实时同步中。</span></template>
           <template v-else-if="isRepairing"><small>状态校正</small><strong>正在恢复同步</strong><span>发现操作历史分叉，正在获取房主的最新棋盘。</span></template>
-          <template v-else-if="isReinforcementPhase"><small>加点回合</small><strong>剩余 {{ currentPlayer?.reinforcementPoints ?? 0 }} 点</strong><span>点击通电兵加 1 点；长按会逐渐加速，最多 3 秒投入全部点数。</span></template>
-          <template v-else-if="selectedUnit"><small>已选单位</small><strong>{{ selectedIsPowered ? "通电兵" : "游兵" }} · {{ selectedUnit.strength }} 点</strong><span>点击青色描边的相邻格移动或攻击。</span></template>
-          <template v-else><small>尚未选择单位</small><span>点击带扩散光圈的当前可行动单位。</span></template>
+          <template v-else-if="isReinforcementPhase"><small>加点</small><strong>剩余 {{ currentPlayer?.reinforcementPoints ?? 0 }} 点</strong><span>点击通电兵加点，结束后轮到下一位。</span></template>
+          <template v-else-if="selectedUnit"><small>已选单位</small><strong>{{ selectedIsPowered ? "通电兵" : "游兵" }} · {{ selectedUnit.strength }} 点</strong><span>点击高亮格移动或攻击。</span></template>
+          <template v-else><small>行动</small><span>选择棋盘上的可行动单位。</span></template>
         </div>
         <button v-if="isActionPhase" class="secondary" :disabled="!canActCurrentPlayer" @click="endActionPhase">结束行动，进入加点</button>
         <button v-else-if="isReinforcementPhase" class="primary" :disabled="!canActCurrentPlayer" @click="endReinforcementPhase">结束加点，轮到下一位</button>

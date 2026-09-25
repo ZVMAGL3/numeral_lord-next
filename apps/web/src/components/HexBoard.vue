@@ -87,6 +87,12 @@ onMounted(async () => {
   // HMR can unmount this component while Pixi or the artwork is awaiting a
   // promise. Do not continue touching an instance already disposed below.
   if (app !== instance || !canvasHost.value) return;
+  if (props.editable) {
+    // The editor's water texture is the page background; never paint an
+    // opaque rectangle behind the transparent hex board.
+    host.style.background = "transparent";
+    instance.canvas.style.background = "transparent";
+  }
   instance.stage.sortableChildren = true;
   instance.stage.eventMode = props.preview && !props.editable ? "none" : "static";
   instance.stage.hitArea = instance.screen;
@@ -519,7 +525,7 @@ function hexagon(centerX: number, centerY: number, radius: number): number[] {
 }
 </script>
 
-<template><div ref="canvasHost" class="board-canvas" :class="{ preview, editable }" :aria-label="preview ? '当前地图预览' : '本地战棋演示地图'" @wheel.prevent="onBoardWheel"><span v-if="!preview && !editable" class="board-gesture-hint">拖动平移 · 滚轮 / 双指缩放</span></div></template>
+<template><div ref="canvasHost" class="board-canvas" :class="{ preview, editable }" :style="editable ? { background: 'transparent' } : undefined" :aria-label="preview ? '当前地图预览' : '本地战棋演示地图'" @wheel.prevent="onBoardWheel"><span v-if="!preview && !editable" class="board-gesture-hint">拖动平移 · 滚轮 / 双指缩放</span></div></template>
 
 <style scoped>
 .board-canvas { position:relative; width: 100%; height: 100%; min-height: 390px; overflow: hidden; border: 1px solid rgba(160, 191, 223, .42); border-radius: 20px; background: #182638; touch-action: none; cursor: grab; }

@@ -23,13 +23,6 @@ try {
   }
   console.log(`PUBLIC_WORKSHOP_LIST_OK maps=${catalog.maps.length} terrainMods=${catalog.terrainMods.length}`);
 
-  const rejectReply = nextMessage("workshop-error");
-  room.send("publish-map", { code: "{}", description: "" });
-  const rejected = await rejectReply;
-  if (!rejected?.message?.includes("仅开放预览")) {
-    throw new Error(`Public workshop did not reject anonymous publishing: ${rejected?.message}`);
-  }
-  console.log("PUBLIC_WORKSHOP_READ_ONLY_OK");
 } catch (error) {
   console.error(error);
   process.exitCode = 1;

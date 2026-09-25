@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { getPoweredUnitIds, type GameState } from "@numeral-lord/game-core";
+import { getPoweredUnitIds, type GameState, type UnitId } from "@numeral-lord/game-core";
 import { createMatchFromMapCode, type MapDefinition } from "@numeral-lord/core-content";
 import { missingTerrainMods, type ConfiguredMap } from "../map-library";
 import { installedMapCatalogs, installedTerrainCatalog } from "../installed-content";
@@ -28,31 +28,18 @@ const previewState = computed<GameState | null>(() => {
   try { return createMatchFromMapCode(selected.value.code, installedMapCatalogs); } catch { return null; }
 });
 const previewPoweredUnitIds = computed(() => previewState.value ? [...getPoweredUnitIds(previewState.value, installedTerrainCatalog)] : []);
-
-function thumbnailPoints(map: ConfiguredMap): Array<{ key: number; x: number; y: number; fill: string; points: string; fontSize: number; unit?: string }> {
-  const definition = map.definition;
-  const palette: Record<string, string> = { "core/plain": "#63985d", "core/mountain": "#52627b", "core/void": "#101927", "core/ocean": "#2f72c8", "core/stronghold": "#bf5d68", "mod/oil-field": "#9a6338" };
-  const units = new Map<number, string>(definition.soldiers.map(([index, _seat, strength]) => [index, String(strength)]));
-  for (const [index, kind, strength] of definition.specialUnits ?? []) units.set(index, `${kind === "wild" ? "野" : "挡"}${strength}`);
-  const rows = definition.terrain.length / definition.columns;
-  const stride = Math.max(1, Math.ceil(Math.sqrt(definition.terrain.length / 500)));
-  return [...definition.terrain].flatMap((symbol, key) => {
-    const row = Math.floor(key / definition.columns), column = key % definition.columns;
-    if ((row % stride !== 0 || column % stride !== 0) && !units.has(key)) return [];
-    const terrainId = definition.terrainLegend[symbol] ?? "core/plain";
-    const fill = palette[terrainId] ?? (terrainId.startsWith("mod/") ? "#9273ad" : "#63985d");
-    const unit = units.get(key);
-    const x = (8 + column * 20 + (row % 2) * 10) * stride;
-    const y = (8 + row * 17) * stride;
-    return [{ key, x, y, fill, ...(unit !== undefined ? { unit } : {}), points: `${x},${y - 7 * stride} ${x + 8 * stride},${y - 3 * stride} ${x + 8 * stride},${y + 4 * stride} ${x},${y + 8 * stride} ${x - 8 * stride},${y + 4 * stride} ${x - 8 * stride},${y - 3 * stride}`, fontSize: Math.max(5, 5 * stride) }];
-  });
-}
-function thumbnailViewBox(map: ConfiguredMap): string {
-  const rows = map.definition.terrain.length / map.definition.columns;
-  const stride = Math.max(1, Math.ceil(Math.sqrt(map.definition.terrain.length / 500)));
-  // Keep the original breathing room around edge hexes. A tightly fitted
-  // viewBox clips the offset rows at the right and bottom of the thumbnail.
-  return `0 0 ${(map.definition.columns * 20 + 24) * stride} ${(rows * 17 + 20) * stride}`;
+const cardPreviews = computed(() => new Map(props.maps.flatMap((map) => {
+  try {
+    const state = createMatchFromMapCode(map.code, installedMapCatalogs);
+    return [[map.definition.id, { state, poweredUnitIds: [...getPoweredUnitIds(state, installedTerrainCatalog)] }] as const];
+  } catch {
+    // Unknown terrain Mod data cannot be rendered faithfully. Show an explicit
+    // dependency placeholder instead of drawing a misleading substitute map.
+    return [];
+  }
+})));
+function cardPreview(map: ConfiguredMap): { state: GameState; poweredUnitIds: readonly UnitId[] } | undefined {
+  return cardPreviews.value.get(map.definition.id);
 }
 function selectMap(id: string): void { emit("select", id); view.value = "detail"; }
 function startCreate(): void { editingDefinition.value = null; view.value = "editor"; }
@@ -79,7 +66,7 @@ defineExpose({ clearCodeDraft });
 </script>
 
 <template>
-  <section class="map-library">
+  <section class="map-library" :class="{ 'editing-map': view === 'editor' }">
     <header class="library-heading">
       <div><p class="kicker">MAP LIBRARY</p><h2>地图配置</h2><p>地图保存在当前浏览器；你可以导入地图码，或直接创建和编辑地图。</p></div>
       <div class="heading-actions"><button v-if="view !== 'library'" class="outline-button" @click="view = 'library'">← 返回地图库</button><button class="back-link" @click="emit('back')">返回主页</button></div>
@@ -90,7 +77,7 @@ defineExpose({ clearCodeDraft });
       <p v-if="actionMessage" class="action-message" :class="{ error: actionError }" role="status">{{ actionMessage }}</p>
       <div class="map-cards">
         <button v-for="map in maps" :key="map.definition.id" class="map-card" @click="selectMap(map.definition.id)">
-          <span class="map-card-preview"><svg :viewBox="thumbnailViewBox(map)" role="img" :aria-label="`${map.definition.name} 地图预览`"><polygon v-for="point in thumbnailPoints(map)" :key="point.key" :points="point.points" :fill="point.fill" stroke="#15253a" stroke-width=".8"/><text v-for="point in thumbnailPoints(map).filter((item) => item.unit !== undefined)" :key="`u-${point.key}`" :x="point.x" :y="point.y+2.3" text-anchor="middle" :font-size="point.fontSize" font-weight="900" fill="white">{{ point.unit }}</text></svg><em>{{ map.definition.columns }} × {{ map.definition.terrain.length / map.definition.columns }}</em></span>
+          <span class="map-card-preview" role="img" :aria-label="`${map.definition.name} 地图预览`"><template v-if="cardPreview(map)"><HexBoard preview :show-unit-labels="false" :state="cardPreview(map)!.state" :selected-unit-id="null" :legal-action-cell-ids="[]" :actionable-unit-ids="[]" :powered-unit-ids="cardPreview(map)!.poweredUnitIds" /></template><span v-else class="thumbnail-missing-mod">安装地图依赖的 Mod 后可预览</span><em>{{ map.definition.columns }} × {{ map.definition.terrain.length / map.definition.columns }}</em></span>
           <span class="map-card-body"><span class="card-title"><strong>{{ map.definition.name }}</strong><small>个人地图</small></span><span class="card-description">{{ map.definition.players }} 个玩家位 · {{ map.definition.requiredTerrainModIds.length ? `依赖 ${map.definition.requiredTerrainModIds.length} 个 Mod` : '无需额外 Mod' }}</span><span v-if="missingTerrainMods(map).length" class="card-warning">缺少 Mod：{{ missingTerrainMods(map).join('、') }}</span><span class="card-footer">地图 v{{ map.definition.version }}<span>查看详情 →</span></span></span>
         </button>
         <div v-if="maps.length === 0" class="empty-card"><strong>还没有个人地图</strong><p>导入地图码，或创建并绘制一张地图。创建对战房间前需要先准备至少一张地图。</p><div><button class="outline-button" @click="view = 'import'">导入地图</button><button class="outline-button" @click="startCreate">创建地图</button></div></div>
@@ -120,5 +107,5 @@ defineExpose({ clearCodeDraft });
 
 <style scoped>
 .map-library{padding:clamp(18px,3vw,34px);border:1px solid rgba(134,177,205,.3);border-radius:24px;background:linear-gradient(145deg,#1a2c40,#101f31);box-shadow:0 24px 65px rgba(0,6,17,.25)}.library-heading,.heading-actions,.library-toolbar,.library-toolbar>div,.detail-topline,.detail-title,.detail-actions,.import-head,.import-bottom{display:flex;align-items:center;justify-content:space-between;gap:12px}.library-heading{align-items:flex-start;margin-bottom:21px}.kicker{margin:0 0 5px;color:#7de6d3;font-size:10px;font-weight:900;letter-spacing:.18em}.library-heading h2{margin:0;color:#f4f9ff;font-size:clamp(28px,4vw,42px);letter-spacing:-.035em}.library-heading p:not(.kicker){margin:7px 0 0;color:#91a9be;font-size:12px;line-height:1.6}.back-link,.outline-button,.primary-button,.danger-button{width:auto;min-height:39px;margin:0;padding:8px 13px;border:1px solid rgba(143,188,206,.32);border-radius:9px;color:#cde6f1;background:rgba(18,47,65,.5);white-space:nowrap}.primary-button{border:0;color:#092332;background:linear-gradient(120deg,#81e9ce,#70c9e7);font-weight:800}.library-toolbar{padding:12px 14px;border:1px solid rgba(135,175,202,.2);border-radius:13px;background:rgba(8,22,35,.48)}.library-toolbar>div:first-child{align-items:flex-start;flex-direction:column;gap:3px}.library-toolbar strong{color:#e6f2fb;font-size:14px}.library-toolbar span{color:#829db1;font-size:10px}.map-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(235px,1fr));gap:14px;margin-top:15px}.map-card{display:block;overflow:hidden;width:100%;margin:0;padding:0;border:1px solid rgba(135,175,202,.24);border-radius:16px;color:#e8f2f9;background:rgba(8,22,35,.67);text-align:left;transition:border-color .18s,transform .18s}.map-card:hover,.map-card:focus-visible{border-color:#79ddcd;transform:translateY(-2px);outline:none}.map-card-preview{position:relative;display:grid;place-items:center;height:170px;overflow:hidden;background:#182638}.map-card-preview svg{width:100%;height:100%;padding:14px}.map-card-preview em{position:absolute;right:9px;bottom:8px;padding:4px 7px;border:1px solid rgba(150,193,214,.24);border-radius:6px;color:#a9c5d5;background:#0d1b2a;font-size:9px;font-style:normal}.map-card-body{display:grid;gap:9px;padding:13px 14px 14px}.card-title,.card-footer{display:flex;align-items:center;justify-content:space-between;gap:9px}.card-title strong{overflow:hidden;color:#eef6fb;font-size:16px;text-overflow:ellipsis;white-space:nowrap}.card-title small{flex:none;color:#8edec9;font-size:9px}.card-description{color:#b4c9d7;font-size:11px}.card-warning{overflow:hidden;color:#efba7e;font-size:10px;text-overflow:ellipsis;white-space:nowrap}.card-footer{padding-top:7px;border-top:1px solid rgba(140,180,202,.13);color:#829db1;font-size:9px}.card-footer span{color:#8ce1d0;font-size:10px}.empty-card{display:grid;align-content:center;justify-items:start;min-height:270px;padding:22px;border:1px dashed rgba(135,175,202,.3);border-radius:15px;background:rgba(8,22,35,.27)}.empty-card strong{color:#e6f2fb;font-size:15px}.empty-card p{color:#8fa9bc;font-size:11px;line-height:1.6}.map-detail,.import-card{padding:clamp(14px,2vw,21px);border:1px solid rgba(135,175,202,.24);border-radius:17px;background:rgba(8,22,35,.58)}.detail-topline{color:#78b9c7;font-size:9px;font-weight:900;letter-spacing:.16em}.detail-title{align-items:end;margin:11px 0 12px}.detail-title h3{margin:0;color:#f3f9ff;font-size:27px}.detail-title p{margin:5px 0 0;color:#8eabba;font-size:11px}.version-badge{padding:5px 8px;border:1px solid rgba(133,190,201,.25);border-radius:7px;color:#86d9cf;font-size:9px;white-space:nowrap}.dependency-line,.missing-mod-note{margin:0 0 11px;color:#b4d9e5;font-size:11px}.missing-mod-note{color:#f0c38a;line-height:1.6}.detail-board{height:clamp(245px,32vw,460px);padding:5px;border:1px solid rgba(138,179,203,.25);border-radius:12px;background:#19293a}.preview-fallback{display:grid;place-items:center;min-height:190px;color:#8fa3b9}.detail-actions{justify-content:flex-start;flex-wrap:wrap;margin-top:13px}.remove-button{margin-left:auto;border-color:rgba(251,153,158,.22);color:#eaa1aa;background:rgba(100,39,52,.2)}.copy-status{color:#8de6bd;font-size:11px}.code-output,.code-input{box-sizing:border-box;width:100%;resize:vertical;border:1px solid rgba(136,177,204,.31);border-radius:10px;outline:none;background:#0c1b2b;color:#c9e3ed;font:11px/1.6 ui-monospace,Consolas,monospace}.code-output{min-height:92px;margin-top:10px;padding:11px}.import-head{align-items:flex-start}.import-head h3{margin:0;color:#f3f9ff;font-size:22px}.import-head p,.import-card label{color:#8fa9bc;font-size:11px;line-height:1.6}.import-card label{display:block;margin:13px 0 6px}.code-input{min-height:210px;padding:12px}.import-bottom{margin-top:10px}.import-bottom span{color:#8faaa9;font-size:11px}.import-bottom span.error,.action-message.error{color:#f4a3ab}.import-bottom button:disabled{opacity:.45}.action-message{padding:10px 13px;border:1px solid rgba(109,221,176,.32);border-radius:10px;color:#9ee9bd;background:rgba(51,106,83,.2);font-size:12px}.confirm-backdrop{position:fixed;z-index:30;inset:0;display:grid;place-items:center;padding:15px;background:rgba(2,11,21,.7)}.confirm-dialog{width:min(430px,100%);padding:21px;border:1px solid rgba(145,184,204,.4);border-radius:16px;background:#1a2b3f;box-shadow:0 26px 70px rgba(0,0,0,.4)}.confirm-dialog h3{margin:0;color:#f4f8ff}.confirm-dialog p{color:#a9bdd0;font-size:12px;line-height:1.7}.confirm-dialog>div{display:flex;gap:10px}.danger-button{color:#fff;background:#a14d61}@media(max-width:620px){.library-heading{display:grid}.heading-actions{flex-wrap:wrap}.library-toolbar{align-items:flex-start}.library-toolbar>div:last-child{align-items:flex-end;flex-direction:column}.map-cards{grid-template-columns:repeat(auto-fill,minmax(180px,1fr))}.map-card-preview{height:145px}.detail-board{height:270px}.import-head{display:grid}.import-bottom{align-items:stretch;flex-direction:column}.import-bottom button{width:100%}}
-.empty-card>div{display:flex;gap:8px;flex-wrap:wrap}
+.empty-card>div{display:flex;gap:8px;flex-wrap:wrap}.map-card-preview{display:block}.map-card-preview :deep(.board-canvas){width:100%;height:100%;min-height:0;border:0;border-radius:0;background:#182638}.thumbnail-missing-mod{display:grid;height:100%;place-items:center;padding:12px;color:#a9bdd0;text-align:center;font-size:10px;background:#182638}.map-library.editing-map{position:static;padding:0;border:0;border-radius:0;background:transparent;box-shadow:none}.map-library.editing-map>.library-heading{display:none}
 </style>

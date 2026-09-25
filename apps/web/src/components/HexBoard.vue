@@ -17,6 +17,8 @@ const props = defineProps<{
   preview?: boolean;
   /** Use the real terrain/unit renderer while forwarding clicks to a map editor. */
   editable?: boolean;
+  /** Hide strength labels in compact map cards while retaining real unit art. */
+  showUnitLabels?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -71,7 +73,12 @@ onMounted(async () => {
   const instance = new Application();
   app = instance;
   try {
-    await instance.init({ background: "#182638", antialias: true, resizeTo: host });
+    await instance.init({
+      background: props.editable ? "#101927" : "#182638",
+      backgroundAlpha: props.editable ? 0 : 1,
+      antialias: true,
+      resizeTo: host
+    });
   } catch (error) {
     if (app === instance) app = undefined;
     console.error("Pixi board initialization failed.", error);
@@ -107,11 +114,19 @@ onMounted(async () => {
     console.warn("Legacy board artwork could not be loaded; using base fills.", error);
   }
   if (app !== instance || !canvasHost.value) return;
-  observer = new ResizeObserver(() => draw());
+  observer = new ResizeObserver(() => {
+    const { width, height } = host.getBoundingClientRect();
+    if (width < 1 || height < 1 || app !== instance) return;
+    // CSS transforms and editor fullscreen breakpoints can resize the host
+    // without a window resize; resize Pixi's backing buffer before redrawing.
+    instance.renderer.resize(width, height);
+    draw();
+  });
   observer.observe(host);
   if (!props.preview) {
     pulseTick = () => updateActionPulses(performance.now());
     instance.ticker.add(pulseTick);
+    window.addEventListener("keydown", onBoardZoomShortcut, true);
   }
   draw();
 });
@@ -124,6 +139,7 @@ onBeforeUnmount(() => {
   if (!instance) return;
   if (pulseTick) instance.ticker.remove(pulseTick);
   pulseTick = undefined;
+  window.removeEventListener("keydown", onBoardZoomShortcut, true);
   instance.stage.off("pointertap", onBoardBackgroundTap);
   instance.stage.off("pointerdown", onCameraPointerDown);
   instance.stage.off("pointermove", onCameraPointerMove);
@@ -244,7 +260,7 @@ function draw(): void {
       app.stage.addChild(pulse);
     }
 
-    if (unit) {
+    if (unit && props.showUnitLabels !== false) {
       const canAct = player ? actionableUnits.value.has(unit.id) : false;
       const strength = new Text({
         text: player ? String(unit.strength) : `${unit.definitionId === "core/wild" ? "野" : "挡"}${unit.strength}`,
@@ -332,6 +348,22 @@ function onBoardBackgroundTap(event: { readonly target: unknown }): void {
 function onBoardWheel(event: WheelEvent): void {
   if (props.preview) return;
   cameraZoom = Math.max(0.55, Math.min(3.2, cameraZoom * (event.deltaY < 0 ? 1.12 : 0.89)));
+  cameraMovedAt = performance.now();
+  applyCamera();
+}
+
+/** Keep browser zoom shortcuts scoped to the board while a match is open. */
+function onBoardZoomShortcut(event: KeyboardEvent): void {
+  if ((!event.ctrlKey && !event.metaKey) || props.preview) return;
+  if (event.key === "+" || event.key === "=" || event.code === "NumpadAdd") {
+    cameraZoom = Math.min(3.2, cameraZoom * 1.12);
+  } else if (event.key === "-" || event.key === "_" || event.code === "NumpadSubtract") {
+    cameraZoom = Math.max(0.55, cameraZoom * 0.89);
+  } else if (event.key === "0" || event.code === "Numpad0") {
+    cameraZoom = 1;
+    cameraPan = { x: 0, y: 0 };
+  } else return;
+  event.preventDefault();
   cameraMovedAt = performance.now();
   applyCamera();
 }

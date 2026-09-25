@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Application, Assets, Container, Graphics, Rectangle, Sprite, type Texture } from "pixi.js";
+import { Application, Assets, Container, Graphics, Rectangle, Sprite, Text, type Texture } from "pixi.js";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { CellId, GameState, UnitId } from "@numeral-lord/game-core";
 
@@ -32,7 +32,6 @@ const emit = defineEmits<{
   cellPointerEnter: [cellId: CellId];
 }>();
 const canvasHost = ref<HTMLDivElement | null>(null);
-const labelCanvas = ref<HTMLCanvasElement | null>(null);
 let app: Application | undefined;
 let observer: ResizeObserver | undefined;
 let pulseTick: (() => void) | undefined;
@@ -282,6 +281,8 @@ function draw(): void {
     }
   }
 
+  drawUnitStrengthLabels();
+
   const legal = new Container();
   const counterattack = new Container();
   const selection = new Container();
@@ -381,46 +382,32 @@ function applyCamera(width?: number, height?: number): void {
     app.stage.scale.set(zoom);
     app.stage.position.set((1 - zoom) * w / 2 + pan.x, (1 - zoom) * h / 2 + pan.y);
   }
-  drawUnitLabels(w, h, zoom, pan);
 }
 
-/** Draw counts in a dedicated 2D layer above Pixi so they stay legible and cannot be occluded by sprites. */
-function drawUnitLabels(width: number, height: number, zoom: number, pan: Readonly<{ x: number; y: number }>): void {
-  const canvas = labelCanvas.value;
-  if (!canvas || width < 1 || height < 1) return;
-  const resolution = Math.min(2, window.devicePixelRatio || 1);
-  const backingWidth = Math.max(1, Math.round(width * resolution));
-  const backingHeight = Math.max(1, Math.round(height * resolution));
-  if (canvas.width !== backingWidth || canvas.height !== backingHeight) {
-    canvas.width = backingWidth;
-    canvas.height = backingHeight;
-  }
-  const context = canvas.getContext("2d");
-  if (!context) return;
-  context.setTransform(resolution, 0, 0, resolution, 0, 0);
-  context.clearRect(0, 0, width, height);
+/** Render labels in Pixi above every terrain/unit sprite so the same scene owns their ordering. */
+function drawUnitStrengthLabels(): void {
   if (props.showUnitLabels === false) return;
-  const offsetX = (1 - zoom) * width / 2 + pan.x;
-  const offsetY = (1 - zoom) * height / 2 + pan.y;
-  context.textAlign = "center";
-  context.textBaseline = "middle";
-  context.lineJoin = "round";
   for (const cell of Object.values(props.state.cells)) {
     const unit = cell.unitId ? props.state.units[cell.unitId] : undefined;
     const layout = cellLayouts.get(cell.id);
     if (!unit || !layout) continue;
     const player = props.state.players[unit.ownerId];
     const canAct = player ? actionableUnits.value.has(unit.id) : false;
-    const fontSize = Math.max(12, Math.round(layout.radius * (powered.value.has(unit.id) ? 0.6 : 0.48))) * zoom;
-    const x = layout.x * zoom + offsetX;
-    const y = (layout.y + layout.radius * 0.02) * zoom + offsetY;
-    context.font = `900 ${fontSize}px Arial, sans-serif`;
-    context.lineWidth = Math.max(2, layout.radius * 0.08) * zoom;
-    context.strokeStyle = "#17212d";
-    context.fillStyle = canAct ? "#ffffff" : "#e8f0fa";
-    const value = String(unit.strength);
-    context.strokeText(value, x, y);
-    context.fillText(value, x, y);
+    const label = new Text({
+      text: String(unit.strength),
+      style: {
+        fontFamily: "Arial, sans-serif",
+        fontSize: Math.max(12, Math.round(layout.radius * (powered.value.has(unit.id) ? 0.6 : 0.48))),
+        fontWeight: "900",
+        fill: canAct ? "#ffffff" : "#e8f0fa",
+        stroke: { color: "#17212d", width: Math.max(2, layout.radius * 0.08) }
+      }
+    });
+    label.anchor.set(0.5);
+    label.position.set(layout.x, layout.y + layout.radius * 0.02);
+    label.zIndex = 4;
+    label.eventMode = "none";
+    app?.stage.addChild(label);
   }
 }
 
@@ -567,7 +554,7 @@ function hexagon(centerX: number, centerY: number, radius: number): number[] {
 }
 </script>
 
-<template><div ref="canvasHost" class="board-canvas" :class="{ preview, editable }" :style="editable ? { background: 'transparent' } : undefined" :aria-label="preview ? '当前地图预览' : '本地战棋演示地图'" @wheel.prevent="onBoardWheel"><canvas ref="labelCanvas" class="unit-label-layer" aria-hidden="true" /><span v-if="!preview && !editable" class="board-gesture-hint">拖动平移 · 滚轮 / 双指缩放</span></div></template>
+<template><div ref="canvasHost" class="board-canvas" :class="{ preview, editable }" :style="editable ? { background: 'transparent' } : undefined" :aria-label="preview ? '当前地图预览' : '本地战棋演示地图'" @wheel.prevent="onBoardWheel"><span v-if="!preview && !editable" class="board-gesture-hint">拖动平移 · 滚轮 / 双指缩放</span></div></template>
 
 <style scoped>
 .board-canvas { position:relative; width: 100%; height: 100%; min-height: 390px; overflow: hidden; border: 1px solid rgba(160, 191, 223, .42); border-radius: 20px; background: #182638; touch-action: none; cursor: grab; }
@@ -576,6 +563,5 @@ function hexagon(centerX: number, centerY: number, radius: number): number[] {
 .board-gesture-hint { position:absolute; z-index:1; top:8px; left:50%; transform:translateX(-50%); padding:4px 8px; border:1px solid rgba(147,177,207,.16); border-radius:999px; color:rgba(178,200,219,.58); background:rgba(11,20,32,.35); font-size:9px; pointer-events:none; white-space:nowrap; }
 .board-canvas.preview .board-gesture-hint { display:none; }
 .board-canvas :deep(canvas) { display: block; width: 100%; height: 100%; }
-.board-canvas :deep(canvas.unit-label-layer) { position:absolute;inset:0;z-index:1;width:100%;height:100%;pointer-events:none; }
 .board-canvas :deep(canvas:not(.unit-label-layer)) { position:relative;z-index:0; }
 </style>

@@ -77,7 +77,7 @@ onBeforeUnmount(() => {
       <div v-if="terrainPickerOpen" class="terrain-options" role="listbox" aria-label="地形选项">
         <button v-for="option in terrainOptions" :key="option.id" role="option" :aria-selected="selectedTerrain === option.id" @click="selectTerrain(option.id)">
           <MapTerrainIcon :terrain-id="option.id" :color="option.color" :size="25" />
-          <span>{{ option.name }}</span><small v-if="option.modId">Mod</small>
+          <span class="terrain-option-name">{{ option.name }}</span><small v-if="option.modId">Mod</small>
         </button>
       </div>
     </div>
@@ -129,7 +129,7 @@ onBeforeUnmount(() => {
 .terrain-options{position:absolute;z-index:8;bottom:calc(100% + 9px);left:0;display:grid;gap:3px;width:190px;max-height:min(48dvh,360px);box-sizing:border-box;overflow:auto;padding:6px;border:1px solid rgba(143,188,206,.3);border-radius:9px;background:#0a121d;box-shadow:0 12px 32px rgba(0,0,0,.58)}
 .terrain-options button{display:flex;align-items:center;gap:9px;min-height:39px;padding:5px 8px;text-align:left}
 .terrain-options button:hover,.terrain-options button[aria-selected="true"]{background:#17364a;color:#fff}
-.terrain-options button>span:nth-of-type(1){flex:1}
+.terrain-options button>.terrain-option-name{flex:1}
 .terrain-options small{color:#80c9c5;font-size:9px}
 .choice-control{display:flex;align-items:center;gap:6px}
 .choice-control i{width:19px;height:19px;flex:none;border:1px solid rgba(255,255,255,.3);border-radius:50%}

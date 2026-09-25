@@ -27,7 +27,7 @@ const variantClass = computed(() => props.terrainId.startsWith("mod/") ? "terrai
 </template>
 
 <style scoped>
-.terrain-icon{position:relative;display:inline-grid;place-items:center;width:var(--icon-size);height:calc(var(--icon-size) * 1.12);flex:none;overflow:hidden;background:var(--terrain-color);clip-path:polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%);filter:drop-shadow(0 1px 1px rgba(0,0,0,.35))}
+.terrain-icon{position:relative;display:inline-grid;place-items:center;width:var(--icon-size)!important;min-width:var(--icon-size);max-width:var(--icon-size);height:calc(var(--icon-size) * 1.155);flex:0 0 var(--icon-size)!important;overflow:hidden;background:var(--terrain-color);clip-path:polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%);filter:drop-shadow(0 1px 1px rgba(0,0,0,.35))}
 .terrain-icon img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.83;pointer-events:none;user-select:none}
 .terrain-icon--core-plain img{opacity:.38}
 .terrain-icon--core-stronghold img{opacity:.35}

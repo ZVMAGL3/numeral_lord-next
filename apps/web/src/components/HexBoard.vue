@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { Application, Assets, Container, Graphics, Rectangle, Sprite, Text, type Texture } from "pixi.js";
+import { Application, Assets, Container, Graphics, Rectangle, Sprite, type Texture } from "pixi.js";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { CellId, GameState, UnitId } from "@numeral-lord/game-core";
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   state: GameState;
   selectedUnitId: UnitId | null;
   legalActionCellIds: readonly CellId[];
@@ -22,7 +22,7 @@ const props = defineProps<{
   /** External editor camera; unlike CSS transforms this does not alter layout measurements. */
   viewZoom?: number;
   viewPan?: Readonly<{ x: number; y: number }>;
-}>();
+}>(), { showUnitLabels: true });
 
 const emit = defineEmits<{
   cellClick: [cellId: CellId];
@@ -32,6 +32,9 @@ const emit = defineEmits<{
   cellPointerEnter: [cellId: CellId];
 }>();
 const canvasHost = ref<HTMLDivElement | null>(null);
+const unitLabelLayer = ref<HTMLDivElement | null>(null);
+const unitStrengthLabels = ref<Array<{ id: UnitId; text: string; x: number; y: number; fontSize: number }>>([]);
+const unitLabelTransform = ref("translate(0px, 0px) scale(1)");
 let app: Application | undefined;
 let observer: ResizeObserver | undefined;
 let pulseTick: (() => void) | undefined;
@@ -110,7 +113,9 @@ onMounted(async () => {
     instance.stage.on("pointerupoutside", onCameraPointerUp);
     instance.stage.on("pointercancel", onCameraPointerUp);
   }
-  host.appendChild(instance.canvas);
+  Object.assign(instance.canvas.style, { position: "absolute", inset: "0", zIndex: "0" });
+  if (unitLabelLayer.value) host.insertBefore(instance.canvas, unitLabelLayer.value);
+  else host.appendChild(instance.canvas);
   // Keep the resolved Texture objects: repeated redraws must not ask Pixi to
   // resolve the same URL again (which also avoids noisy cache-miss warnings).
   try {
@@ -281,8 +286,6 @@ function draw(): void {
     }
   }
 
-  drawUnitStrengthLabels();
-
   const legal = new Container();
   const counterattack = new Container();
   const selection = new Container();
@@ -297,6 +300,7 @@ function draw(): void {
   interactionLayers = { legal, counterattack, selection };
   applyCamera(width, height);
   drawInteractionOverlay();
+  drawUnitStrengthLabels();
   updateActionPulses(performance.now());
 }
 
@@ -379,36 +383,30 @@ function applyCamera(width?: number, height?: number): void {
   const zoom = props.preview && !props.editable ? 1 : props.editable ? props.viewZoom ?? 1 : cameraZoom;
   const pan = props.preview && !props.editable ? { x: 0, y: 0 } : props.editable ? props.viewPan ?? { x: 0, y: 0 } : cameraPan;
   if (!props.preview || props.editable) {
+    const offsetX = (1 - zoom) * w / 2 + pan.x;
+    const offsetY = (1 - zoom) * h / 2 + pan.y;
     app.stage.scale.set(zoom);
-    app.stage.position.set((1 - zoom) * w / 2 + pan.x, (1 - zoom) * h / 2 + pan.y);
+    app.stage.position.set(offsetX, offsetY);
+    unitLabelTransform.value = `translate(${offsetX}px, ${offsetY}px) scale(${zoom})`;
+  } else {
+    unitLabelTransform.value = "translate(0px, 0px) scale(1)";
   }
 }
 
-/** Render labels in Pixi above every terrain/unit sprite so the same scene owns their ordering. */
+/** Keep DOM labels in a higher stacking layer than Pixi's injected canvas. */
 function drawUnitStrengthLabels(): void {
-  if (props.showUnitLabels === false) return;
-  for (const cell of Object.values(props.state.cells)) {
+  unitStrengthLabels.value = props.showUnitLabels === false ? [] : Object.values(props.state.cells).flatMap((cell) => {
     const unit = cell.unitId ? props.state.units[cell.unitId] : undefined;
     const layout = cellLayouts.get(cell.id);
-    if (!unit || !layout) continue;
-    const player = props.state.players[unit.ownerId];
-    const canAct = player ? actionableUnits.value.has(unit.id) : false;
-    const label = new Text({
+    if (!unit || !layout) return [];
+    return [{
+      id: unit.id,
       text: String(unit.strength),
-      style: {
-        fontFamily: "Arial, sans-serif",
-        fontSize: Math.max(12, Math.round(layout.radius * (powered.value.has(unit.id) ? 0.6 : 0.48))),
-        fontWeight: "900",
-        fill: canAct ? "#ffffff" : "#e8f0fa",
-        stroke: { color: "#17212d", width: Math.max(2, layout.radius * 0.08) }
-      }
-    });
-    label.anchor.set(0.5);
-    label.position.set(layout.x, layout.y + layout.radius * 0.02);
-    label.zIndex = 4;
-    label.eventMode = "none";
-    app?.stage.addChild(label);
-  }
+      x: layout.x,
+      y: layout.y + layout.radius * 0.02,
+      fontSize: Math.max(12, Math.round(layout.radius * (powered.value.has(unit.id) ? 0.6 : 0.48)))
+    }];
+  });
 }
 
 function onCameraPointerDown(event: { pointerId: number; global: { x: number; y: number } }): void {
@@ -554,10 +552,12 @@ function hexagon(centerX: number, centerY: number, radius: number): number[] {
 }
 </script>
 
-<template><div ref="canvasHost" class="board-canvas" :class="{ preview, editable }" :style="editable ? { background: 'transparent' } : undefined" :aria-label="preview ? '当前地图预览' : '本地战棋演示地图'" @wheel.prevent="onBoardWheel"><span v-if="!preview && !editable" class="board-gesture-hint">拖动平移 · 滚轮 / 双指缩放</span></div></template>
+<template><div ref="canvasHost" class="board-canvas" :class="{ preview, editable }" :style="editable ? { background: 'transparent' } : undefined" :aria-label="preview ? '当前地图预览' : '本地战棋演示地图'" @wheel.prevent="onBoardWheel"><div ref="unitLabelLayer" v-if="props.showUnitLabels !== false" class="unit-label-layer" :style="{ transform: unitLabelTransform }"><span v-for="label in unitStrengthLabels" :key="label.id" :style="{ left: `${label.x}px`, top: `${label.y}px`, fontSize: `${label.fontSize}px` }">{{ label.text }}</span></div><span v-if="!preview && !editable" class="board-gesture-hint">拖动平移 · 滚轮 / 双指缩放</span></div></template>
 
 <style scoped>
 .board-canvas { position:relative; width: 100%; height: 100%; min-height: 390px; overflow: hidden; border: 1px solid rgba(160, 191, 223, .42); border-radius: 20px; background: #182638; touch-action: none; cursor: grab; }
+.unit-label-layer{position:absolute;inset:0;z-index:2;overflow:hidden;pointer-events:none;transform-origin:0 0}
+.unit-label-layer span{position:absolute;display:block;min-width:1em;transform:translate(-50%,-50%);color:#fff;font-family:Arial,sans-serif;font-weight:900;line-height:1;text-align:center;white-space:nowrap;-webkit-text-stroke:1.5px #17212d;text-shadow:0 1px 2px #17212d,0 -1px 2px #17212d,1px 0 2px #17212d,-1px 0 2px #17212d}
 .board-canvas.preview { min-height: 0; border-radius: 12px; pointer-events: none; }
 .board-canvas.editable { min-height: 0; border: 0; border-radius: 0; pointer-events: auto; }
 .board-gesture-hint { position:absolute; z-index:1; top:8px; left:50%; transform:translateX(-50%); padding:4px 8px; border:1px solid rgba(147,177,207,.16); border-radius:999px; color:rgba(178,200,219,.58); background:rgba(11,20,32,.35); font-size:9px; pointer-events:none; white-space:nowrap; }

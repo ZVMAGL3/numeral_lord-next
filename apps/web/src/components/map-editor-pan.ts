@@ -8,19 +8,19 @@ export interface MapEditorSize {
   readonly height: number;
 }
 
-/** Clamp a full-screen canvas pan so the board bounds stop at screen edges. */
+/** Keep the screen center inside the board bounds while allowing the board off-screen. */
 export function clampMapEditorPan(
   pan: MapEditorPan,
   viewport: MapEditorSize,
   board: MapEditorSize,
   boardCenter: MapEditorPan
 ): MapEditorPan {
-  const centeredPanX = viewport.width / 2 - boardCenter.x;
-  const centeredPanY = viewport.height / 2 - boardCenter.y;
-  const travelX = Math.abs(viewport.width - board.width) / 2;
-  const travelY = Math.abs(viewport.height - board.height) / 2;
+  const minX = viewport.width / 2 - board.width / 2 - boardCenter.x;
+  const maxX = viewport.width / 2 + board.width / 2 - boardCenter.x;
+  const minY = viewport.height / 2 - board.height / 2 - boardCenter.y;
+  const maxY = viewport.height / 2 + board.height / 2 - boardCenter.y;
   return {
-    x: Math.max(centeredPanX - travelX, Math.min(centeredPanX + travelX, pan.x)),
-    y: Math.max(centeredPanY - travelY, Math.min(centeredPanY + travelY, pan.y))
+    x: Math.max(minX, Math.min(maxX, pan.x)),
+    y: Math.max(minY, Math.min(maxY, pan.y))
   };
 }

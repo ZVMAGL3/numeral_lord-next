@@ -4,6 +4,8 @@ import type { MapDefinition } from "@numeral-lord/core-content";
 import { getPoweredUnitIds, fromCellId, type CellId } from "@numeral-lord/game-core";
 import { createMatchFromMapDefinition } from "@numeral-lord/core-content";
 import HexBoard from "./HexBoard.vue";
+import MapEditorToolbar from "./MapEditorToolbar.vue";
+import { getMapCellRangeIndices } from "./map-cell-range";
 import { installedMapCatalogs, installedTerrainMods } from "../installed-content";
 
 const props = defineProps<{ initial?: MapDefinition | null }>();
@@ -25,7 +27,7 @@ const terrain = ref<string[]>([]), soldiers = ref<Array<{ index: number; seat: n
 const specialUnits = ref<Array<{ index: number; kind: "wild" | "blocker"; strength: number }>>([]), teams = ref<number[]>([]);
 const selectedTerrain = ref("core/plain"), placementMode = ref<"terrain" | "unit" | "erase">("terrain");
 const unitKind = ref<"player" | "wild" | "blocker">("player"), selectedSeat = ref(1), strength = ref(1);
-const terrainPickerOpen = ref(false), unitPickerOpen = ref(false);
+const fillRadius = ref(0);
 const unitPreset = computed<string>({
   get: () => unitKind.value === "player" ? `player:${selectedSeat.value}` : unitKind.value,
   set: (value) => {
@@ -47,6 +49,8 @@ const editorPointers = new Map<number, { x: number; y: number }>();
 let editorDrag: { x: number; y: number; panX: number; panY: number } | undefined;
 let editorPinch: { distance: number; zoom: number; x: number; y: number; panX: number; panY: number } | undefined;
 let editorDraggingAt = 0;
+let editorAltPainting = false;
+let lastAltPaintIndex = -1;
 
 function resetFromDefinition(definition?: MapDefinition | null): void {
   width.value = definition?.columns ?? 9; height.value = definition ? definition.terrain.length / definition.columns : 9;
@@ -129,29 +133,66 @@ function paintCellId(cellId: CellId): void {
   if (index >= 0 && index < terrain.value.length) paintCell(index);
 }
 function paintCell(index: number): void {
-  if (performance.now() - editorDraggingAt < 220) return;
+  if (!editorAltPainting && performance.now() - editorDraggingAt < 220) return;
+  for (const target of indexesInRange(index, fillRadius.value)) paintOneCell(target);
+}
+function paintOneCell(index: number): void {
   if (placementMode.value === "terrain") {
     terrain.value[index] = selectedTerrain.value;
-    if (terrainLookup.value.get(selectedTerrain.value)?.blocked) { soldiers.value = soldiers.value.filter((u) => u.index !== index); specialUnits.value = specialUnits.value.filter((u) => u.index !== index); }
+    if (terrainLookup.value.get(selectedTerrain.value)?.blocked) {
+      soldiers.value = soldiers.value.filter((u) => u.index !== index);
+      specialUnits.value = specialUnits.value.filter((u) => u.index !== index);
+    }
     return;
   }
   if (placementMode.value === "erase") {
-    soldiers.value = soldiers.value.filter((u) => u.index !== index); specialUnits.value = specialUnits.value.filter((u) => u.index !== index); return;
+    soldiers.value = soldiers.value.filter((u) => u.index !== index);
+    specialUnits.value = specialUnits.value.filter((u) => u.index !== index);
+    return;
   }
   if (terrainLookup.value.get(terrain.value[index]!)?.blocked) return;
   if (unitKind.value === "player") {
     specialUnits.value = specialUnits.value.filter((u) => u.index !== index);
     const current = soldiers.value.find((u) => u.index === index);
-    if (current) Object.assign(current, { seat: selectedSeat.value, strength: strength.value }); else soldiers.value.push({ index, seat: selectedSeat.value, strength: strength.value });
+    if (current) Object.assign(current, { seat: selectedSeat.value, strength: strength.value });
+    else soldiers.value.push({ index, seat: selectedSeat.value, strength: strength.value });
   } else {
     soldiers.value = soldiers.value.filter((u) => u.index !== index);
     specialUnits.value = specialUnits.value.filter((u) => u.index !== index);
     specialUnits.value.push({ index, kind: unitKind.value, strength: strength.value });
   }
 }
-function selectTerrain(id: string): void { selectedTerrain.value = id; terrainPickerOpen.value = false; }
-function selectUnit(preset: string): void { unitPreset.value = preset; unitPickerOpen.value = false; }
+function indexesInRange(centerIndex: number, radius: number): number[] {
+  return getMapCellRangeIndices(centerIndex, width.value, terrain.value.length, radius);
+}
+function onCellPressStart(cellId: CellId): void {
+  if (!editorAltPainting) return;
+  const { column, row } = fromCellId(cellId);
+  const index = row * width.value + column;
+  if (index < 0 || index >= terrain.value.length) return;
+  lastAltPaintIndex = index;
+  paintCell(index);
+}
+function onCellPointerEnter(cellId: CellId): void {
+  if (!editorAltPainting) return;
+  const { column, row } = fromCellId(cellId);
+  const index = row * width.value + column;
+  if (index < 0 || index >= terrain.value.length || index === lastAltPaintIndex) return;
+  lastAltPaintIndex = index;
+  editorDraggingAt = performance.now();
+  paintCell(index);
+}
 function onEditorPointerDown(event: PointerEvent): void {
+  if (event.altKey) {
+    editorAltPainting = true;
+    lastAltPaintIndex = -1;
+    editorDraggingAt = performance.now();
+    // Keep pointer events targeted at the Pixi canvas so its hex hit-testing
+    // continues to report cells while Alt-dragging; only listen globally for release.
+    window.addEventListener("pointerup", onEditorPointerUp, { once: true });
+    window.addEventListener("pointercancel", onEditorPointerUp, { once: true });
+    return;
+  }
   editorPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
   // Leave pointer ownership with the Pixi canvas as well so its cell tap can
   // be delivered while this wrapper tracks pan and pinch gestures.
@@ -164,6 +205,10 @@ function onEditorPointerDown(event: PointerEvent): void {
   }
 }
 function onEditorPointerMove(event: PointerEvent): void {
+  if (editorAltPainting) {
+    editorDraggingAt = performance.now();
+    return;
+  }
   if (!editorPointers.has(event.pointerId)) return;
   editorPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
   const points = [...editorPointers.values()];
@@ -182,6 +227,13 @@ function onEditorPointerMove(event: PointerEvent): void {
   }
 }
 function onEditorPointerUp(event: PointerEvent): void {
+  window.removeEventListener("pointerup", onEditorPointerUp);
+  window.removeEventListener("pointercancel", onEditorPointerUp);
+  if (editorAltPainting) {
+    editorAltPainting = false;
+    lastAltPaintIndex = -1;
+    return;
+  }
   editorPointers.delete(event.pointerId);
   if (editorPointers.size < 2) editorPinch = undefined;
   const point = [...editorPointers.values()][0];
@@ -217,26 +269,12 @@ function createId(): string { return typeof crypto.randomUUID === "function" ? c
     <header class="editor-head"><div class="editor-title"><p class="eyebrow">MAP EDITOR</p><h2>{{ initial ? '编辑地图' : '创建地图' }}</h2></div><div class="editor-head-actions"><button class="quiet-button" @click="settingsOpen = !settingsOpen">⚙ <span>地图设置</span></button><button class="quiet-button" @click="emit('cancel')">返回地图库</button><button class="save-button" @click="saveMap">保存地图</button></div></header>
     <div class="editor-layout">
       <div class="board-workspace" @pointerdown="onEditorPointerDown" @pointermove="onEditorPointerMove" @pointerup="onEditorPointerUp" @pointercancel="onEditorPointerUp" @wheel.prevent="onEditorWheel">
-        <div class="editor-board" :style="{ transform: `translate(${editorPan.x}px, ${editorPan.y}px) scale(${editorZoom})` }">
-          <HexBoard preview editable :state="previewState" :selected-unit-id="null" :legal-action-cell-ids="[]" :actionable-unit-ids="[]" :powered-unit-ids="previewPoweredUnitIds" @cell-click="paintCellId" />
+        <div class="editor-board">
+          <HexBoard preview editable :view-zoom="editorZoom" :view-pan="editorPan" :state="previewState" :selected-unit-id="null" :legal-action-cell-ids="[]" :actionable-unit-ids="[]" :powered-unit-ids="previewPoweredUnitIds" @cell-click="paintCellId" @cell-pointer-enter="onCellPointerEnter" @cell-press-start="onCellPressStart" />
         </div>
-        <div class="board-caption">{{ width }} × {{ height }} 格 <span>·</span> {{ soldiers.length + specialUnits.length }} 个初始单位 <span>·</span> 点击六边格应用当前工具</div>
+        <div class="board-caption">{{ width }} × {{ height }} 格 <span>·</span> {{ soldiers.length + specialUnits.length }} 个初始单位 <span>·</span> 点击绘制，按住 Alt 拖动批量绘制</div>
       </div>
-      <div class="editor-tools" aria-label="地图绘制工具">
-        <div class="tool-tabs"><button :class="{ active: placementMode === 'terrain' }" @click="placementMode = 'terrain'; terrainPickerOpen = false; unitPickerOpen = false">地形</button><button :class="{ active: placementMode === 'unit' || placementMode === 'erase' }" @click="placementMode = 'unit'; terrainPickerOpen = false; unitPickerOpen = false">单位</button></div>
-        <div v-if="placementMode === 'terrain'" class="toolbar-choice">
-          <button class="choice-trigger" aria-label="选择地形" :aria-expanded="terrainPickerOpen" @click="terrainPickerOpen = !terrainPickerOpen; unitPickerOpen = false"><i :style="{ background: terrainLookup.get(selectedTerrain)?.color ?? '#63985d' }" />{{ terrainLookup.get(selectedTerrain)?.name ?? '平原' }}<span>⌃</span></button>
-          <div v-if="terrainPickerOpen" class="choice-popover terrain-popover" role="listbox" aria-label="地形选项"><button v-for="option in terrainOptions" :key="option.id" role="option" :aria-selected="selectedTerrain === option.id" @click="selectTerrain(option.id)"><i :style="{ background: option.color }" />{{ option.name }}<small v-if="option.modId">Mod</small></button></div>
-        </div>
-        <template v-if="placementMode === 'unit' || placementMode === 'erase'">
-          <button class="erase-button" :class="{ active: placementMode === 'erase' }" :aria-pressed="placementMode === 'erase'" @click="placementMode = placementMode === 'erase' ? 'unit' : 'erase'; unitPickerOpen = false">× <small>擦除单位</small></button>
-          <div v-if="placementMode === 'unit'" class="toolbar-choice unit-choice">
-            <button class="choice-trigger" aria-label="选择单位" :aria-expanded="unitPickerOpen" @click="unitPickerOpen = !unitPickerOpen; terrainPickerOpen = false">{{ unitKind === 'player' ? `玩家 ${selectedSeat}` : unitKind === 'wild' ? '野怪' : '阻挡' }}<span>⌃</span></button>
-            <div v-if="unitPickerOpen" class="choice-popover unit-popover" role="listbox" aria-label="单位选项"><div class="choice-group-title">玩家单位</div><button v-for="seat in players" :key="seat" role="option" :aria-selected="unitKind === 'player' && selectedSeat === seat" @click="selectUnit(`player:${seat}`)">玩家 {{ seat }}<small>单位</small></button><div class="choice-group-title">特殊单位</div><button role="option" :aria-selected="unitKind === 'wild'" @click="selectUnit('wild')">野怪</button><button role="option" :aria-selected="unitKind === 'blocker'" @click="selectUnit('blocker')">阻挡</button></div>
-          </div>
-        </template>
-        <div v-if="placementMode === 'unit'" class="strength-control"><button :disabled="strength <= 1" aria-label="减少点数" @click="strength = Math.max(1, strength - 1)">−</button><input v-model.number="strength" type="number" min="1" max="65535" aria-label="放置点数" @change="strength = Math.max(1, Math.min(65535, Math.trunc(strength || 1)))" /><button aria-label="增加点数" @click="strength = Math.min(65535, strength + 1)">＋</button><small>点</small></div>
-      </div>
+      <MapEditorToolbar v-model:mode="placementMode" v-model:selected-terrain="selectedTerrain" v-model:unit-preset="unitPreset" v-model:strength="strength" v-model:fill-radius="fillRadius" :terrain-options="terrainOptions" :player-count="players" />
       <aside v-if="settingsOpen" class="editor-settings" role="dialog" aria-label="地图设置">
         <div class="side-title"><span>地图设置</span><button class="settings-close" aria-label="关闭设置" @click="settingsOpen = false">×</button></div>
         <label>地图名称<input v-model="name" maxlength="60" /></label>

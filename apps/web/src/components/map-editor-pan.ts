@@ -8,15 +8,15 @@ export interface MapEditorSize {
   readonly height: number;
 }
 
-/** Clamp panning so at least half of the smaller board/viewport extent stays visible. */
+/** Keep at least half of the viewport covered, unless the board is smaller. */
 export function clampMapEditorPan(
   pan: MapEditorPan,
   viewport: MapEditorSize,
   board: MapEditorSize,
   boardCenter: MapEditorPan
 ): MapEditorPan {
-  const visibleX = Math.min(viewport.width, board.width) / 2;
-  const visibleY = Math.min(viewport.height, board.height) / 2;
+  const visibleX = Math.min(viewport.width / 2, board.width);
+  const visibleY = Math.min(viewport.height / 2, board.height);
   return {
     x: Math.max(visibleX - board.width / 2 - boardCenter.x,
       Math.min(viewport.width - visibleX + board.width / 2 - boardCenter.x, pan.x)),

@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { MapDefinition } from "@numeral-lord/core-content";
 import { getPoweredUnitIds, fromCellId, type CellId } from "@numeral-lord/game-core";
 import { createMatchFromMapDefinition } from "@numeral-lord/core-content";
 import HexBoard from "./HexBoard.vue";
 import MapEditorToolbar from "./MapEditorToolbar.vue";
 import { getMapCellRangeIndices } from "./map-cell-range";
+import { clampMapEditorPan } from "./map-editor-pan";
 import { installedMapCatalogs, installedTerrainMods } from "../installed-content";
 
 const props = defineProps<{ initial?: MapDefinition | null }>();
@@ -45,12 +46,42 @@ const unitPreset = computed<string>({
 const settingsOpen = ref(false);
 const formError = ref(""), terrainLookup = computed(() => new Map(terrainOptions.value.map((entry) => [entry.id, entry])));
 const editorZoom = ref(1), editorPan = ref({ x: 0, y: 0 });
+const boardWorkspace = ref<HTMLDivElement | null>(null), editorBoard = ref<HTMLDivElement | null>(null);
 const editorPointers = new Map<number, { x: number; y: number }>();
 let editorDrag: { x: number; y: number; panX: number; panY: number } | undefined;
 let editorPinch: { distance: number; zoom: number; x: number; y: number; panX: number; panY: number } | undefined;
 let editorDraggingAt = 0;
 let editorAltPainting = false;
 let lastAltPaintIndex = -1;
+let workspaceResizeObserver: ResizeObserver | undefined;
+
+function constrainEditorPan(): void {
+  const workspace = boardWorkspace.value, boardHost = editorBoard.value;
+  if (!workspace || !boardHost) return;
+  const viewport = workspace.getBoundingClientRect(), host = boardHost.getBoundingClientRect();
+  if (viewport.width < 1 || viewport.height < 1 || host.width < 1 || host.height < 1) return;
+  const radius = Math.max(1, Math.min(
+    (host.width - 14) / (Math.sqrt(3) * (width.value + 0.5)),
+    (host.height - 14) / (1.5 * (height.value - 1) + 2)
+  ));
+  const boardWidth = Math.sqrt(3) * radius * (width.value + 0.5) * editorZoom.value;
+  const boardHeight = (2 + 1.5 * (height.value - 1)) * radius * editorZoom.value;
+  const hostCenterX = host.left - viewport.left + host.width / 2;
+  const hostCenterY = host.top - viewport.top + host.height / 2;
+  // Large maps can extend beyond the viewport, but cannot be panned away.
+  editorPan.value = clampMapEditorPan(editorPan.value,
+    { width: viewport.width, height: viewport.height },
+    { width: boardWidth, height: boardHeight },
+    { x: hostCenterX, y: hostCenterY });
+}
+watch([width, height, editorZoom], constrainEditorPan, { flush: "post" });
+onMounted(() => {
+  workspaceResizeObserver = new ResizeObserver(constrainEditorPan);
+  if (boardWorkspace.value) workspaceResizeObserver.observe(boardWorkspace.value);
+  if (editorBoard.value) workspaceResizeObserver.observe(editorBoard.value);
+  constrainEditorPan();
+});
+onBeforeUnmount(() => workspaceResizeObserver?.disconnect());
 
 function resetFromDefinition(definition?: MapDefinition | null): void {
   width.value = definition?.columns ?? 9; height.value = definition ? definition.terrain.length / definition.columns : 9;
@@ -217,6 +248,7 @@ function onEditorPointerMove(event: PointerEvent): void {
     if (a && b) {
       if (editorPinch.distance > 0) editorZoom.value = Math.max(.6, Math.min(3, editorPinch.zoom * Math.hypot(a.x - b.x, a.y - b.y) / editorPinch.distance));
       editorPan.value = { x: editorPinch.panX + (a.x + b.x) / 2 - editorPinch.x, y: editorPinch.panY + (a.y + b.y) / 2 - editorPinch.y };
+      constrainEditorPan();
     }
     editorDraggingAt = performance.now();
   } else if (points.length === 1 && editorDrag) {
@@ -224,6 +256,7 @@ function onEditorPointerMove(event: PointerEvent): void {
     const dx = point.x - editorDrag.x, dy = point.y - editorDrag.y;
     if (Math.abs(dx) + Math.abs(dy) > 4) editorDraggingAt = performance.now();
     editorPan.value = { x: editorDrag.panX + dx, y: editorDrag.panY + dy };
+    constrainEditorPan();
   }
 }
 function onEditorPointerUp(event: PointerEvent): void {
@@ -241,6 +274,7 @@ function onEditorPointerUp(event: PointerEvent): void {
 }
 function onEditorWheel(event: WheelEvent): void {
   editorZoom.value = Math.max(.6, Math.min(3, editorZoom.value * (event.deltaY < 0 ? 1.1 : .91)));
+  constrainEditorPan();
 }
 function saveMap(): void {
   formError.value = "";
@@ -268,8 +302,8 @@ function createId(): string { return typeof crypto.randomUUID === "function" ? c
   <section class="editor-shell">
     <header class="editor-head"><div class="editor-title"><p class="eyebrow">MAP EDITOR</p><h2>{{ initial ? '编辑地图' : '创建地图' }}</h2></div><div class="editor-head-actions"><button class="quiet-button" @click="settingsOpen = !settingsOpen">⚙ <span>地图设置</span></button><button class="quiet-button" @click="emit('cancel')">返回地图库</button><button class="save-button" @click="saveMap">保存地图</button></div></header>
     <div class="editor-layout">
-      <div class="board-workspace" @pointerdown="onEditorPointerDown" @pointermove="onEditorPointerMove" @pointerup="onEditorPointerUp" @pointercancel="onEditorPointerUp" @wheel.prevent="onEditorWheel">
-        <div class="editor-board">
+      <div ref="boardWorkspace" class="board-workspace" @pointerdown="onEditorPointerDown" @pointermove="onEditorPointerMove" @pointerup="onEditorPointerUp" @pointercancel="onEditorPointerUp" @wheel.prevent="onEditorWheel">
+        <div ref="editorBoard" class="editor-board">
           <HexBoard preview editable :view-zoom="editorZoom" :view-pan="editorPan" :state="previewState" :selected-unit-id="null" :legal-action-cell-ids="[]" :actionable-unit-ids="[]" :powered-unit-ids="previewPoweredUnitIds" @cell-click="paintCellId" @cell-pointer-enter="onCellPointerEnter" @cell-press-start="onCellPressStart" />
         </div>
         <div class="board-caption">{{ width }} × {{ height }} 格 <span>·</span> {{ soldiers.length + specialUnits.length }} 个初始单位 <span>·</span> 点击绘制，按住 Alt 拖动批量绘制</div>

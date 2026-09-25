@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import MapTerrainIcon from "./MapTerrainIcon.vue";
 
 export interface MapEditorTerrainOption {
   id: string;
@@ -26,20 +27,41 @@ const emit = defineEmits<{
 }>();
 
 const terrain = computed(() => props.terrainOptions.find((entry) => entry.id === props.selectedTerrain));
+const terrainPickerOpen = ref(false);
+const toolbarRoot = ref<HTMLDivElement | null>(null);
 const unitLabel = computed(() => props.unitPreset.startsWith("player:")
   ? `玩家 ${props.unitPreset.slice("player:".length)}`
   : props.unitPreset === "wild" ? "野怪" : "阻挡");
 function changeMode(event: Event): void {
+  terrainPickerOpen.value = false;
   emit("update:mode", (event.target as HTMLSelectElement).value as "terrain" | "unit");
 }
 function changeStrength(event: Event): void {
   const value = Number((event.target as HTMLInputElement).value);
   emit("update:strength", Math.max(1, Math.min(65535, Math.trunc(value || 1))));
 }
+function selectTerrain(id: string): void {
+  emit("update:selectedTerrain", id);
+  terrainPickerOpen.value = false;
+}
+function closeTerrainPicker(event: PointerEvent): void {
+  if (!toolbarRoot.value?.contains(event.target as Node)) terrainPickerOpen.value = false;
+}
+function onToolbarKeydown(event: KeyboardEvent): void {
+  if (event.key === "Escape") terrainPickerOpen.value = false;
+}
+onMounted(() => {
+  document.addEventListener("pointerdown", closeTerrainPicker);
+  document.addEventListener("keydown", onToolbarKeydown);
+});
+onBeforeUnmount(() => {
+  document.removeEventListener("pointerdown", closeTerrainPicker);
+  document.removeEventListener("keydown", onToolbarKeydown);
+});
 </script>
 
 <template>
-  <div class="map-editor-toolbar" aria-label="地图绘制工具">
+  <div ref="toolbarRoot" class="map-editor-toolbar" aria-label="地图绘制工具">
     <label class="mode-control" aria-label="绘制类型">
       <select :value="mode === 'terrain' ? 'terrain' : 'unit'" @change="changeMode">
         <option value="terrain">地形</option>
@@ -47,14 +69,18 @@ function changeStrength(event: Event): void {
       </select>
     </label>
 
-    <label v-if="mode === 'terrain'" class="choice-control terrain-control" aria-label="选择地形">
-      <i :style="{ background: terrain?.color ?? '#63985d' }" />
-      <select :value="selectedTerrain" @change="emit('update:selectedTerrain', ($event.target as HTMLSelectElement).value)">
-        <option v-for="option in terrainOptions" :key="option.id" :value="option.id">
-          {{ option.name }}{{ option.modId ? ' · Mod' : '' }}
-        </option>
-      </select>
-    </label>
+    <div v-if="mode === 'terrain'" class="terrain-picker">
+      <button class="terrain-trigger" aria-label="选择地形" aria-haspopup="listbox" :aria-expanded="terrainPickerOpen" @click="terrainPickerOpen = !terrainPickerOpen">
+        <MapTerrainIcon :terrain-id="terrain?.id ?? 'core/plain'" :color="terrain?.color ?? '#63985d'" :size="20" />
+        <span class="terrain-name">{{ terrain?.name ?? '平原' }}</span><span class="picker-chevron">⌃</span>
+      </button>
+      <div v-if="terrainPickerOpen" class="terrain-options" role="listbox" aria-label="地形选项">
+        <button v-for="option in terrainOptions" :key="option.id" role="option" :aria-selected="selectedTerrain === option.id" @click="selectTerrain(option.id)">
+          <MapTerrainIcon :terrain-id="option.id" :color="option.color" :size="25" />
+          <span>{{ option.name }}</span><small v-if="option.modId">Mod</small>
+        </button>
+      </div>
+    </div>
 
     <template v-else>
       <label v-if="mode === 'unit'" class="choice-control unit-control" aria-label="选择单位">
@@ -96,6 +122,15 @@ function changeStrength(event: Event): void {
 .map-editor-toolbar select,.map-editor-toolbar button,.map-editor-toolbar input{box-sizing:border-box;min-height:36px;margin:0;border:1px solid rgba(143,188,206,.25);border-radius:7px;background:#090d13;color:#e4edf4;font:inherit}
 .map-editor-toolbar select{max-width:180px;padding:6px 26px 6px 9px;cursor:pointer}
 .mode-control select{min-width:70px}
+.terrain-picker{position:relative;display:flex;align-items:center}
+.terrain-trigger{display:flex;align-items:center;gap:8px;min-width:108px;padding:4px 8px!important;text-align:left;white-space:nowrap}
+.terrain-name{flex:1;overflow:hidden;text-overflow:ellipsis}
+.picker-chevron{color:#91a8b7;font-size:13px}
+.terrain-options{position:absolute;z-index:8;bottom:calc(100% + 9px);left:0;display:grid;gap:3px;width:190px;max-height:min(48dvh,360px);box-sizing:border-box;overflow:auto;padding:6px;border:1px solid rgba(143,188,206,.3);border-radius:9px;background:#0a121d;box-shadow:0 12px 32px rgba(0,0,0,.58)}
+.terrain-options button{display:flex;align-items:center;gap:9px;min-height:39px;padding:5px 8px;text-align:left}
+.terrain-options button:hover,.terrain-options button[aria-selected="true"]{background:#17364a;color:#fff}
+.terrain-options button>span:nth-of-type(1){flex:1}
+.terrain-options small{color:#80c9c5;font-size:9px}
 .choice-control{display:flex;align-items:center;gap:6px}
 .choice-control i{width:19px;height:19px;flex:none;border:1px solid rgba(255,255,255,.3);border-radius:50%}
 .terrain-control select{min-width:105px;max-width:150px}
@@ -107,4 +142,5 @@ function changeStrength(event: Event): void {
 .erase-button{width:36px;padding:0!important;font-size:21px!important}.erase-button.active{border-color:#f07883!important;color:#ffc3ca!important;background:#492631!important}
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 @media(max-width:720px){.map-editor-toolbar{right:8px;bottom:8px;left:8px;flex-wrap:wrap;justify-content:center;width:auto;max-width:none;gap:5px;padding:6px;transform:none}.map-editor-toolbar select{min-height:33px;max-width:130px;padding:5px 20px 5px 7px;font-size:11px}.mode-control select{min-width:64px}.choice-control i{width:16px;height:16px}.terrain-control select{min-width:86px;max-width:115px}.unit-control select{min-width:96px;max-width:120px}.range-control{gap:3px;padding-left:4px}.range-control select{min-width:56px}.strength-control{gap:2px;padding-left:4px}.strength-control button{width:28px;min-height:33px}.strength-control input{width:34px;min-height:33px}.erase-button{width:33px;min-height:33px}}
+@media(max-width:720px){.terrain-trigger{min-width:100px;padding:3px 6px!important}.terrain-options{width:min(190px,calc(100vw - 20px));max-height:min(45dvh,320px)}.terrain-options button{min-height:36px}}
 </style>

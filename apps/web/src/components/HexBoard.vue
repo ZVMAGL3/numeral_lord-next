@@ -74,8 +74,12 @@ onMounted(async () => {
   app = instance;
   try {
     await instance.init({
-      background: props.editable ? "#101927" : "#182638",
-      backgroundAlpha: props.editable ? 0 : 1,
+      // The editor intentionally uses an opaque, uniform backdrop. Keeping
+      // Pixi and the surrounding workspace on the exact same color avoids a
+      // visible canvas rectangle even if the browser composites WebGL alpha
+      // differently on a particular GPU.
+      background: props.editable ? "#10141d" : "#182638",
+      backgroundAlpha: 1,
       antialias: true,
       resizeTo: host
     });
@@ -88,10 +92,8 @@ onMounted(async () => {
   // promise. Do not continue touching an instance already disposed below.
   if (app !== instance || !canvasHost.value) return;
   if (props.editable) {
-    // The editor's water texture is the page background; never paint an
-    // opaque rectangle behind the transparent hex board.
-    host.style.background = "transparent";
-    instance.canvas.style.background = "transparent";
+    host.style.background = "#10141d";
+    instance.canvas.style.background = "#10141d";
   }
   instance.stage.sortableChildren = true;
   instance.stage.eventMode = props.preview && !props.editable ? "none" : "static";
@@ -195,7 +197,8 @@ function draw(): void {
   const offsetX = (width - boardWidth) / 2 + horizontalUnit * radius / 2;
   const offsetY = (height - boardHeight) / 2 + radius;
 
-  for (const cell of Object.values(props.state.cells)) {
+  const cells = Object.values(props.state.cells);
+  for (const cell of cells) {
     // Void is absence of board rather than a dark terrain. Leaving it
     // unrendered lets the canvas background define the map silhouette.
     if (cell.terrainId === "core/void") continue;
@@ -205,10 +208,6 @@ function draw(): void {
     const y = offsetY + 1.5 * radius * cell.coordinate.row;
     cellLayouts.set(cell.id, { x, y, radius });
     drawTerrainLayer(cell.terrainId, x, y, radius);
-    const unit = cell.unitId ? props.state.units[cell.unitId] : undefined;
-    const player = unit ? props.state.players[unit.ownerId] : undefined;
-    const neutralColor = unit?.definitionId === "core/wild" ? 0xc28a4c : 0x8491a4;
-
     // This transparent hit layer stays below the unit / stronghold layers;
     // interactions remain on the hex while the visual layers are noninteractive.
     // Local target outlines use a separate overlay, leaving these hit targets
@@ -228,24 +227,22 @@ function draw(): void {
     } else bindCellInteraction(tile, cell.id);
     app.stage.addChild(tile);
 
-    const isPowered = unit ? powered.value.has(unit.id) : false;
-    const isExhausted = unit ? props.state.turn.exhaustedUnitIds.includes(unit.id) : false;
+  }
 
-    // Unit layer: a powered formation fills its cell. A roaming unit uses the
-    // same old-system tile texture at 58%, making it readable at a glance.
-    if (unit) {
-      // Powered units occupy the terrain layer's footprint without spilling
-      // over its hex edge; roaming units remain deliberately smaller.
-      const unitScale = isPowered ? 0.96 : 0.58;
-      addHexFill(x, y, radius * unitScale * 0.98, player ? colorNumber(player.color) : neutralColor, isExhausted ? 0.62 : 0.96);
-      addLegacySprite(legacyTextureUrls.plain, x, y, radius, unitScale, 0xffffff, isExhausted ? 0.16 : 0.24);
-    }
-
-    // Stronghold is deliberately above the unit layer. Its gameplay rule is
-    // composed separately; this is only the castle artwork layer.
-    if (cell.terrainId === "core/stronghold") {
-      addLegacySprite(legacyTextureUrls.stronghold, x, y, radius, 0.98);
-    }
+  // Draw all unit bodies only after every terrain tile. Otherwise later
+  // opaque terrain fills cover numbers and art belonging to earlier cells.
+  for (const cell of cells) {
+    const unit = cell.unitId ? props.state.units[cell.unitId] : undefined;
+    const layout = cellLayouts.get(cell.id);
+    if (!unit || !layout) continue;
+    const { x, y, radius } = layout;
+    const player = props.state.players[unit.ownerId];
+    const neutralColor = unit.definitionId === "core/wild" ? 0xc28a4c : 0x8491a4;
+    const isPowered = powered.value.has(unit.id);
+    const isExhausted = props.state.turn.exhaustedUnitIds.includes(unit.id);
+    const unitScale = isPowered ? 0.96 : 0.58;
+    addHexFill(x, y, radius * unitScale * 0.98, player ? colorNumber(player.color) : neutralColor, isExhausted ? 0.62 : 0.96);
+    addLegacySprite(legacyTextureUrls.plain, x, y, radius, unitScale, 0xffffff, isExhausted ? 0.16 : 0.24);
 
     if (!props.preview && unit && actionableUnits.value.has(unit.id)) {
       const pulse = new Graphics();
@@ -266,24 +263,39 @@ function draw(): void {
       app.stage.addChild(pulse);
     }
 
-    if (unit && props.showUnitLabels !== false) {
+  }
+
+  // Stronghold art belongs over unit fills, but should never obscure their
+  // numeric strength labels.
+  for (const cell of cells) {
+    const layout = cellLayouts.get(cell.id);
+    if (cell.terrainId === "core/stronghold" && layout) {
+      addLegacySprite(legacyTextureUrls.stronghold, layout.x, layout.y, layout.radius, 0.98);
+    }
+  }
+
+  for (const cell of cells) {
+    const unit = cell.unitId ? props.state.units[cell.unitId] : undefined;
+    const layout = cellLayouts.get(cell.id);
+    if (unit && layout && props.showUnitLabels !== false) {
+      const player = props.state.players[unit.ownerId];
+      const isPowered = powered.value.has(unit.id);
       const canAct = player ? actionableUnits.value.has(unit.id) : false;
       const strength = new Text({
-        text: player ? String(unit.strength) : `${unit.definitionId === "core/wild" ? "野" : "挡"}${unit.strength}`,
+        text: String(unit.strength),
         style: {
           // Preserve the old game's `aliceblue` active treatment, but keep
           // inactive units in a dim white rather than a muddy mid-grey.
           fill: canAct ? 0xffffff : 0xdce5ef,
           fontFamily: "Arial",
-          fontSize: Math.round(radius * (isPowered ? 0.6 : player ? 0.44 : 0.28)),
+          fontSize: Math.round(radius * (isPowered ? 0.6 : 0.44)),
           fontWeight: "900",
         }
       });
-      strength.anchor.set(0.5); strength.position.set(x, y + radius * 0.05); strength.eventMode = "none";
+      strength.anchor.set(0.5); strength.position.set(layout.x, layout.y + layout.radius * 0.05); strength.eventMode = "none";
       strength.zIndex = 20;
       app.stage.addChild(strength);
     }
-
   }
   const legal = new Container();
   const counterattack = new Container();

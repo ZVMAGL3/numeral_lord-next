@@ -8,6 +8,7 @@ export const router = createRouter({
     { path: "/", component: App },
     { path: "/rooms", component: App },
     { path: "/maps", component: App },
+    { path: "/maps/edit/:mapId", component: App },
     { path: "/workshop", component: App },
     { path: "/:pathMatch(.*)*", redirect: "/" }
   ]

@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import { getPoweredUnitIds, type GameState, type UnitId } from "@numeral-lord/game-core";
-import { createMatchFromMapCode, type MapDefinition } from "@numeral-lord/core-content";
+import { createMatchFromMapCode, parseMapCode, type MapDefinition } from "@numeral-lord/core-content";
 import { missingTerrainMods, type ConfiguredMap } from "../map-library";
 import { installedMapCatalogs, installedTerrainCatalog } from "../installed-content";
 import HexBoard from "./HexBoard.vue";
 import MapEditor from "./MapEditor.vue";
 
 const props = defineProps<{ maps: readonly ConfiguredMap[]; selectedId: string; actionMessage: string; actionError: boolean }>();
+const route = useRoute(), router = useRouter();
 const emit = defineEmits<{
   back: []; select: [id: string]; add: [code: string]; save: [definition: MapDefinition]; remove: [id: string];
 }>();
@@ -20,9 +22,58 @@ const confirmRemoveId = ref<string | null>(null);
 const copyStatus = ref("");
 const codeField = ref<HTMLTextAreaElement | null>(null);
 const editingDefinition = ref<MapDefinition | null>(null);
+const newDraftAvailable = ref(false);
+const EDITOR_DRAFT_KEY = "numeral-lord.map-editor-draft.v1";
+const draftCatalogs = { ...installedMapCatalogs, allowUnknownTerrainMods: true };
 const selected = computed(() => props.maps.find((map) => map.definition.id === props.selectedId) ?? props.maps[0]);
 const selectedMissingMods = computed(() => selected.value ? missingTerrainMods(selected.value) : []);
 watch(() => props.selectedId, () => { showCode.value = false; copyStatus.value = ""; });
+function readEditorDraft(mapId: string): MapDefinition | null {
+  try {
+    const saved = JSON.parse(localStorage.getItem(EDITOR_DRAFT_KEY) ?? "null") as { mapId?: unknown; definition?: unknown } | null;
+    if (!saved || saved.mapId !== mapId || !saved.definition) return null;
+    return parseMapCode(JSON.stringify(saved.definition), draftCatalogs);
+  } catch {
+    return null;
+  }
+}
+function clearEditorDraft(mapId: string): void {
+  try {
+    const saved = JSON.parse(localStorage.getItem(EDITOR_DRAFT_KEY) ?? "null") as { mapId?: unknown } | null;
+    if (saved?.mapId === mapId) localStorage.removeItem(EDITOR_DRAFT_KEY);
+  } catch {
+    localStorage.removeItem(EDITOR_DRAFT_KEY);
+  }
+  newDraftAvailable.value = Boolean(readEditorDraft("new"));
+}
+function restoreEditorRoute(path: string): void {
+  const match = path.match(/^\/maps\/edit\/([^/]+)$/);
+  if (!match) {
+    view.value = "library";
+    newDraftAvailable.value = Boolean(readEditorDraft("new"));
+    return;
+  }
+  const mapId = decodeURIComponent(match[1]!);
+  view.value = "editor";
+  const draft = readEditorDraft(mapId);
+  if (draft) {
+    editingDefinition.value = draft;
+    return;
+  }
+  if (mapId === "new") {
+    editingDefinition.value = null;
+    return;
+  }
+  const map = props.maps.find((entry) => entry.definition.id === mapId);
+  if (!map) {
+    editingDefinition.value = null;
+    view.value = "library";
+    void router.replace("/maps");
+    return;
+  }
+  editingDefinition.value = map.definition;
+}
+watch(() => route.path, restoreEditorRoute, { immediate: true });
 const previewState = computed<GameState | null>(() => {
   if (!selected.value) return null;
   try { return createMatchFromMapCode(selected.value.code, installedMapCatalogs); } catch { return null; }
@@ -42,15 +93,32 @@ function cardPreview(map: ConfiguredMap): { state: GameState; poweredUnitIds: re
   return cardPreviews.value.get(map.definition.id);
 }
 function selectMap(id: string): void { emit("select", id); view.value = "detail"; }
-function startCreate(): void { editingDefinition.value = null; view.value = "editor"; }
+function startCreate(): void { void router.push("/maps/edit/new"); }
+function resumeNewDraft(): void { void router.push("/maps/edit/new"); }
 function startEdit(): void {
   if (!selected.value) return;
   editingDefinition.value = selected.value.isDefault
     ? { ...selected.value.definition, id: `custom-${Date.now().toString(36)}`, name: `${selected.value.definition.name} 副本` }
     : selected.value.definition;
-  view.value = "editor";
+  void router.push(`/maps/edit/${encodeURIComponent(editingDefinition.value.id)}`);
 }
-function saveDefinition(definition: MapDefinition): void { emit("save", definition); view.value = "library"; }
+function saveEditorDraft(definition: MapDefinition): void {
+  const mapId = typeof route.params.mapId === "string" ? route.params.mapId : "";
+  if (!mapId) return;
+  try {
+    localStorage.setItem(EDITOR_DRAFT_KEY, JSON.stringify({ mapId, definition, updatedAt: Date.now() }));
+    if (mapId === "new") newDraftAvailable.value = true;
+  } catch {
+    // The editor remains usable if local storage is disabled or full.
+  }
+}
+function saveDefinition(definition: MapDefinition): void {
+  const mapId = typeof route.params.mapId === "string" ? route.params.mapId : "";
+  emit("save", definition);
+  if (mapId) clearEditorDraft(mapId);
+  void router.push("/maps");
+}
+function cancelEditor(): void { void router.push("/maps"); }
 function addMap(): void { emit("add", codeDraft.value.trim()); }
 function clearCodeDraft(): void { codeDraft.value = ""; }
 async function copyCode(): Promise<void> {
@@ -73,7 +141,7 @@ defineExpose({ clearCodeDraft });
     </header>
 
     <template v-if="view === 'library'">
-      <div class="library-toolbar"><div><strong>我的地图</strong><span>{{ maps.length }} 张 · 仅保存在本机</span></div><div><button class="outline-button" @click="view = 'import'">导入地图</button><button class="primary-button" @click="startCreate">＋ 创建地图</button></div></div>
+      <div class="library-toolbar"><div><strong>我的地图</strong><span>{{ maps.length }} 张 · 仅保存在本机</span></div><div><button v-if="newDraftAvailable" class="outline-button" @click="resumeNewDraft">继续编辑草稿</button><button class="outline-button" @click="view = 'import'">导入地图</button><button class="primary-button" @click="startCreate">＋ 创建地图</button></div></div>
       <p v-if="actionMessage" class="action-message" :class="{ error: actionError }" role="status">{{ actionMessage }}</p>
       <div class="map-cards">
         <button v-for="map in maps" :key="map.definition.id" class="map-card" @click="selectMap(map.definition.id)">
@@ -99,7 +167,7 @@ defineExpose({ clearCodeDraft });
     <template v-else-if="view === 'import'">
       <article class="import-card"><div class="import-head"><div><h3>导入地图</h3><p>地图码只在你点击“显示地图码”或“复制地图码”时出现，不会占据地图库页面。</p></div><button class="outline-button" @click="startCreate">打开地图编辑器</button></div><label for="map-code">地图码</label><textarea id="map-code" v-model="codeDraft" class="code-input" spellcheck="false" placeholder="粘贴地图码 JSON…" /><div class="import-bottom"><span :class="{ error: actionError }" role="status">{{ actionMessage }}</span><button class="primary-button" :disabled="!codeDraft.trim()" @click="addMap">导入到我的地图</button></div></article>
     </template>
-    <MapEditor v-else-if="view === 'editor'" :initial="editingDefinition" @save="saveDefinition" @cancel="view = 'library'" />
+    <MapEditor v-else-if="view === 'editor'" :initial="editingDefinition" @draft="saveEditorDraft" @save="saveDefinition" @cancel="cancelEditor" />
 
     <div v-if="confirmRemoveId" class="confirm-backdrop" @click.self="confirmRemoveId = null"><div class="confirm-dialog" role="dialog" aria-modal="true" aria-label="移除地图"><h3>从本机移除地图？</h3><p>这只会删除当前浏览器中的个人地图，不会影响已复制的地图码或创意工坊作品。</p><div><button class="outline-button" @click="confirmRemoveId = null">取消</button><button class="danger-button" @click="confirmRemove">移除地图</button></div></div></div>
   </section>

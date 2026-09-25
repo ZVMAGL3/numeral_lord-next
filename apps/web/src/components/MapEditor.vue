@@ -7,7 +7,7 @@ import HexBoard from "./HexBoard.vue";
 import { installedMapCatalogs, installedTerrainMods } from "../installed-content";
 
 const props = defineProps<{ initial?: MapDefinition | null }>();
-const emit = defineEmits<{ save: [definition: MapDefinition]; cancel: [] }>();
+const emit = defineEmits<{ save: [definition: MapDefinition]; draft: [definition: MapDefinition]; cancel: [] }>();
 type TerrainOption = { id: string; name: string; color: string; blocked?: boolean; modId?: string };
 const coreTerrains: TerrainOption[] = [
   { id: "core/plain", name: "平原", color: "#63985d" }, { id: "core/ocean", name: "海洋", color: "#2f72c8" },
@@ -18,7 +18,9 @@ const terrainOptions = computed<TerrainOption[]>(() => [...coreTerrains, ...inst
   id: t.id, name: t.displayName, color: t.id === "mod/oil-field" ? "#9a6338" : "#8173ac", modId: mod.id
 })))]);
 const width = ref(props.initial?.columns ?? 9), height = ref(props.initial ? props.initial.terrain.length / props.initial.columns : 9);
+const widthInput = ref(String(width.value)), heightInput = ref(String(height.value));
 const players = ref(props.initial?.players ?? 2), name = ref(props.initial?.name ?? "新地图");
+const playersInput = ref(String(players.value));
 const terrain = ref<string[]>([]), soldiers = ref<Array<{ index: number; seat: number; strength: number }>>([]);
 const specialUnits = ref<Array<{ index: number; kind: "wild" | "blocker"; strength: number }>>([]), teams = ref<number[]>([]);
 const selectedTerrain = ref("core/plain"), placementMode = ref<"terrain" | "unit" | "erase">("terrain");
@@ -48,7 +50,8 @@ let editorDraggingAt = 0;
 
 function resetFromDefinition(definition?: MapDefinition | null): void {
   width.value = definition?.columns ?? 9; height.value = definition ? definition.terrain.length / definition.columns : 9;
-  players.value = definition?.players ?? 2; name.value = definition?.name ?? "新地图";
+  widthInput.value = String(width.value); heightInput.value = String(height.value);
+  players.value = definition?.players ?? 2; playersInput.value = String(players.value); name.value = definition?.name ?? "新地图";
   const count = width.value * height.value;
   terrain.value = Array.from({ length: count }, (_, i) => {
     if (!definition) return "core/plain";
@@ -65,12 +68,25 @@ watch([width, height], () => {
   const count = Math.max(1, Math.min(4096, width.value * height.value));
   terrain.value = Array.from({ length: count }, (_, i) => terrain.value[i] ?? "core/plain");
   soldiers.value = soldiers.value.filter((u) => u.index < count); specialUnits.value = specialUnits.value.filter((u) => u.index < count);
-}, { flush: "sync" });
+});
 watch(players, (value) => {
   selectedSeat.value = Math.min(selectedSeat.value, value);
   teams.value = Array.from({ length: value }, (_, i) => teams.value[i] ?? i + 1);
   soldiers.value = soldiers.value.filter((u) => u.seat <= value);
 }, { flush: "sync" });
+function applyBoardSize(): void {
+  const nextWidth = Math.max(1, Math.min(64, Math.trunc(Number(widthInput.value) || 1)));
+  const nextHeight = Math.max(1, Math.min(64, Math.floor(4096 / nextWidth), Math.trunc(Number(heightInput.value) || 1)));
+  widthInput.value = String(nextWidth);
+  heightInput.value = String(nextHeight);
+  width.value = nextWidth;
+  height.value = nextHeight;
+}
+function applyPlayerCount(): void {
+  const next = Math.max(1, Math.min(64, Math.trunc(Number(playersInput.value) || 1)));
+  playersInput.value = String(next);
+  players.value = next;
+}
 const previewDefinition = computed<MapDefinition>(() => {
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
   const legend: Record<string, string> = {}, terrainSymbols = new Map<string, string>();
@@ -96,12 +112,16 @@ const previewDefinition = computed<MapDefinition>(() => {
     players: players.value,
     soldiers: soldiers.value.map(({ index, seat, strength }) => [index, seat, strength] as const),
     ...(specialUnits.value.length ? { specialUnits: specialUnits.value.map(({ index, kind, strength }) => [index, kind, strength] as const) } : {}),
-    teams: teams.value,
+    teams: Array.from({ length: players.value }, (_, index) => {
+      const team = Number(teams.value[index]);
+      return Number.isInteger(team) && team >= 1 && team <= 64 ? team : index + 1;
+    }),
     matchConditionIds: []
   };
 });
 const previewState = computed(() => createMatchFromMapDefinition(previewDefinition.value, installedMapCatalogs));
 const previewPoweredUnitIds = computed(() => [...getPoweredUnitIds(previewState.value, installedMapCatalogs.terrains)]);
+watch(previewDefinition, (definition) => emit("draft", definition), { immediate: true });
 
 function paintCellId(cellId: CellId): void {
   const { column, row } = fromCellId(cellId);
@@ -181,7 +201,10 @@ function saveMap(): void {
       requiredTerrainModIds: [...new Set(terrain.value.map((id) => terrainLookup.value.get(id)?.modId).filter((id): id is string => Boolean(id)))],
       players: players.value, soldiers: soldiers.value.map((u) => [u.index, u.seat, u.strength] as const),
       ...(specialUnits.value.length ? { specialUnits: specialUnits.value.map((u) => [u.index, u.kind, u.strength] as const) } : {}),
-      teams: teams.value, matchConditionIds: props.initial?.matchConditionIds ?? ["core/lose-all-survival-anchors", "core/last-team-standing"]
+      teams: Array.from({ length: players.value }, (_, index) => {
+        const team = Number(teams.value[index]);
+        return Number.isInteger(team) && team >= 1 && team <= 64 ? team : index + 1;
+      }), matchConditionIds: props.initial?.matchConditionIds ?? ["core/lose-all-survival-anchors", "core/last-team-standing"]
     };
     emit("save", definition);
   } catch (error) { formError.value = error instanceof Error ? error.message : "地图无法保存。"; }
@@ -217,8 +240,8 @@ function createId(): string { return typeof crypto.randomUUID === "function" ? c
       <aside v-if="settingsOpen" class="editor-settings" role="dialog" aria-label="地图设置">
         <div class="side-title"><span>地图设置</span><button class="settings-close" aria-label="关闭设置" @click="settingsOpen = false">×</button></div>
         <label>地图名称<input v-model="name" maxlength="60" /></label>
-        <div class="form-grid"><label>宽度<input v-model.number="width" type="number" min="1" max="64" @change="width = Math.max(1, Math.min(64, Math.trunc(width || 1))); height = Math.min(height, Math.floor(4096 / width))" /></label><label>高度<input v-model.number="height" type="number" min="1" max="64" @change="height = Math.max(1, Math.min(64, Math.trunc(height || 1), Math.floor(4096 / width)))" /></label></div>
-        <details class="advanced-settings" open><summary>对局规则 <small>{{ players }} 位玩家 · 初始 {{ strength }} 点</small></summary><div class="form-grid"><label>玩家位<input v-model.number="players" type="number" min="1" max="64" @change="players = Math.max(1, Math.min(64, Math.trunc(players || 1)))" /></label><label>初始点数<input v-model.number="strength" type="number" min="1" max="65535" @change="strength = Math.max(1, Math.min(65535, Math.trunc(strength || 1)))" /></label></div><div class="team-settings"><label v-for="(_, index) in teams" :key="index">玩家 {{ index + 1 }}<input v-model.number="teams[index]" type="number" min="1" max="64" /></label><small>相同队伍号表示同队。</small></div><p class="compat-note">阻挡不反击；野怪会反击，次数取决于所在地皮。</p></details>
+        <div class="form-grid"><label>宽度<input v-model="widthInput" type="number" min="1" max="64" @change="applyBoardSize" /></label><label>高度<input v-model="heightInput" type="number" min="1" max="64" @change="applyBoardSize" /></label></div>
+        <details class="advanced-settings" open><summary>对局规则 <small>{{ players }} 位玩家 · 初始 {{ strength }} 点</small></summary><div class="form-grid"><label>玩家位<input v-model="playersInput" type="number" min="1" max="64" @change="applyPlayerCount" /></label><label>初始点数<input v-model.number="strength" type="number" min="1" max="65535" @change="strength = Math.max(1, Math.min(65535, Math.trunc(strength || 1)))" /></label></div><div class="team-settings"><label v-for="(_, index) in teams" :key="index">玩家 {{ index + 1 }}<input v-model.number="teams[index]" type="number" min="1" max="64" /></label><small>相同队伍号表示同队。</small></div><p class="compat-note">阻挡不反击；野怪会反击，次数取决于所在地皮。</p></details>
       </aside>
       <p v-if="formError" class="form-error editor-error" role="alert">{{ formError }}</p>
     </div>

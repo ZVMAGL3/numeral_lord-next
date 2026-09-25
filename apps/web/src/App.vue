@@ -201,7 +201,7 @@ const route = useRoute();
 const router = useRouter();
 const page = computed<"home" | "maps" | "workshop" | "rooms">(() => {
   if (route.query.room) return "rooms";
-  if (route.path === "/maps") return "maps";
+  if (route.path === "/maps" || route.path.startsWith("/maps/edit/")) return "maps";
   if (route.path === "/workshop") return "workshop";
   if (route.path === "/rooms") return "rooms";
   return "home";

@@ -178,6 +178,12 @@ importers:
       '@numeral-lord/core-content':
         specifier: workspace:*
         version: link:../../packages/core-content
+      '@numeral-lord/decay-terrain-mod':
+        specifier: workspace:*
+        version: link:../../packages/decay-terrain-mod
+      '@numeral-lord/desert-terrain-mod':
+        specifier: workspace:*
+        version: link:../../packages/desert-terrain-mod
       '@numeral-lord/game-core':
         specifier: workspace:*
         version: link:../../packages/game-core

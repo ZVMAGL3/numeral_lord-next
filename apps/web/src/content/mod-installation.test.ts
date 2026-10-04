@@ -1,9 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { reactive } from "vue";
 import type { TerrainModDefinition } from "@numeral-lord/content-schema";
-import { oilFieldMod } from "@numeral-lord/oil-field-mod";
 import { cloneTerrainModDefinition } from "./mod-installation.js";
-import { terrainModDefinitionObject, validateTerrainModObject } from "./installed-content.js";
+import { validateTerrainModObject } from "./installed-content.js";
 
 describe("terrain Mod persistence serialization", () => {
   it("unwraps nested Vue proxies before structured cloning for IndexedDB", () => {
@@ -37,6 +36,6 @@ describe("terrain Mod persistence serialization", () => {
       ...valid,
       rules: [{ type: "run-javascript", source: "alert(1)" }]
     } as unknown as TerrainModDefinition)).toThrow(/Mod 规则/);
-    expect(() => validateTerrainModObject(terrainModDefinitionObject(oilFieldMod))).not.toThrow();
+    expect(() => validateTerrainModObject(valid)).not.toThrow();
   });
 });

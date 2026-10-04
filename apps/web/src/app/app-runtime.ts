@@ -44,8 +44,6 @@ import {
   registerInstalledTerrainModObject,
   installedTerrainModContentHashes,
   validateTerrainModObject,
-  bundledTerrainModIds,
-  installTerrainModObject,
   installedMapCatalogs,
   installedTerrainCatalog,
   installedTerrainMods,
@@ -261,17 +259,6 @@ export function useAppRuntime() {
     else if (action === "out") gameBoardRef.value?.zoomOut();
     else gameBoardRef.value?.resetZoom();
   }
-  const builtInTerrainMod: TerrainModEntry = {
-    id: "local:mod-oil-field",
-    modId: installedTerrainMods[0]!.id,
-    name: "油田",
-    version: installedTerrainMods[0]!.version,
-    description: "占据时每回合产生 2 点；离开时留下 1 点游兵。不导电。这个地块由独立的 oil-field-mod 包提供。",
-    terrainId: installedTerrainMods[0]!.terrain?.id ?? "mod/oil-field",
-    installed: true,
-    authorName: "Numeral Lord",
-    definition: terrainModDefinitionObject(installedTerrainMods[0]!)
-  };
   const builtInMapWork: MapWorkshopEntry = {
     id: "local:map-1001",
     mapId: DEFAULT_MAP_DEFINITION.id,
@@ -301,7 +288,7 @@ export function useAppRuntime() {
   })));
   const workshopTerrainMods = computed(() => mergeWorkshopTerrainCatalog(
     remoteTerrainMods.value,
-   [builtInTerrainMod],
+    [],
     localInstalledTerrainMods.value
   ));
   const workshopMapWorks = computed(() => [builtInMapWork, ...remoteMapWorks.value]);
@@ -1343,9 +1330,8 @@ export function useAppRuntime() {
   }
 
   function connectWorkshopForLobbyModUpdates(refreshCatalog = false): void {
-    const usesBundledMod = lobbyState.value.requiredTerrainModIds.some((id) => bundledTerrainModIds.has(id));
     if (activeRouteSection.value !== "rooms" || lobbyState.value.phase !== "lobby"
-      || (subscribedTerrainModIds.value.length === 0 && !usesBundledMod)) return;
+      || (subscribedTerrainModIds.value.length === 0 && lobbyState.value.requiredTerrainModIds.length === 0)) return;
     ensureWorkshopClient();
     if (workshopClient?.connected) {
       if (refreshCatalog) workshopClient.requestList();
@@ -1361,8 +1347,7 @@ export function useAppRuntime() {
   }
 
   function mapPreviewNeedsWorkshopUpdate(): boolean {
-    return getMapRequiredTerrainModIds().some((id) => bundledTerrainModIds.has(id)
-      || subscribedTerrainModIds.value.includes(id));
+    return getMapRequiredTerrainModIds().length > 0;
   }
 
   function connectWorkshopForMapPreviewUpdates(): void {
@@ -1396,7 +1381,6 @@ export function useAppRuntime() {
   }
 
   function selectWorkshopTerrainMod(id: string): void {
-    if (id === builtInTerrainMod.id) return;
     const entry = remoteTerrainModReleases.value.find((candidate) => candidate.id === id)
       ?? remoteTerrainMods.value.find((candidate) => candidate.id === id || candidate.modId === id);
     if (entry && !entry.definition) workshopClient?.requestDetail("terrain-mod", entry.id);
@@ -1566,14 +1550,11 @@ export function useAppRuntime() {
       if (!canApplySubscribedModUpdate(showWorkshop.value, lobbyState.value.phase === "playing", activeRouteSection.value === "rooms", showMaps.value)) return;
       subscribedTerrainModIds.value = subscriptions.map((entry) => entry.id);
       const updates = (showMaps.value
-        ? mapTerrainModUpdateCandidates(entries, subscriptions, installedTerrainMods, bundledTerrainModIds, getMapRequiredTerrainModIds())
+        ? mapTerrainModUpdateCandidates(entries, subscriptions, installedTerrainMods, getMapRequiredTerrainModIds())
         : terrainModUpdateCandidates(
           entries,
           subscriptions,
-          installedTerrainMods,
-          bundledTerrainModIds,
-          showWorkshop.value,
-          activeRouteSection.value === "rooms" && lobbyState.value.phase === "lobby" ? lobbyState.value.requiredTerrainModIds : []
+          installedTerrainMods
         )).filter(({ id }) => !pendingSubscribedModUpdateIds.value.includes(id));
       pendingSubscribedModUpdateIds.value = updates.map(({ id }) => id);
       if (updates.length > 0 && activeRouteSection.value === "rooms" && lobbyState.value.phase === "lobby") sendLobbyReady(false);
@@ -1595,25 +1576,15 @@ export function useAppRuntime() {
       // A catalog reply can arrive after the user has entered a match; recheck at apply time.
       if (!canApplySubscribedModUpdate(showWorkshop.value, lobbyState.value.phase === "playing", activeRouteSection.value === "rooms", showMaps.value)) return;
       const isSubscribed = subscriptions.some((entry) => entry.id === definition.id);
-      const isRoomDependency = activeRouteSection.value === "rooms" && lobbyState.value.phase === "lobby"
-        && lobbyState.value.requiredTerrainModIds.includes(definition.id);
       const isMapDependency = showMaps.value && getMapRequiredTerrainModIds().includes(definition.id);
-      const isBundledUpdate = bundledTerrainModIds.has(definition.id)
-        && (showWorkshop.value || isRoomDependency || isMapDependency);
       if (showMaps.value && !isMapDependency) return;
-      if (!isSubscribed && !isBundledUpdate) return;
+      if (!isSubscribed) return;
       const current = installedTerrainMods.find((mod) => mod.id === definition.id)?.version;
       if (current && compareModVersions(definition.version, current) <= 0) return;
       validateTerrainModObject(definition);
       const name = terrainModDisplayName(definition);
-      if (isSubscribed) {
-        await updateSubscribedMod(definition, name);
-        registerInstalledTerrainModObject(definition, name);
-      } else {
-        // Store the server-authored release and its fetched artwork locally, but
-        // do not silently create a user subscription for an app-bundled Mod.
-        await installTerrainModObject(definition, name);
-      }
+      await updateSubscribedMod(definition, name);
+      registerInstalledTerrainModObject(definition, name);
       reportInstalledModsToRoom();
       logConnection("mods.updated", { modId: definition.id, version: definition.version });
       if (activeRouteSection.value === "rooms") roomModUpdateMessage.value = `已自动更新「${definition.id}」v${definition.version}；房间成员需统一版本后重新准备。`;

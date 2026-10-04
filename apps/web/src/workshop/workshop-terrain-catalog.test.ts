@@ -3,8 +3,8 @@ import { canApplySubscribedModUpdate, latestTerrainModVersions, mapTerrainModUpd
 import type { TerrainModEntry } from "./types";
 
 const oilField: TerrainModEntry = {
-  id: "local:mod-oil-field", modId: "mod-oil-field", name: "油田", version: "1.0.0",
-  description: "本机内置地块。", terrainId: "mod/oil-field", installed: true
+  id: "local-installed:mod-oil-field", modId: "mod-oil-field", name: "油田", version: "1.0.0",
+  description: "本机已安装的地块。", terrainId: "mod/oil-field", installed: true
 };
 const decay: TerrainModEntry = {
   id: "local-installed:mod-decay-terrain", modId: "mod-decay-terrain", name: "衰蚀地", version: "0.1.0",
@@ -42,7 +42,7 @@ describe("workshop terrain catalog", () => {
     expect(latestTerrainModVersions(versions).map(({ id }) => id)).toEqual(["stable"]);
   });
 
-  it("checks bundled Mods in the Workshop without creating subscriptions", () => {
+  it("does not update an installed Mod unless the player subscribed to it", () => {
     const latest = [
       { id: "workshop-oil-field-v2", modId: "mod-oil-field", version: "0.1.1" },
       { id: "workshop-decay-v2", modId: "mod-decay-terrain", version: "0.3.1" }
@@ -50,36 +50,14 @@ describe("workshop terrain catalog", () => {
     expect(terrainModUpdateCandidates(
       latest,
       [],
-      [{ id: "mod-oil-field", version: "0.1.0" }],
-      new Set(["mod-oil-field", "mod-decay-terrain"]),
-      true
-    )).toEqual([{ id: "mod-oil-field", entry: latest[0] }]);
+      [{ id: "mod-oil-field", version: "0.1.0" }]
+    )).toEqual([]);
   });
 
-  it("checks only map-required bundled Mods in a room, while retaining subscribed updates", () => {
+  it("checks only subscribed Mod updates required by the open map", () => {
     const latest = [
       { id: "oil-v2", modId: "mod-oil-field", version: "0.1.1" },
       { id: "desert-v2", modId: "mod-desert-terrain", version: "0.2.0" },
-      { id: "subscribed-v2", modId: "mod-community", version: "2.0.0" }
-    ];
-    const updates = terrainModUpdateCandidates(
-      latest,
-      [{ id: "mod-community", installedVersion: "1.0.0" }],
-      [
-        { id: "mod-oil-field", version: "0.1.0" },
-        { id: "mod-desert-terrain", version: "0.1.0" }
-      ],
-      new Set(["mod-oil-field", "mod-desert-terrain"]),
-      false,
-      ["mod-oil-field"]
-    );
-    expect(updates.map(({ id }) => id)).toEqual(["mod-community", "mod-oil-field"]);
-  });
-
-  it("checks only a map's dependencies and fetches bundled artwork without subscribing", () => {
-    const latest = [
-      { id: "oil-v2", modId: "mod-oil-field", version: "0.1.1" },
-      { id: "decay-v2", modId: "mod-decay-terrain", version: "0.2.0" },
       { id: "subscribed-v2", modId: "mod-community", version: "2.0.0" }
     ];
     const updates = mapTerrainModUpdateCandidates(
@@ -87,13 +65,30 @@ describe("workshop terrain catalog", () => {
       [{ id: "mod-community", installedVersion: "1.0.0" }],
       [
         { id: "mod-oil-field", version: "0.1.0" },
+        { id: "mod-community", version: "1.0.0" }
+      ],
+      ["mod-community", "mod-oil-field"]
+    );
+    expect(updates.map(({ id }) => id)).toEqual(["mod-community"]);
+  });
+
+  it("ignores map dependencies that are not explicitly subscribed", () => {
+    const latest = [
+      { id: "oil-v2", modId: "mod-oil-field", version: "0.1.1" },
+      { id: "decay-v2", modId: "mod-decay-terrain", version: "0.2.0" },
+      { id: "subscribed-v2", modId: "mod-community", version: "2.0.0" }
+    ];
+    const updates = mapTerrainModUpdateCandidates(
+      latest,
+      [],
+      [
+        { id: "mod-oil-field", version: "0.1.0" },
         { id: "mod-decay-terrain", version: "0.2.0" },
         { id: "mod-community", version: "1.0.0" }
       ],
-      new Set(["mod-oil-field", "mod-decay-terrain"]),
       ["mod-oil-field", "mod-decay-terrain"]
     );
-    expect(updates.map(({ id }) => id)).toEqual(["mod-oil-field"]);
+    expect(updates).toEqual([]);
   });
 
   it("keeps newly installed packages visible when the workshop is offline", () => {
@@ -104,7 +99,7 @@ describe("workshop terrain catalog", () => {
   it("retains remote entries and marks their installed package without duplicating it", () => {
     const { definition: _definition, ...summary } = decay;
     const remote: TerrainModEntry = { ...summary, id: "workshop-decay", installed: false };
-    const [entry] = mergeWorkshopTerrainCatalog([remote], [oilField], [decay]);
+    const [entry] = mergeWorkshopTerrainCatalog([remote], [], [decay]);
     expect(entry).toMatchObject({ id: "workshop-decay", modId: "mod-decay-terrain", installed: true, definition: decay.definition });
     expect(mergeWorkshopTerrainCatalog([remote], [], [decay])).toHaveLength(1);
   });

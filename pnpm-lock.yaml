@@ -178,12 +178,6 @@ importers:
       '@numeral-lord/core-content':
         specifier: workspace:*
         version: link:../../packages/core-content
-      '@numeral-lord/decay-terrain-mod':
-        specifier: workspace:*
-        version: link:../../packages/decay-terrain-mod
-      '@numeral-lord/desert-terrain-mod':
-        specifier: workspace:*
-        version: link:../../packages/desert-terrain-mod
       '@numeral-lord/game-core':
         specifier: workspace:*
         version: link:../../packages/game-core
@@ -227,24 +221,12 @@ importers:
       '@numeral-lord/core-content':
         specifier: workspace:*
         version: link:../../packages/core-content
-      '@numeral-lord/decay-terrain-mod':
-        specifier: workspace:*
-        version: link:../../packages/decay-terrain-mod
-      '@numeral-lord/desert-terrain-mod':
-        specifier: workspace:*
-        version: link:../../packages/desert-terrain-mod
-      '@numeral-lord/example-mods':
-        specifier: workspace:*
-        version: link:../../packages/example-mods
       '@numeral-lord/game-core':
         specifier: workspace:*
         version: link:../../packages/game-core
       '@numeral-lord/game-sdk':
         specifier: workspace:*
         version: link:../../packages/game-sdk
-      '@numeral-lord/oil-field-mod':
-        specifier: workspace:*
-        version: link:../../packages/oil-field-mod
       pinia:
         specifier: ^4.0.3
         version: 4.0.3(@vue/devtools-api@8.2.1)(typescript@5.9.3)(vue@3.5.43(typescript@5.9.3))

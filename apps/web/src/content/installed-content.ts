@@ -2,31 +2,18 @@ import { coreTerrainCatalog, type MapCatalogs } from "@numeral-lord/core-content
 import { validateTerrainModDefinition, type TerrainModDefinition } from "@numeral-lord/content-schema";
 import type { ModDefinition } from "@numeral-lord/game-sdk";
 import type { ModContentLock, TerrainCatalog } from "@numeral-lord/game-core";
-import { decayTerrainMod } from "@numeral-lord/decay-terrain-mod";
-import { desertTerrainMod } from "@numeral-lord/desert-terrain-mod";
-import { exampleTerrainMods } from "@numeral-lord/example-mods";
-import { oilFieldMod, oilFieldTerrainCatalog } from "@numeral-lord/oil-field-mod";
 import { reactive } from "vue";
 import { compareModVersions } from "../workshop/workshop-terrain-catalog.js";
 import { loadInstalledTerrainModObjects, loadInstalledTerrainModReleases, persistInstalledTerrainModObject, terrainModContentHash, type CachedTerrainModRelease } from "./mod-installation";
 
-/** Bundled playable examples plus persisted packages, all validated before hydration. */
-const bundledTerrainMods: ModDefinition[] = [oilFieldMod, decayTerrainMod, desertTerrainMod, ...exampleTerrainMods];
-/** IDs for app-shipped Mods; their artwork and later releases still come from the Workshop. */
-export const bundledTerrainModIds: ReadonlySet<string> = new Set(bundledTerrainMods.map((mod) => mod.id));
-export const installedTerrainMods = reactive<ModDefinition[]>(bundledTerrainMods);
+/** Mods are external content: only explicit local installs enter the active catalog. */
+export const installedTerrainMods = reactive<ModDefinition[]>([]);
 /** Immutable cached releases are separate from the active subscription version. */
 export const cachedTerrainModReleases = reactive<CachedTerrainModRelease[]>([]);
 
-export const installedTerrainCatalog = reactive<Record<string, (typeof coreTerrainCatalog)[string]>>({
-  ...coreTerrainCatalog,
-  ...oilFieldTerrainCatalog,
-  ...Object.fromEntries(bundledTerrainMods.flatMap((mod) => mod.terrain ? [[mod.terrain.id, mod.terrain]] : []))
-});
+export const installedTerrainCatalog = reactive<Record<string, (typeof coreTerrainCatalog)[string]>>({ ...coreTerrainCatalog });
 
-export const installedTerrainModIds = reactive<Record<string, string>>(Object.fromEntries(
-  bundledTerrainMods.flatMap((mod) => mod.terrain ? [[mod.terrain.id, mod.id]] : [])
-));
+export const installedTerrainModIds = reactive<Record<string, string>>({});
 
 const installedModCatalog = reactive<Record<string, ModDefinition>>(
   Object.fromEntries(installedTerrainMods.map((mod) => [mod.id, mod]))
@@ -106,9 +93,7 @@ function registerTerrainModObject(definition: TerrainModDefinition, name: string
   const current = installedTerrainMods.find((mod) => mod.id === definition.id);
   if (current) {
     const versionOrder = compareModVersions(current.version, definition.version);
-    // The shipped definition is authoritative for its exact bundled release.
-    // A same-version IndexedDB copy must not replace packaged visual assets.
-    if (versionOrder > 0 || (versionOrder === 0 && bundledTerrainModIds.has(definition.id))) return;
+    if (versionOrder > 0) return;
   }
   const runtimeMod = runtimeTerrainMod(definition, name);
   const previousIndex = installedTerrainMods.findIndex((mod) => mod.id === definition.id);

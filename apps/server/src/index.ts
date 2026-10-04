@@ -35,7 +35,7 @@ import {
 } from "./workshop.js";
 import { defaultWorkshopDataDirectory, getTerrainAssetContentType, workshopTerrainAssetDirectory } from "./workshop-assets.js";
 
-/** The relay accepts only terrain content the deployed client currently ships. */
+/** Server-side schemas validate map and Mod settings; this does not install Mods on clients. */
 const installedMapCatalogs = {
   terrains: { ...coreTerrainCatalog, ...oilFieldTerrainCatalog },
   terrainModIds: { [oilFieldMod.terrain.id]: oilFieldMod.id },

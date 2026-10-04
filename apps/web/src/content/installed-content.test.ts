@@ -1,8 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { TerrainModDefinition } from "@numeral-lord/content-schema";
-import { coreTerrainCatalog, DEFAULT_MAP_DEFINITION, serializeMapCode, createMatchFromMapCode } from "@numeral-lord/core-content";
+import { coreTerrainCatalog, DEFAULT_MAP_DEFINITION, createMatchFromMapCode, parseMapCode, serializeMapCode } from "@numeral-lord/core-content";
 import {
-  bundledTerrainModIds,
   installedTerrainCatalog,
   installedTerrainModIds,
   installedTerrainMods,
@@ -39,18 +38,14 @@ function mapCodeFor(mod: TerrainModDefinition, id: string): string {
 }
 
 describe("map Mod dependency release resolution", () => {
-  it("ships the existing decay example and the new playable rule examples in the map editor catalog", () => {
-    expect(installedTerrainMods.map(({ id }) => id)).toEqual(expect.arrayContaining([
-      "mod-decay-terrain",
-      "mod-sample-grove",
-      "mod-sample-ward"
-    ]));
-    expect(installedTerrainCatalog["mod/sample-grove"]?.visuals?.baseColor).toBe("#5f8d64");
-    expect(installedTerrainModIds["mod/sample-ward"]).toBe("mod-sample-ward");
+  it("starts with only core terrain and no bundled Mods", () => {
+    expect(installedTerrainMods).toEqual([]);
+    expect(Object.keys(installedTerrainModIds)).toEqual([]);
+    expect(installedTerrainCatalog["mod/oil-field"]).toBeUndefined();
+    expect(installedTerrainCatalog["core/plain"]).toEqual(coreTerrainCatalog["core/plain"]);
   });
 
-  it("identifies bundled Mods without bundling their Workshop artwork", () => {
-    expect(bundledTerrainModIds.has("mod-oil-field")).toBe(true);
+  it("passes artwork from a Mod explicitly present in the resolved catalog", () => {
     const assetUrl = "data:image/svg+xml;base64,PHN2Zy8+";
     const catalogs = {
       mods: {
@@ -67,7 +62,7 @@ describe("map Mod dependency release resolution", () => {
     expect(terrainVisualAssetsForCatalogs(catalogs)).toEqual({ "mod/oil-field": { "oil-art": assetUrl } });
   });
 
-  it("parses map 1001 with both Mod terrain IDs and preserves its F/G tile counts", () => {
+  it("keeps map 1001's oil-field as an external dependency instead of preinstalling it", () => {
     const code = JSON.stringify({
       version: 1,
       id: "1001",
@@ -87,16 +82,9 @@ describe("map Mod dependency release resolution", () => {
       matchConditionIds: []
     });
     const catalogs = resolveMapCatalogs(code);
-    expect(catalogs?.mods?.["mod-oil-field"]?.terrain?.id).toBe("mod/oil-field");
-    expect(catalogs?.mods?.["mod-decay-terrain"]?.terrain?.id).toBe("mod/decay-terrain");
-    const state = createMatchFromMapCode(code, catalogs!);
-    const counts = Object.values(state.cells).reduce<Record<string, number>>((result, cell) => {
-      if (cell.terrainId.startsWith("mod/")) result[cell.terrainId] = (result[cell.terrainId] ?? 0) + 1;
-      return result;
-    }, {});
-    expect(Object.keys(state.cells)).toHaveLength(81);
-    expect(counts).toEqual({ "mod/decay-terrain": 2, "mod/oil-field": 2 });
-    expect(Object.keys(state.units)).toHaveLength(7);
+    expect(catalogs?.mods).toEqual({});
+    expect(catalogs?.terrains?.["mod/oil-field"]).toBeUndefined();
+    expect(parseMapCode(code, catalogs!).requiredTerrainModIds).toEqual(["mod-oil-field", "mod-decay-terrain"]);
   });
 
   it("follows the active release locally and the host-selected cached release in a room", () => {

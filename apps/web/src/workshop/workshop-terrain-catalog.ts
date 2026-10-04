@@ -55,28 +55,19 @@ export interface TerrainModUpdateInstallation {
 }
 
 /**
- * Find newer published releases for explicit subscriptions and app-bundled
- * Mods. Bundled Mods are checked everywhere in the Workshop, but in a room
- * only when the map actually uses them. The returned definitions remain
- * server-authored; this helper only selects catalog entries to fetch.
+ * Find newer published releases for explicit subscriptions. The returned
+ * definitions remain server-authored; this helper only selects catalog entries to fetch.
  */
 export function terrainModUpdateCandidates<T extends VersionedTerrainMod>(
   entries: readonly T[],
   subscriptions: readonly TerrainModUpdateSubscription[],
-  installations: readonly TerrainModUpdateInstallation[],
-  bundledModIds: ReadonlySet<string>,
-  workshopIsOpen: boolean,
-  requiredTerrainModIds: readonly string[] = []
+  installations: readonly TerrainModUpdateInstallation[]
 ): Array<{ readonly id: string; readonly entry: T }> {
   const latestByModId = new Map(latestTerrainModVersions(entries).map((entry) => [entry.modId ?? entry.id, entry]));
   const installedVersions = new Map(installations.map(({ id, version }) => [id, version]));
   const subscriptionsById = new Map(subscriptions.map((subscription) => [subscription.id, subscription]));
-  const candidateIds = new Set(subscriptionsById.keys());
-  for (const id of bundledModIds) {
-    if (installedVersions.has(id) && (workshopIsOpen || requiredTerrainModIds.includes(id))) candidateIds.add(id);
-  }
 
-  return [...candidateIds].flatMap((id) => {
+  return [...subscriptionsById.keys()].flatMap((id) => {
     const entry = latestByModId.get(id);
     const installedVersion = installedVersions.get(id) ?? subscriptionsById.get(id)?.installedVersion;
     return entry && installedVersion && compareModVersions(entry.version, installedVersion) > 0
@@ -86,19 +77,16 @@ export function terrainModUpdateCandidates<T extends VersionedTerrainMod>(
 }
 
 /**
- * Map previews only need fresh releases for their own dependencies. In
- * particular, bundled example Mods must be allowed to fetch Workshop artwork
- * even when the player has never subscribed to them.
+ * Map previews only check subscribed Mods that are required by one of the maps.
  */
 export function mapTerrainModUpdateCandidates<T extends VersionedTerrainMod>(
   entries: readonly T[],
   subscriptions: readonly TerrainModUpdateSubscription[],
   installations: readonly TerrainModUpdateInstallation[],
-  bundledModIds: ReadonlySet<string>,
   requiredTerrainModIds: readonly string[]
 ): Array<{ readonly id: string; readonly entry: T }> {
   const required = new Set(requiredTerrainModIds);
-  return terrainModUpdateCandidates(entries, subscriptions, installations, bundledModIds, false, [...required])
+  return terrainModUpdateCandidates(entries, subscriptions, installations)
     .filter(({ id }) => required.has(id));
 }
 

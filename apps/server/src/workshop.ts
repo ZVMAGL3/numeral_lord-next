@@ -56,6 +56,8 @@ interface StoredWorkshopTerrainModEntry extends Omit<WorkshopTerrainModEntry, "d
   readonly visualAssetUrls?: Readonly<Record<string, string>>;
   /** Presentation-only artwork is separate from the immutable playable Mod definition/hash. */
   readonly previewArtworkUrls?: Readonly<Record<string, string>>;
+  /** Pre single-terrain releases used a plural terrainIds field. */
+  readonly terrainIds?: readonly string[];
 }
 
 interface PublicationRate {
@@ -1421,25 +1423,35 @@ function stripStoredAssetReferences(entry: WorkshopTerrainModEntry | StoredWorks
   return dataOnlyEntry as WorkshopTerrainModEntry;
 }
 
+function isCurrentTerrainModDefinition(definition: unknown): definition is TerrainModDefinition {
+  return isRecord(definition) && isRecord(definition.terrain) && Array.isArray(definition.terrain.capabilities);
+}
+
 function terrainModSummary(entry: WorkshopTerrainModEntry | StoredWorkshopTerrainModEntry): WorkshopTerrainModSummary {
   const {
-    definition: _definition,
+    definition,
     sourceFiles: _legacySourceFiles,
     visualAssetUrls: _visualAssetUrls,
     previewArtworkUrls: _previewArtworkUrls,
+    terrainIds: _legacyTerrainIds,
+    terrainId: _terrainId,
     ...summary
   } = entry as (WorkshopTerrainModEntry | StoredWorkshopTerrainModEntry) & {
     readonly sourceFiles?: unknown;
     readonly visualAssetUrls?: Readonly<Record<string, string>>;
     readonly previewArtworkUrls?: Readonly<Record<string, string>>;
+    readonly terrainIds?: readonly string[];
   };
-  if (!entry.definition) return summary;
-
-  return { ...summary, contentHash: entry.contentHash ?? hashModContent(terrainModContent(entry.definition)) };
+  const terrainId = typeof entry.terrainId === "string"
+    ? entry.terrainId
+    : _legacyTerrainIds?.[0] ?? terrainIdForModId(entry.modId);
+  const currentDefinition = isCurrentTerrainModDefinition(definition) ? definition : undefined;
+  const contentHash = entry.contentHash ?? (currentDefinition ? hashModContent(terrainModContent(currentDefinition)) : undefined);
+  return { ...summary, terrainId, ...(contentHash ? { contentHash } : {}) };
 }
 
 function terrainModVisualPreview(entry: WorkshopTerrainModEntry | StoredWorkshopTerrainModEntry): WorkshopTerrainModPreview["preview"] | undefined {
-  if (!entry.definition) return undefined;
+  if (!isCurrentTerrainModDefinition(entry.definition)) return undefined;
   const storedAssetUrls = (entry as StoredWorkshopTerrainModEntry).visualAssetUrls ?? {};
   const terrain = entry.definition.terrain;
   const referencedAssetIds = referencedTerrainVisualAssetIds(terrain);
@@ -1492,25 +1504,23 @@ async function storeTerrainModAssets(
 }
 
 function terrainModDetail(entry: StoredWorkshopTerrainModEntry): WorkshopDetail {
-  const {
-    definition,
-    visualAssetUrls,
-    previewArtworkUrls: _previewArtworkUrls,
-    sourceFiles: _legacySourceFiles,
-    ...summary
-  } = entry as StoredWorkshopTerrainModEntry & { readonly sourceFiles?: unknown };
+  const storedDefinition: unknown = entry.definition;
+  const definition = isCurrentTerrainModDefinition(storedDefinition) ? storedDefinition : undefined;
+  const visualAssetUrls = entry.visualAssetUrls;
   const referencedAssetIds = definition ? referencedTerrainVisualAssetIds(definition.terrain) : new Set<string>();
   const visualAssets: readonly StoredVisualAsset[] = Object.entries(visualAssetUrls ?? {})
     .filter(([id]) => referencedAssetIds.has(id))
     .map(([id, url]) => ({ id, url }));
+  const detailDefinition = definition ? (() => {
+    const { visualAssets: _inlineVisualAssets, ...definitionWithoutInlineAssets } = definition;
+    return {
+      ...definitionWithoutInlineAssets,
+      ...(visualAssets.length ? { visualAssets } : {})
+    };
+  })() : undefined;
   const detail: WorkshopTerrainModDetailEntry = {
-    ...summary,
-    ...(definition ? {
-      definition: {
-        ...definition,
-        ...(visualAssets.length ? { visualAssets } : {})
-      }
-    } : {})
+    ...terrainModSummary(entry),
+    ...(detailDefinition ? { definition: detailDefinition } : {})
   };
   return { kind: "terrain-mod", entry: detail };
 }

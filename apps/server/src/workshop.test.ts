@@ -191,6 +191,40 @@ describe("workshop persistence and data-only Mod objects", () => {
       .rejects.toThrow("地块 Mod 必须提交仅包含受支持字段的结构化 definition 对象。");
   });
 
+  it("shows legacy multi-terrain releases as metadata-only instead of failing detail reads", async () => {
+    const legacyEntry = {
+      id: "legacy-multi-terrain-release",
+      modId: "mod-legacy-terrain",
+      name: "旧版地形包",
+      version: "1.0.0",
+      description: "历史多地块作品",
+      authorName: "作者",
+      createdAt: new Date(0).toISOString(),
+      terrainIds: ["mod/legacy-terrain/forest", "mod/legacy-terrain/swamp"],
+      contentHash: "legacy-content-hash",
+      definition: {
+        id: "mod-legacy-terrain",
+        version: "1.0.0",
+        capabilities: [],
+        terrains: [
+          { id: "mod/legacy-terrain/forest", displayName: "森林", capabilities: [] },
+          { id: "mod/legacy-terrain/swamp", displayName: "沼泽", capabilities: [] }
+        ]
+      }
+    };
+    await writeFile(join(dataDirectory, "workshop.json"), JSON.stringify({ version: 1, maps: [], terrainMods: [legacyEntry] }));
+
+    const legacyStore = new WorkshopStore(dataDirectory);
+    const [summary] = (await legacyStore.list()).terrainMods;
+    expect(summary).toMatchObject({ id: legacyEntry.id, terrainId: "mod/legacy-terrain/forest" });
+    expect(summary).not.toHaveProperty("terrainIds");
+
+    const detail = await legacyStore.get({ kind: "terrain-mod", id: legacyEntry.id });
+    expect(detail).toMatchObject({ kind: "terrain-mod", entry: { id: legacyEntry.id, name: legacyEntry.name } });
+    expect(detail?.kind === "terrain-mod" ? detail.entry.definition : undefined).toBeUndefined();
+    expect(await legacyStore.getTerrainModPreview(legacyEntry.id)).toBeUndefined();
+  });
+
   it("does not use detached card artwork as a second source for terrain previews", async () => {
     const { visualAssets: _inlineAssets, ...definition } = exampleModDefinition;
     const artworkUrl = `assets/terrain/${"a".repeat(64)}.svg`;

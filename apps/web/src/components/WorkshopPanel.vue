@@ -1315,7 +1315,7 @@ function installSelectedTerrain(): void {
           <div class="metadata-block"><strong>Mod 属性对象</strong><p class="quiet">这些是存入数据库并安装到本机的 JSON 属性；行为由游戏内核中对应的能力处理器执行，不运行上传脚本。</p></div>
           <p v-if="selectedDefinitionAssetStatus" class="quiet" role="status">{{ selectedDefinitionAssetStatus }}</p>
           <pre v-if="selectedDefinitionJson" class="definition-preview"><code>{{ selectedDefinitionJson }}</code></pre>
-          <p v-else class="source-empty">{{ selectedTerrain.definition === undefined ? '此旧版作品没有结构化属性对象，暂时无法安装；作者可以按新格式重新发布。' : '正在加载作品详情…' }}</p>
+          <p v-else class="source-empty">{{ selectedTerrain.definition === undefined ? '此作品使用旧版多地块格式，仍可浏览作品信息，但当前版本无法安装；作者可以按新格式重新发布。' : '正在加载作品详情…' }}</p>
           <div class="detail-actions">
             <button class="primary-button" type="button" :disabled="(selectedTerrainIsLatest ? selectedTerrain.installed && selectedTerrainIsSubscribed : selectedTerrain.cached) || !selectedTerrain.definition || working" @click="installSelectedTerrain">{{ !selectedTerrain.definition ? '需要重新发布' : selectedTerrainIsLatest ? (selectedTerrainIsSubscribed ? '已订阅并安装' : selectedTerrain.installed ? '订阅自动更新' : '订阅并安装 Mod') : selectedTerrain.cached ? '此版本已缓存' : '缓存此版本以加入对应房间' }}</button>
             <button v-if="selectedTerrainIsSubscribed" class="unsubscribe-button" type="button" :disabled="working" @click="emit('unsubscribe-terrain-mod', selectedTerrainModId)">取消订阅</button>

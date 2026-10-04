@@ -91,4 +91,61 @@ describe("serializable spatial patterns", () => {
     };
     expect([...selectSpatialPatternCells(state, terrains, path, p1)]).toContain(cellId(2));
   });
+
+  it("can exclude area anchors when a repeated path folds back to its start", () => {
+    const surroundingArea: SpatialPatternDefinition = {
+      id: "mod/example/surrounding-two-rings",
+      result: { entity: "cell" },
+      starts: { op: "terrain-has", capabilityId: "power-source" },
+      expression: {
+        op: "repeat", min: 1, max: 2,
+        item: { op: "step", relation: "hex-neighbor", where: { op: "cell-exists" } }
+      },
+      excludeStarts: true
+    };
+    const selected = selectSpatialPatternCells(state, terrains, surroundingArea, p1);
+    expect(selected).toContain(cellId(1));
+    expect(selected).toContain(cellId(2));
+    expect(selected).not.toContain(cellId(0));
+  });
+
+  it("selects exact concentric rings by shortest hex distance", () => {
+    const secondRing: SpatialPatternDefinition = {
+      id: "mod/example/exact-second-ring",
+      result: { entity: "cell" },
+      starts: { op: "terrain-has", capabilityId: "power-source" },
+      expression: { op: "hex-range", min: 2, max: 2, where: { op: "cell-exists" } }
+    };
+    expect([...selectSpatialPatternCells(state, terrains, secondRing, p1)]).toEqual([cellId(2)]);
+  });
+
+  it("evaluates several full-board alternatives on the largest supported map", () => {
+    const largeState: GameState = {
+      ...state,
+      board: { columns: 64, rows: 64 },
+      cells: Object.fromEntries(Array.from({ length: 64 * 64 }, (_, index) => {
+        const column = index % 64;
+        const row = Math.floor(index / 64);
+        const id = `${column},${row}` as CellId;
+        return [id, { id, coordinate: { column, row }, terrainId: "plain" }];
+      })) as GameState["cells"],
+      units: {}
+    };
+    const wideTerrains: TerrainCatalog = {
+      plain: { id: "plain", displayName: "平原", capabilities: [{ id: "test/all-cells" }] }
+    };
+    const broadStep = {
+      op: "step" as const,
+      relation: "hex-neighbor" as const,
+      where: { op: "terrain-has" as const, capabilityId: "test/all-cells" }
+    };
+    const broadPattern: SpatialPatternDefinition = {
+      id: "mod/example/five-way-scan",
+      result: { entity: "cell" },
+      starts: { op: "terrain-has", capabilityId: "test/all-cells" },
+      expression: { op: "either", items: [broadStep, broadStep, broadStep, broadStep, broadStep] }
+    };
+
+    expect(selectSpatialPatternCells(largeState, wideTerrains, broadPattern, p1).size).toBe(64 * 64);
+  });
 });

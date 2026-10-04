@@ -1,8 +1,12 @@
 import { Client } from "@colyseus/sdk";
+import { hashModContent, modContentIdentity } from "@numeral-lord/game-sdk";
+import { oilFieldMod } from "@numeral-lord/oil-field-mod";
 
 const endpoint = process.env.PVP_SMOKE_ENDPOINT ?? "ws://39.107.250.161/numeral-lord-stage";
 const checkReturnToLobby = process.env.PVP_SMOKE_CHECK_RESET === "1";
-const requiredModId = "mod-oil-field";
+const requiredModId = oilFieldMod.id;
+const requiredModVersion = oilFieldMod.version;
+const requiredModContentHash = hashModContent(modContentIdentity(oilFieldMod));
 const unique = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 let host;
 let guest;
@@ -21,7 +25,9 @@ function nextMessage(room, type, predicate = () => true, timeoutMs = 12_000) {
 try {
   const client = new Client(endpoint);
   host = await client.create("pvp", {
-    name: "公网冒烟测试 A", accountId: `smoke-a-${unique}`, installedModIds: [requiredModId]
+    name: "公网冒烟测试 A", accountId: `smoke-a-${unique}`, installedModIds: [requiredModId],
+    installedModVersions: { [requiredModId]: requiredModVersion },
+    installedModContentHashes: { [requiredModId]: requiredModContentHash }
   });
   const hostStarted = nextMessage(host, "match-start");
   guest = await client.joinById(host.roomId, { name: "公网冒烟测试 B", accountId: `smoke-b-${unique}` });
@@ -33,7 +39,11 @@ try {
   await missingError;
   const installed = nextMessage(guest, "room-state", (payload) => payload?.members
     ?.find((member) => member.sessionId === guest.sessionId)?.missingModIds?.length === 0);
-  guest.send("lobby-installed-mods", { installedModIds: [requiredModId] });
+  guest.send("lobby-installed-mods", {
+    installedModIds: [requiredModId],
+    installedModVersions: { [requiredModId]: requiredModVersion },
+    installedModContentHashes: { [requiredModId]: requiredModContentHash }
+  });
   await installed;
 
   const configured = nextMessage(guest, "room-state", (payload) => payload?.roomModSettings?.[requiredModId]?.incomePerTurn === 7);

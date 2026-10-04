@@ -1,3 +1,25 @@
+import type {
+  ModRuleCondition,
+  ModRuleDefinition,
+  ModRuleEffect,
+  ModRuleTarget,
+  ModRuleTrigger,
+  SpatialExpression,
+  SpatialPatternDefinition,
+  SpatialPredicate
+} from "@numeral-lord/game-core";
+
+export type {
+  ModRuleCondition,
+  ModRuleDefinition,
+  ModRuleEffect,
+  ModRuleTarget,
+  ModRuleTrigger,
+  SpatialExpression,
+  SpatialPatternDefinition,
+  SpatialPredicate
+} from "@numeral-lord/game-core";
+
 /** Versioned, JSON-only Mod object. Runtime behavior comes from core capability handlers. */
 export type WorkshopKind = "map" | "terrain-mod";
 
@@ -12,55 +34,29 @@ export interface TerrainModDefinition {
   readonly settings?: readonly TerrainModSetting[];
   readonly spatialPatterns?: readonly SpatialPatternDefinition[];
   readonly rules?: readonly ModRuleDefinition[];
-  readonly terrains: readonly {
-    readonly id: string;
-    readonly displayName: string;
+  readonly visualAssets?: readonly { readonly id: string; readonly dataUrl: string }[];
+  readonly terrain: {
     readonly capabilities: readonly {
       readonly id: string;
       readonly config?: Readonly<Record<string, unknown>>;
     }[];
-  }[];
-}
-
-export type SpatialPredicate =
-  | { readonly op: "terrain-has"; readonly capabilityId: string }
-  | { readonly op: "unit-owner-is"; readonly owner: "actor" | "other" }
-  | { readonly op: "unit-has-marker"; readonly marker: string }
-  | { readonly op: "all" | "any"; readonly items: readonly SpatialPredicate[] }
-  | { readonly op: "not"; readonly item: SpatialPredicate };
-
-export type SpatialExpression =
-  | { readonly op: "step"; readonly relation: "hex-neighbor"; readonly where: SpatialPredicate }
-  | { readonly op: "sequence" | "either"; readonly items: readonly SpatialExpression[] }
-  | { readonly op: "repeat"; readonly item: SpatialExpression; readonly min: number; readonly max: number };
-
-export interface SpatialPatternDefinition {
-  readonly id: string;
-  readonly starts: SpatialPredicate;
-  readonly expression: SpatialExpression;
-  readonly result: { readonly entity: "cell" } | { readonly entity: "unit"; readonly distinctBy: "id" };
-  readonly role?: "core/powered-units";
-}
-
-export type ModRuleTrigger = "state-changed" | "unit-enter" | "unit-leave" | "unit-destroyed" | "turn-start";
-export type ModRuleTarget = { readonly scope: "trigger-unit" }
-  | { readonly scope: "pattern-units"; readonly patternId: string };
-export type ModRuleCondition =
-  | { readonly op: "at-cell-matches"; readonly predicate: SpatialPredicate }
-  | { readonly op: "pattern-includes-trigger-unit"; readonly patternId: string };
-export type ModRuleEffect =
-  | { readonly type: "change-strength"; readonly amount: number }
-  | { readonly type: "grant-points"; readonly amount: number }
-  | { readonly type: "exhaust-unit" }
-  | { readonly type: "set-unit-marker"; readonly marker: string }
-  | { readonly type: "remove-unit-marker"; readonly marker: string }
-  | { readonly type: "sync-unit-marker"; readonly marker: string; readonly patternId: string };
-export interface ModRuleDefinition {
-  readonly id: string;
-  readonly trigger: ModRuleTrigger;
-  readonly target: ModRuleTarget;
-  readonly conditions?: readonly ModRuleCondition[];
-  readonly effects: readonly ModRuleEffect[];
+    readonly visuals?: {
+      readonly baseColor?: string;
+      readonly baseAssetId?: string;
+      /** Opacity of the base color or image, from fully transparent to opaque. */
+      readonly baseOpacity?: number;
+      /** Explicitly leaves the hex tile transparent, like the built-in void terrain. */
+      readonly baseTransparent?: boolean;
+      readonly overlay?: {
+        readonly assetId: string;
+        readonly scale: number;
+        readonly opacity: number;
+        readonly offsetX: number;
+        readonly offsetY: number;
+        readonly whenOccupied?: boolean;
+      };
+    };
+  };
 }
 
 export type TerrainModSetting =
@@ -72,7 +68,7 @@ interface TerrainModSettingBase {
   readonly id: string;
   readonly displayName: string;
   readonly description?: string;
-  readonly target: { readonly terrainId: string; readonly capabilityId: string; readonly configKey: string };
+  readonly target: { readonly capabilityId: string; readonly configKey: string };
 }
 
 export interface PublishMapRequest {
@@ -108,7 +104,21 @@ export interface WorkshopTerrainModSummary {
   readonly description: string;
   readonly authorName: string;
   readonly createdAt: string;
-  readonly terrainIds: readonly string[];
+  readonly terrainId: string;
+  /** Hash of the immutable, playable release content. */
+  readonly contentHash?: string;
+}
+
+export interface TerrainModVisualPreview {
+  readonly terrainId: string;
+  readonly displayName: string;
+  readonly visuals?: TerrainModDefinition["terrain"]["visuals"];
+  readonly visualAssets: readonly { readonly id: string; readonly url: string }[];
+}
+
+export interface WorkshopTerrainModPreview {
+  readonly id: string;
+  readonly preview: TerrainModVisualPreview;
 }
 
 export interface WorkshopMapEntry extends WorkshopMapSummary {
@@ -120,6 +130,16 @@ export interface WorkshopTerrainModEntry extends WorkshopTerrainModSummary {
   readonly definition?: TerrainModDefinition;
 }
 
+/** Wire representation used for full Mod details; image bytes load separately from these URLs. */
+export type TerrainModDefinitionAssetReferences = Omit<TerrainModDefinition, "visualAssets"> & {
+  readonly visualAssets?: readonly { readonly id: string; readonly url: string }[];
+};
+
+export interface WorkshopTerrainModDetailEntry extends WorkshopTerrainModSummary {
+  /** Image references remain URLs on the wire; the client downloads and materializes them for installation. */
+  readonly definition?: TerrainModDefinitionAssetReferences;
+}
+
 export interface WorkshopCatalog {
   readonly maps: readonly WorkshopMapSummary[];
   readonly terrainMods: readonly WorkshopTerrainModSummary[];
@@ -127,7 +147,7 @@ export interface WorkshopCatalog {
 
 export type WorkshopDetail =
   | { readonly kind: "map"; readonly entry: WorkshopMapEntry }
-  | { readonly kind: "terrain-mod"; readonly entry: WorkshopTerrainModEntry };
+  | { readonly kind: "terrain-mod"; readonly entry: WorkshopTerrainModDetailEntry };
 
 export interface WorkshopGetRequest {
   readonly kind: WorkshopKind;

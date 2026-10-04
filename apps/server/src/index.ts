@@ -5,7 +5,7 @@ import {
   applyIntent,
   getLegalIntents
 } from "@numeral-lord/game-core/node";
-import { DEFAULT_MAP_CODE, coreTerrainCatalog, parseMapCode, validateModSettings } from "@numeral-lord/core-content";
+import { DEFAULT_MAP_CODE, coreTerrainCatalog, parseMapCode, serializeMapCode, validateModSettings } from "@numeral-lord/core-content";
 import { oilFieldMod, oilFieldTerrainCatalog } from "@numeral-lord/oil-field-mod";
 import type {
   GameIntent,
@@ -16,17 +16,29 @@ import type {
   LobbySettings,
   MatchStartPayload,
   MatchConditionCatalog,
+  ModContentLock,
   TerrainCatalog,
   UnitCatalog
 } from "@numeral-lord/game-core/node";
 import { RelayRoom, Server, WebSocketTransport, type Client } from "colyseus";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { WorkshopRoom } from "./workshop.js";
+import { SafeLobbyRoom } from "./lobby-room.js";
+import {
+  initializeWorkshopStore,
+  isWorkshopEnabled,
+  saveUploadedTerrainAsset,
+  startWorkshopAssetCleanupScheduler,
+  WorkshopInputError,
+  WorkshopRoom
+} from "./workshop.js";
+import { defaultWorkshopDataDirectory, getTerrainAssetContentType, workshopTerrainAssetDirectory } from "./workshop-assets.js";
 
 /** The relay accepts only terrain content the deployed client currently ships. */
 const installedMapCatalogs = {
   terrains: { ...coreTerrainCatalog, ...oilFieldTerrainCatalog },
-  terrainModIds: Object.fromEntries(oilFieldMod.terrains.map((terrain) => [terrain.id, oilFieldMod.id])),
+  terrainModIds: { [oilFieldMod.terrain.id]: oilFieldMod.id },
   mods: { [oilFieldMod.id]: oilFieldMod },
   // The relay transports maps/mod settings but does not run a client's Mod
   // code. The owning clients validate custom definitions before play.
@@ -43,6 +55,7 @@ export { getLegalIntents };
  * uploads rather than disabling the receiver's size protection.
  */
 export const MAX_CLIENT_MESSAGE_BYTES = 1024 * 1024;
+const MAX_TERRAIN_ASSET_BYTES = 128 * 1024;
 const REPLACED_BROWSER_SESSION_CLOSE_CODE = 4001;
 
 interface MutableLobbyMember {
@@ -55,6 +68,8 @@ interface MutableLobbyMember {
   playerColorId: string | null;
   ready: boolean;
   installedModIds: readonly string[];
+  installedModVersions: Readonly<Record<string, string>>;
+  installedModContentHashes: Readonly<Record<string, string>>;
   joinOrder: number;
 }
 
@@ -88,10 +103,13 @@ export class PvpRelayRoom extends RelayRoom {
   private mapCode = DEFAULT_MAP_CODE;
   private mapName = "昏晓";
   private requiredTerrainModIds: readonly string[] = [];
+  private effectiveTerrainModReleases: readonly ModContentLock[] = [];
   private roomModSettings: LobbyModSettings = {};
   private settings: LobbySettings = DEFAULT_LOBBY_SETTINGS;
   private matchStartedAtEpochMs: number | null = null;
   private nextJoinOrder = 0;
+  private lastLobbyListingSignature = "";
+  private roomCreationMetadata: Record<string, unknown> = {};
   private latestHostSnapshot: CachedHostSnapshot | undefined;
   /** Re-sendable initial state seed if the first host disappears before its first snapshot. */
   private matchStartPayload: MatchStartPayload | undefined;
@@ -99,7 +117,8 @@ export class PvpRelayRoom extends RelayRoom {
   override onCreate(options: RoomCreateOptions): void {
     const initialMapCode = options.mapCode ?? DEFAULT_MAP_CODE;
     const initialMap = parseMapCode(initialMapCode, installedMapCatalogs);
-    this.mapCode = initialMapCode;
+    this.roomCreationMetadata = isRecord(options.metadata) ? options.metadata : {};
+    this.mapCode = serializeMapCode(initialMap, installedMapCatalogs);
     this.mapName = initialMap.name;
     this.mapPlayerCount = initialMap.players;
     this.requiredTerrainModIds = initialMap.requiredTerrainModIds;
@@ -110,14 +129,21 @@ export class PvpRelayRoom extends RelayRoom {
       this.allowReconnectionTime = Math.min(options.allowReconnectionTime, 40);
     }
     this.setMetadata({
-      ...(typeof options.metadata === "object" && options.metadata ? options.metadata : {}),
+      ...this.roomCreationMetadata,
+      visibility: "public",
+      phase: this.phase,
       mapName: this.mapName,
-      mapPlayerCount: this.mapPlayerCount
+      mapPlayerCount: this.mapPlayerCount,
+      requiredTerrainModIds: this.requiredTerrainModIds,
+      playerCount: 0,
+      openSeats: this.mapPlayerCount,
+      hostName: ""
     });
 
     // The server owns room membership and setup, while game-core remains the
     // authority for board rules in the host client.
-    this.onMessage("player-intent", (client, payload: Record<string, unknown> = {}) => {
+    this.onMessage("player-intent", (client, rawPayload: unknown = {}) => {
+      const payload = isRecord(rawPayload) ? rawPayload : {};
       const member = this.members.get(client.sessionId);
       if (this.phase !== "playing" || this.authoritativeHostSessionId !== this.hostSessionId
         || !member?.participating || member.seat === null) {
@@ -137,9 +163,21 @@ export class PvpRelayRoom extends RelayRoom {
         return;
       }
       const playerId = playerIdForSeat(member.seat);
-      const command = isRecord(payload.command)
-        ? { ...payload.command, actorId: playerId }
-        : payload.command;
+      const command = sanitizeRelayedCommand(payload.command, playerId);
+      const parentCommandId = payload.parentCommandId === undefined || payload.parentCommandId === null
+        ? null
+        : typeof payload.parentCommandId === "string" && payload.parentCommandId.length <= 128
+          ? payload.parentCommandId
+          : undefined;
+      if (!command || parentCommandId === undefined) {
+        client.send("intent-rejected", {
+          commandId: isRecord(payload.command) && typeof payload.command.commandId === "string"
+            ? payload.command.commandId.slice(0, 128)
+            : undefined,
+          reason: "invalid-command-payload"
+        });
+        return;
+      }
       console.info("PvP intent relayed", {
         roomId: this.roomId,
         sessionId: client.sessionId,
@@ -150,7 +188,7 @@ export class PvpRelayRoom extends RelayRoom {
         expectedSequence: isRecord(command) ? command.expectedSequence : undefined,
         hostSessionId: this.hostSessionId
       });
-      this.broadcast("player-intent", { ...payload, command, playerId }, { except: client });
+      this.broadcast("player-intent", { parentCommandId, command, playerId }, { except: client });
     });
     this.onMessage("host-snapshot", (client, payload: Record<string, unknown> = {}) => {
       if (this.phase !== "playing" || client.sessionId !== this.hostSessionId) return;
@@ -231,6 +269,10 @@ export class PvpRelayRoom extends RelayRoom {
         this.sendError(client, `请先安装地图需要的地块 Mod：${this.missingModIds(member).join("、")}`);
         return;
       }
+      if (payload.ready === true && this.modVersionMismatchIds().length > 0) {
+        this.sendError(client, `参战玩家的地块 Mod 版本或内容不一致：${this.modVersionMismatchIds().join("、")}。请更新后重新准备。`);
+        return;
+      }
       member.ready = payload.ready === true;
       this.broadcastRoomState();
       this.startWhenReady();
@@ -244,8 +286,24 @@ export class PvpRelayRoom extends RelayRoom {
         this.sendError(client, "已安装 Mod 列表格式不正确。");
         return;
       }
+      const versions = parseInstalledModVersions(payload.installedModVersions, ids);
+      if (!versions) {
+        this.sendError(client, "已安装地块 Mod 版本列表格式不正确。");
+        return;
+      }
+      const contentHashes = parseInstalledModContentHashes(payload.installedModContentHashes, ids);
+      if (!contentHashes) {
+        this.sendError(client, "已安装地块 Mod 内容指纹格式不正确。");
+        return;
+      }
+      if (sameStringRecord(member.installedModVersions, versions)
+        && sameStringRecord(member.installedModContentHashes, contentHashes)
+        && sameModIds(member.installedModIds, ids)) return;
       member.installedModIds = ids;
-      member.ready = false;
+      member.installedModVersions = versions;
+      member.installedModContentHashes = contentHashes;
+      this.refreshEffectiveTerrainModReleases();
+      this.resetReady();
       this.broadcastRoomState();
     });
     this.onMessage("lobby-settings", (client, payload: Record<string, unknown> = {}) => {
@@ -398,6 +456,8 @@ export class PvpRelayRoom extends RelayRoom {
         playerColorId: member.playerColorId,
         ready: member.ready,
         installedModIds: member.installedModIds,
+        installedModVersions: member.installedModVersions,
+        installedModContentHashes: member.installedModContentHashes,
         missingModIds: this.missingModIds(member)
       }));
     return {
@@ -406,6 +466,8 @@ export class PvpRelayRoom extends RelayRoom {
       mapName: this.mapName,
       mapPlayerCount: this.mapPlayerCount,
       requiredTerrainModIds: this.requiredTerrainModIds,
+      effectiveTerrainModReleases: this.effectiveTerrainModReleases,
+      modVersionMismatchIds: this.modVersionMismatchIds(),
       roomModSettings: this.roomModSettings,
       settings: this.settings,
       members,
@@ -414,6 +476,7 @@ export class PvpRelayRoom extends RelayRoom {
   }
 
   private broadcastRoomState(): void {
+    this.updateLobbyListingMetadata();
     for (const client of this.clients) {
       this.sendClientRole(client);
     }
@@ -447,8 +510,36 @@ export class PvpRelayRoom extends RelayRoom {
       playerColorId: member.playerColorId,
       ready: member.ready,
       installedModIds: member.installedModIds,
+      installedModVersions: member.installedModVersions,
+      installedModContentHashes: member.installedModContentHashes,
       missingModIds: this.missingModIds(member)
     };
+  }
+
+  private updateLobbyListingMetadata(): void {
+    const noConnectedClients = this.clients.length === 0;
+    const metadata = {
+      // Keep a running room discoverable while anyone is connected. If every
+      // socket drops, hide it during Colyseus' reconnect grace period: the
+      // room can still be resumed by its id, but it is no longer a ghost in
+      // the public lobby. A returning member makes it public again below.
+      visibility: noConnectedClients ? "private" : "public",
+      phase: this.phase,
+      mapName: this.mapName,
+      mapPlayerCount: this.mapPlayerCount,
+      requiredTerrainModIds: this.requiredTerrainModIds,
+      playerCount: this.participantCount(),
+      openSeats: Math.max(0, this.mapPlayerCount - this.participantCount()),
+      hostName: [...this.members.values()].find((member) => member.sessionId === this.hostSessionId)?.displayName ?? ""
+    };
+    const signature = JSON.stringify(metadata);
+    if (signature === this.lastLobbyListingSignature) return;
+    this.lastLobbyListingSignature = signature;
+    void this.setMetadata({ ...this.roomCreationMetadata, protocol: "host-authoritative-relay", version: "0.2.0", ...metadata });
+    // LobbyRoom removes rooms from already-connected clients when Colyseus'
+    // actual private flag changes; metadata filtering alone only affects the
+    // next room-list snapshot.
+    void this.setPrivate(noConnectedClients);
   }
 
   private missingModIds(member: MutableLobbyMember): string[] {
@@ -456,11 +547,40 @@ export class PvpRelayRoom extends RelayRoom {
     return this.requiredTerrainModIds.filter((id) => !installed.has(id));
   }
 
+  /** Maps declare dependency IDs only; the elected host supplies their active release. */
+  private refreshEffectiveTerrainModReleases(): void {
+    if (this.phase !== "lobby") return;
+    const host = this.hostSessionId ? this.members.get(this.hostSessionId) : undefined;
+    this.effectiveTerrainModReleases = host
+      ? this.requiredTerrainModIds.flatMap((id) => {
+        const version = host.installedModVersions[id];
+        const contentHash = host.installedModContentHashes[id];
+        return version && contentHash ? [{ id, version, contentHash }] : [];
+      })
+      : [];
+  }
+
+  private modVersionMismatchIds(): string[] {
+    const participants = [...this.members.values()].filter((member) => member.participating);
+    return this.requiredTerrainModIds.filter((modId) => {
+      if (participants.some((member) => !member.installedModIds.includes(modId))) return false;
+      if (participants.some((member) => !member.installedModVersions[modId] || !member.installedModContentHashes[modId])) return true;
+      const hostRelease = this.effectiveTerrainModReleases.find((candidate) => candidate.id === modId);
+      if (hostRelease) return participants.some((member) => member.installedModVersions[modId] !== hostRelease.version
+        || member.installedModContentHashes[modId] !== hostRelease.contentHash);
+      const versions = participants.map((member) => member.installedModVersions[modId]);
+      const hashes = participants.map((member) => member.installedModContentHashes[modId]);
+      return new Set(versions).size > 1 || new Set(hashes).size > 1;
+    });
+  }
+
   override onJoin(client: Client, options: Record<string, unknown> = {}): void {
     super.onJoin(client, options);
     const requestedAccountId = typeof options.accountId === "string" ? options.accountId.trim() : "";
     const requestedName = typeof options.name === "string" ? options.name.trim() : "";
     const installedModIds = parseInstalledModIds(options.installedModIds) ?? [];
+    const installedModVersions = parseInstalledModVersions(options.installedModVersions, installedModIds) ?? {};
+    const installedModContentHashes = parseInstalledModContentHashes(options.installedModContentHashes, installedModIds) ?? {};
     const previous = requestedAccountId
       ? [...this.members.values()].find((member) => member.accountId === requestedAccountId)
       : undefined;
@@ -482,7 +602,9 @@ export class PvpRelayRoom extends RelayRoom {
       previous.displayName = requestedName || previous.displayName;
       previous.connected = true;
       previous.installedModIds = installedModIds;
-      if (this.phase === "lobby" && this.missingModIds(previous).length > 0) previous.ready = false;
+      previous.installedModVersions = installedModVersions;
+      previous.installedModContentHashes = installedModContentHashes;
+      if (this.phase === "lobby") this.resetReady();
       this.members.set(client.sessionId, previous);
       // Match-start is retained so a replacement host can rebuild the opening
       // state if no authoritative snapshot has been published yet. Keep its
@@ -513,6 +635,7 @@ export class PvpRelayRoom extends RelayRoom {
         // Until then it cannot submit a new authoritative snapshot.
         this.authoritativeHostSessionId = this.phase === "playing" ? undefined : client.sessionId;
       }
+      this.refreshEffectiveTerrainModReleases();
       this.broadcastRoomState();
       this.broadcast("room-host", { sessionId: this.hostSessionId });
       return;
@@ -534,6 +657,8 @@ export class PvpRelayRoom extends RelayRoom {
       playerColorId: canParticipate ? this.firstAvailablePlayerColor() : null,
       ready: false,
       installedModIds,
+      installedModVersions,
+      installedModContentHashes,
       joinOrder: this.nextJoinOrder++
     };
     console.info("PvP new room member joined", {
@@ -546,6 +671,7 @@ export class PvpRelayRoom extends RelayRoom {
     });
     this.members.set(client.sessionId, member);
     if (!this.hostSessionId) this.hostSessionId = client.sessionId;
+    this.refreshEffectiveTerrainModReleases();
     this.broadcastRoomState();
     this.broadcast("room-host", { sessionId: this.hostSessionId });
   }
@@ -596,6 +722,10 @@ export class PvpRelayRoom extends RelayRoom {
       .sort((left, right) => Number(right.participating) - Number(left.participating)
         || left.joinOrder - right.joinOrder)[0];
     this.hostSessionId = successor?.sessionId;
+    if (this.phase === "lobby") {
+      this.refreshEffectiveTerrainModReleases();
+      this.resetReady();
+    }
     this.authoritativeHostSessionId = undefined;
     const nextClient = this.clients.find((candidate) => candidate.sessionId === successor?.sessionId);
     if (nextClient && (this.phase !== "playing"
@@ -624,12 +754,7 @@ export class PvpRelayRoom extends RelayRoom {
     this.settings = nextSettings;
     if (wasRandom !== this.settings.randomizePositions) this.convertPositionMode();
     this.resetReady();
-    this.setMetadata({
-      protocol: "host-authoritative-relay",
-      version: "0.2.0",
-      mapName: this.mapName,
-      mapPlayerCount: this.mapPlayerCount
-    });
+    this.updateLobbyListingMetadata();
     this.broadcastRoomState();
   }
 
@@ -645,12 +770,14 @@ export class PvpRelayRoom extends RelayRoom {
       this.sendError(client, "地图码无法读取，请检查内容后重试。 ");
       return;
     }
-    if (requestedCode === this.mapCode) return;
+    const canonicalCode = serializeMapCode(selectedMap, installedMapCatalogs);
+    if (canonicalCode === this.mapCode) return;
 
-    this.mapCode = requestedCode;
+    this.mapCode = canonicalCode;
     this.mapName = selectedMap.name;
     this.mapPlayerCount = selectedMap.players;
     this.requiredTerrainModIds = selectedMap.requiredTerrainModIds;
+    this.refreshEffectiveTerrainModReleases();
     this.roomModSettings = {};
     if (this.settings.randomizePositions) {
       const participants = [...this.members.values()]
@@ -671,12 +798,7 @@ export class PvpRelayRoom extends RelayRoom {
       }
     }
     this.resetReady();
-    this.setMetadata({
-      protocol: "host-authoritative-relay",
-      version: "0.2.0",
-      mapName: this.mapName,
-      mapPlayerCount: this.mapPlayerCount
-    });
+    this.updateLobbyListingMetadata();
     this.broadcastRoomState();
   }
 
@@ -821,6 +943,7 @@ export class PvpRelayRoom extends RelayRoom {
       .filter((member) => member.participating);
     if (participants.length === 0 || participants.length > this.mapPlayerCount
       || new Set(participants.map((member) => member.playerColorId)).size !== participants.length
+      || this.modVersionMismatchIds().length > 0
       || participants.some((member) => !member.connected || !member.ready || !member.playerColorId || this.missingModIds(member).length > 0)) return;
 
     if (this.settings.randomizePositions) {
@@ -839,6 +962,7 @@ export class PvpRelayRoom extends RelayRoom {
     this.latestHostSnapshot = undefined;
     const payload: MatchStartPayload = {
       mapCode: this.mapCode,
+      effectiveTerrainModReleases: this.effectiveTerrainModReleases,
       settings: this.settings,
       roomModSettings: this.roomModSettings,
       startedAtEpochMs: this.matchStartedAtEpochMs,
@@ -862,6 +986,7 @@ export class PvpRelayRoom extends RelayRoom {
     this.latestHostSnapshot = undefined;
     this.matchStartPayload = undefined;
     this.authoritativeHostSessionId = this.hostSessionId;
+    this.refreshEffectiveTerrainModReleases();
     this.lastRoomSyncAtBySession.clear();
     this.resetReady();
     // Random seats were only assigned for the finished match. Participants
@@ -932,7 +1057,102 @@ export function validateIntent(
  */
 export function createGameServer(): Server {
   const gameServer = new Server({
-    transport: new WebSocketTransport({ maxPayload: MAX_CLIENT_MESSAGE_BYTES })
+    transport: new WebSocketTransport({ maxPayload: MAX_CLIENT_MESSAGE_BYTES }),
+    express: (app) => {
+      const corsHeaders = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type"
+      };
+      app.options("/assets/terrain", (_request: unknown, response: {
+        set: (headers: Readonly<Record<string, string>>) => unknown;
+        sendStatus: (status: number) => unknown;
+      }) => {
+        response.set(corsHeaders);
+        response.sendStatus(204);
+      });
+      app.post("/assets/terrain", async (
+        request: {
+          readonly headers: Readonly<Record<string, string | string[] | undefined>>;
+          on: (event: string, listener: (...args: unknown[]) => void) => unknown;
+        },
+        response: {
+          set: (headers: Readonly<Record<string, string>>) => unknown;
+          status: (status: number) => { json: (value: unknown) => unknown };
+        }
+      ) => {
+        response.set(corsHeaders);
+        const fail = (status: number, error: string): void => { response.status(status).json({ error }); };
+        if (!isWorkshopEnabled() || (process.env.NODE_ENV === "production" && process.env.WORKSHOP_PUBLISH_ENABLED !== "1")) {
+          fail(503, "当前环境暂未开放工坊图片上传。");
+          return;
+        }
+        const contentTypeHeader = request.headers["content-type"];
+        const contentType = typeof contentTypeHeader === "string" ? contentTypeHeader.toLowerCase() : "";
+        if (!["image/png", "image/webp", "image/svg+xml"].includes(contentType)) {
+          fail(415, "图片仅支持 PNG、WebP 或静态 SVG 格式。");
+          return;
+        }
+        const contentLength = Number(request.headers["content-length"]);
+        if (Number.isFinite(contentLength) && contentLength > MAX_TERRAIN_ASSET_BYTES) {
+          fail(413, "图片文件不能超过 128 KiB。");
+          return;
+        }
+        try {
+          const chunks: Buffer[] = [];
+          let byteSize = 0;
+          let tooLarge = false;
+          await new Promise<void>((resolve, reject) => {
+            request.on("data", (chunk: unknown) => {
+              const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+              byteSize += bytes.length;
+              if (byteSize > MAX_TERRAIN_ASSET_BYTES) tooLarge = true;
+              else if (!tooLarge) chunks.push(bytes);
+            });
+            request.on("end", () => resolve());
+            request.on("error", (error: unknown) => reject(error));
+          });
+          if (tooLarge) { fail(413, "图片文件不能超过 128 KiB。"); return; }
+          const bytes = Buffer.concat(chunks);
+          if (!bytes.length) { fail(400, "上传的图片内容为空。"); return; }
+          if (!matchesImageContentType(bytes, contentType)) { fail(415, "图片内容与文件格式不一致。"); return; }
+          const dataUrl = `data:${contentType};base64,${bytes.toString("base64")}`;
+          const record = await saveUploadedTerrainAsset(dataUrl, contentType, bytes.length);
+          response.status(201).json({ url: record.assetUrl, uploadId: record.uploadId });
+        } catch (error) {
+          fail(error instanceof WorkshopInputError ? 400 : 500,
+            error instanceof Error ? error.message : "图片上传失败。");
+        }
+      });
+      app.get("/assets/terrain/:fileName", async (
+        request: { readonly params: { readonly fileName: string } },
+        response: {
+          sendStatus: (status: number) => unknown;
+          set: (headers: Readonly<Record<string, string>>) => { send: (body: Buffer) => unknown };
+        }
+      ) => {
+        response.set({ "Access-Control-Allow-Origin": "*" });
+        const fileName = request.params.fileName;
+        const contentType = getTerrainAssetContentType(fileName);
+        if (!contentType) {
+          response.sendStatus(404);
+          return;
+        }
+        try {
+          const asset = await readFile(join(workshopTerrainAssetDirectory(defaultWorkshopDataDirectory()), fileName));
+          response.set({
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "Content-Type": contentType,
+            "X-Content-Type-Options": "nosniff",
+            ...(contentType === "image/svg+xml" ? { "Content-Security-Policy": "default-src 'none'; sandbox" } : {})
+          }).send(asset);
+        } catch {
+          response.set({ "Access-Control-Allow-Origin": "*" });
+          response.sendStatus(404);
+        }
+      });
+    }
   });
 
   gameServer.define("pvp", PvpRelayRoom, {
@@ -942,11 +1162,11 @@ export function createGameServer(): Server {
       protocol: "host-authoritative-relay",
       version: "0.2.0"
     }
-  });
+  }).enableRealtimeListing();
+  gameServer.define("lobby", SafeLobbyRoom);
   // Public PvP staging must not expose anonymous source/map publishing. Keep
   // the workshop available during local development; production opts in.
-  if (process.env.WORKSHOP_ENABLED === "1"
-    || (process.env.NODE_ENV !== "production" && process.env.WORKSHOP_ENABLED !== "0")) {
+  if (isWorkshopEnabled()) {
     gameServer.define("workshop", WorkshopRoom);
   }
   return gameServer;
@@ -954,11 +1174,28 @@ export function createGameServer(): Server {
 
 export async function startServer(
   port = Number(process.env.PORT ?? 2567),
-  host = process.env.HOST ?? "0.0.0.0"
+  host = process.env.HOST ?? "0.0.0.0",
+  startup: ServerStartupDependencies = {
+    createGameServer,
+    isWorkshopEnabled,
+    initializeWorkshopStore,
+    startWorkshopAssetCleanupScheduler
+  }
 ): Promise<void> {
-  const gameServer = createGameServer();
+  const gameServer = startup.createGameServer();
+  if (startup.isWorkshopEnabled()) {
+    await startup.initializeWorkshopStore();
+    startup.startWorkshopAssetCleanupScheduler?.();
+  }
   await gameServer.listen(port, host);
   console.info(`Numeral Lord relay server listening on ${host}:${port}`);
+}
+
+export interface ServerStartupDependencies {
+  readonly createGameServer: () => Pick<Server, "listen">;
+  readonly isWorkshopEnabled: () => boolean;
+  readonly initializeWorkshopStore: () => Promise<void>;
+  readonly startWorkshopAssetCleanupScheduler?: () => void;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
@@ -969,8 +1206,47 @@ function playerIdForSeat(seat: number): string {
   return `player-${seat}`;
 }
 
+function matchesImageContentType(bytes: Buffer, contentType: string): boolean {
+  if (contentType === "image/png") return bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  if (contentType === "image/webp") return bytes.length >= 12
+    && bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP";
+  if (contentType === "image/svg+xml") {
+    const source = bytes.toString("utf8").replace(/^\uFEFF/, "").trimStart();
+    return /^<(?:\?xml\b[^?]*\?>\s*)?(?:!--[\s\S]*?-->\s*)*svg(?:\s|>)/i.test(source);
+  }
+  return false;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function sanitizeRelayedCommand(input: unknown, actorId: string): Record<string, unknown> | undefined {
+  if (!isRecord(input)
+    || typeof input.commandId !== "string" || input.commandId.length < 1 || input.commandId.length > 128
+    || !Number.isSafeInteger(input.expectedSequence) || (input.expectedSequence as number) < 0) return undefined;
+  const base = { commandId: input.commandId, actorId, expectedSequence: input.expectedSequence as number };
+  switch (input.type) {
+    case "move-unit":
+      return typeof input.unitId === "string" && input.unitId.length > 0 && input.unitId.length <= 80
+        && typeof input.destinationId === "string" && input.destinationId.length > 0 && input.destinationId.length <= 80
+        ? { ...base, type: input.type, unitId: input.unitId, destinationId: input.destinationId }
+        : undefined;
+    case "attack-unit":
+      return typeof input.unitId === "string" && input.unitId.length > 0 && input.unitId.length <= 80
+        && typeof input.targetId === "string" && input.targetId.length > 0 && input.targetId.length <= 80
+        ? { ...base, type: input.type, unitId: input.unitId, targetId: input.targetId }
+        : undefined;
+    case "reinforce-unit":
+      return typeof input.unitId === "string" && input.unitId.length > 0 && input.unitId.length <= 80
+        ? { ...base, type: input.type, unitId: input.unitId }
+        : undefined;
+    case "end-action-phase":
+    case "end-reinforcement-phase":
+      return { ...base, type: input.type };
+    default:
+      return undefined;
+  }
 }
 
 /** Bound and sanitize the client capability declaration used for lobby checks. */
@@ -978,6 +1254,44 @@ function parseInstalledModIds(value: unknown): readonly string[] | undefined {
   if (!Array.isArray(value) || value.length > 64) return undefined;
   if (!value.every((id) => typeof id === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,79}$/.test(id))) return undefined;
   return [...new Set(value as string[])];
+}
+
+/** Versions are bounded, inert labels. Missing labels are kept absent so an old client cannot silently pass compatibility checks. */
+function parseInstalledModVersions(value: unknown, installedModIds: readonly string[]): Readonly<Record<string, string>> | undefined {
+  if (value === undefined) return {};
+  if (!isRecord(value) || Object.keys(value).length > 64) return undefined;
+  const installed = new Set(installedModIds);
+  const versions: Record<string, string> = {};
+  for (const [modId, version] of Object.entries(value)) {
+    if (!installed.has(modId) || !/^mod-[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/.test(modId)
+      || typeof version !== "string" || version.length < 1 || version.length > 48
+      || !/^[a-zA-Z0-9][a-zA-Z0-9.+_-]*$/.test(version)) return undefined;
+    versions[modId] = version;
+  }
+  return versions;
+}
+
+function parseInstalledModContentHashes(value: unknown, installedModIds: readonly string[]): Readonly<Record<string, string>> | undefined {
+  if (value === undefined) return {};
+  if (!isRecord(value) || Object.keys(value).length > 64) return undefined;
+  const installed = new Set(installedModIds);
+  const hashes: Record<string, string> = {};
+  for (const [modId, hash] of Object.entries(value)) {
+    if (!installed.has(modId) || !/^mod-[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/.test(modId)
+      || typeof hash !== "string" || !/^sha256:[a-f0-9]{64}$/.test(hash)) return undefined;
+    hashes[modId] = hash;
+  }
+  return hashes;
+}
+
+function sameModIds(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((id) => right.includes(id));
+}
+
+function sameStringRecord(left: Readonly<Record<string, string>>, right: Readonly<Record<string, string>>): boolean {
+  const leftEntries = Object.entries(left);
+  return leftEntries.length === Object.keys(right).length
+    && leftEntries.every(([id, version]) => right[id] === version);
 }
 
 /** Keep the cached clock in server time; each delivery receives a fresh stamp. */

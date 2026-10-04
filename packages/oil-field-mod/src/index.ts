@@ -1,8 +1,7 @@
-import { defineMod, type CapabilityBinding } from "@numeral-lord/game-sdk";
+import { defineTerrainMod, loadTerrainSvgAsset, type CapabilityBinding } from "@numeral-lord/game-sdk";
 import type { TerrainCatalog } from "@numeral-lord/game-core";
 
-/** Stable terrain id owned by this Mod, not by the built-in terrain pack. */
-export const OIL_FIELD_TERRAIN_ID = "mod/oil-field";
+const oilFieldArtwork = await loadTerrainSvgAsset(new URL("./assets/oil-field.svg", import.meta.url));
 
 // `core/occupiable` is a public capability supplied by the core terrain pack.
 const occupiable: CapabilityBinding = { id: "core/occupiable" };
@@ -23,8 +22,9 @@ const captureArrivalExhaustion: CapabilityBinding = {
 const oilFieldIncome: CapabilityBinding = {
   id: "core/income-source",
   config: {
-    // 触发时机和驻兵要求是内核现有能力契约；可配置的是收益数量。
-    amount: 2
+    amount: 2,
+    requires: "occupied",
+    when: "owner-turn-start"
   }
 };
 
@@ -42,19 +42,19 @@ const departureGarrison: CapabilityBinding = {
  * same shape: define its own id/version, register any new capabilities, then
  * export a terrain catalog that a map explicitly installs.
  */
-export const oilFieldMod = defineMod({
+export const oilFieldMod = defineTerrainMod({
   id: "mod-oil-field",
-  version: "0.1.0",
+  name: "油田",
+  version: "0.1.1",
   settings: [{
     id: "incomePerTurn",
     displayName: "油田每回合收益",
-    description: "有己方单位驻守时，在该玩家回合开始获得的点数。",
+    description: "有己方单位占领时，在该玩家回合开始获得的点数；不要求通电。",
     kind: "integer",
     defaultValue: 2,
     min: 0,
     max: 20,
     target: {
-      terrainId: OIL_FIELD_TERRAIN_ID,
       capabilityId: "core/income-source",
       configKey: "amount"
     }
@@ -64,7 +64,9 @@ export const oilFieldMod = defineMod({
       id: "core/income-source",
       target: "terrain",
       defaultConfig: {
-        amount: 0
+        amount: 0,
+        requires: "occupied",
+        when: "owner-turn-start"
       }
     },
     {
@@ -73,19 +75,24 @@ export const oilFieldMod = defineMod({
       defaultConfig: { strength: 1, unitDefinitionId: "core/roamer" }
     }
   ],
-  terrains: [{
-    id: OIL_FIELD_TERRAIN_ID,
-    displayName: "油田",
+  visualAssets: [{ id: "oil-field-art", dataUrl: oilFieldArtwork }],
+  terrain: {
     // It is occupiable but deliberately not conductive: oil income does not
     // turn a roaming unit into a powered unit.
-    capabilities: [occupiable, oilFieldIncome, departureGarrison, noCounterattack, captureArrivalExhaustion]
-  }],
+    capabilities: [occupiable, oilFieldIncome, departureGarrison, noCounterattack, captureArrivalExhaustion],
+    visuals: {
+      baseAssetId: "oil-field-art"
+    }
+  },
   units: [],
   commandRules: [],
   victoryConditions: []
 });
 
+/** Stable terrain id owned by this Mod, derived from its Mod ID. */
+export const OIL_FIELD_TERRAIN_ID = oilFieldMod.terrain.id;
+
 /** Runtime catalog installed by maps that opt into this Mod. */
 export const oilFieldTerrainCatalog = Object.fromEntries(
-  oilFieldMod.terrains.map((terrain) => [terrain.id, terrain])
+  [[oilFieldMod.terrain.id, oilFieldMod.terrain]]
 ) as TerrainCatalog;

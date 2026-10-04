@@ -26,14 +26,18 @@ describe("map terrain Mod dependencies", () => {
     expect(serializeMapCode(upgraded, { allowUnknownTerrainMods: true })).toBe(DEFAULT_MAP_CODE);
   });
 
-  it("rejects missing or unrelated declarations", () => {
+  it("requires every used terrain Mod but permits selected Mods that are not used yet", () => {
     expect(() => parseMapCode(JSON.stringify({ ...DEFAULT_MAP_DEFINITION, requiredTerrainModIds: [] }), {
       allowUnknownTerrainMods: true
-    })).toThrow(/依赖与地图实际使用的地形不一致/);
-    expect(() => parseMapCode(JSON.stringify({
+    })).toThrow(/依赖缺少地图实际使用的地形/);
+
+    const selectedButUnused = {
       ...DEFAULT_MAP_DEFINITION,
       requiredTerrainModIds: ["mod-oil-field", "mod-unused"]
-    }), { allowUnknownTerrainMods: true })).toThrow(/依赖与地图实际使用的地形不一致/);
+    };
+    const code = serializeMapCode(selectedButUnused, { allowUnknownTerrainMods: true });
+    expect(parseMapCode(code, { allowUnknownTerrainMods: true }).requiredTerrainModIds)
+      .toEqual(["mod-oil-field", "mod-unused"]);
   });
 
   it("does not require oil-field when the map uses only core terrain", () => {

@@ -1,14 +1,14 @@
 import { defineStore } from "pinia";
-import { ref } from "vue";
+import { shallowRef } from "vue";
 import type { GameState } from "@numeral-lord/game-core";
 
 /**
- * Pinia is the reactive source of truth for the match. Commands and network
- * snapshots commit their resulting state through setGame; Vue then propagates
- * the update to the board and the rest of the UI.
+ * Pinia is the reactive source of truth for the match. GameState is an immutable
+ * snapshot, so a shallow ref notifies consumers when the snapshot is replaced
+ * without recursively proxying every cell, unit, and rule setting.
  */
 export const useMatchStore = defineStore("match", () => {
-  const game = ref<GameState | null>(null);
+  const game = shallowRef<GameState | null>(null);
 
   function setGame(next: GameState): void {
     game.value = next;

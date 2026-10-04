@@ -1,28 +1,60 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { MapDefinition } from "@numeral-lord/core-content";
-import { getPoweredUnitIds, fromCellId, type CellId } from "@numeral-lord/game-core";
+import { getPoweredUnitIds, fromCellId, PLAYER_COLOR_OPTIONS, type CellId } from "@numeral-lord/game-core";
 import { createMatchFromMapDefinition } from "@numeral-lord/core-content";
 import HexBoard from "./HexBoard.vue";
 import MapEditorToolbar from "./MapEditorToolbar.vue";
-import { getMapCellRangeIndices } from "./map-cell-range";
-import { clampMapEditorPan } from "./map-editor-pan";
-import { installedMapCatalogs, installedTerrainMods } from "../installed-content";
+import NumberStepper from "./NumberStepper.vue";
+import { getMapCellRangeIndices } from "../maps/map-cell-range";
+import { clampMapEditorPan } from "../maps/map-editor-pan";
+import { changeSeatColor } from "../maps/map-player-colors";
+import { installedMapCatalogs, installedTerrainMods, resolveMapCatalogs, terrainVisualAssetsForCatalogs } from "../content/installed-content";
 
 const props = defineProps<{ initial?: MapDefinition | null }>();
 const emit = defineEmits<{ save: [definition: MapDefinition]; draft: [definition: MapDefinition]; cancel: [] }>();
-type TerrainOption = { id: string; name: string; color: string; blocked?: boolean; modId?: string };
+type TerrainOption = { id: string; name: string; color: string; baseOpacity?: number; transparent?: boolean; blocked?: boolean; modId?: string; artwork?: { src: string; scale: number; opacity: number; offsetX: number; offsetY: number }[] };
 const coreTerrains: TerrainOption[] = [
-  { id: "core/plain", name: "平原", color: "#63985d" }, { id: "core/ocean", name: "海洋", color: "#2f72c8" },
+  { id: "core/plain", name: "平原", color: "#63985d" },
+  { id: "core/ocean", name: "海洋", color: "#2f72c8" },
   { id: "core/stronghold", name: "据点", color: "#63985d" }, { id: "core/mountain", name: "山地", color: "#52627b", blocked: true },
-  { id: "core/void", name: "虚无", color: "#101927", blocked: true }
+  { id: "core/void", name: "虚无", color: "#101927", blocked: true, transparent: true }
 ];
-const terrainOptions = computed<TerrainOption[]>(() => [...coreTerrains, ...installedTerrainMods.flatMap((mod) => mod.terrains.map((t) => ({
-  id: t.id, name: t.displayName, color: t.id === "mod/oil-field" ? "#9a6338" : "#8173ac", modId: mod.id
-})))]);
+const allTerrainOptions = computed<TerrainOption[]>(() => [...coreTerrains, ...installedTerrainMods.flatMap((mod) => {
+  const terrain = mod.terrain;
+  if (!terrain) return [];
+  const assets = new Map((mod.visualAssets ?? []).map((asset) => [asset.id, asset.dataUrl]));
+  const visuals = terrain.visuals;
+  const artwork: NonNullable<TerrainOption["artwork"]> = [];
+  const baseOpacity = visuals?.baseTransparent === true ? 0 : visuals?.baseOpacity ?? 1;
+  if (!visuals?.baseTransparent && visuals?.baseAssetId) {
+    const src = assets.get(visuals.baseAssetId);
+    if (src) artwork.push({ src, scale: 1, opacity: baseOpacity, offsetX: 0, offsetY: 0 });
+  }
+  const overlay = visuals?.overlay;
+  if (overlay && !overlay.whenOccupied) {
+    const src = assets.get(overlay.assetId);
+    if (src) artwork.push({ src, scale: overlay.scale, opacity: overlay.opacity, offsetX: overlay.offsetX, offsetY: overlay.offsetY });
+  }
+  return [{
+    id: terrain.id, name: terrain.displayName, color: visuals?.baseColor ?? "#26384c", baseOpacity,
+    transparent: visuals?.baseTransparent === true || baseOpacity === 0 || (!visuals?.baseColor && Boolean(visuals?.baseAssetId)), modId: mod.id, artwork
+  }];
+})]);
+const selectedTerrainModIds = ref<string[]>([]);
+const terrainOptions = computed<TerrainOption[]>(() => [
+  ...coreTerrains,
+  ...allTerrainOptions.value.filter((option) => option.modId && selectedTerrainModIds.value.includes(option.modId))
+]);
+const terrainModOptions = computed(() => installedTerrainMods.map((mod) => ({
+  id: mod.id,
+  name: mod.terrain?.displayName ?? mod.id,
+  terrainId: mod.terrain?.id ?? ""
+})));
 const width = ref(props.initial?.columns ?? 9), height = ref(props.initial ? props.initial.terrain.length / props.initial.columns : 9);
 const widthInput = ref(String(width.value)), heightInput = ref(String(height.value));
 const players = ref(props.initial?.players ?? 2), name = ref(props.initial?.name ?? "新地图");
+const playerNames = ref<string[]>([]), playerColors = ref<string[]>([]);
 const playersInput = ref(String(players.value));
 const terrain = ref<string[]>([]), soldiers = ref<Array<{ index: number; seat: number; strength: number }>>([]);
 const specialUnits = ref<Array<{ index: number; kind: "wild" | "blocker"; strength: number }>>([]), teams = ref<number[]>([]);
@@ -43,7 +75,7 @@ const unitPreset = computed<string>({
     }
   }
 });
-const settingsOpen = ref(false);
+const settingsOpen = ref(false), playerSettingsOpen = ref(false);
 const formError = ref(""), terrainLookup = computed(() => new Map(terrainOptions.value.map((entry) => [entry.id, entry])));
 const editorZoom = ref(1), editorPan = ref({ x: 0, y: 0 });
 const boardWorkspace = ref<HTMLDivElement | null>(null), editorBoard = ref<HTMLDivElement | null>(null);
@@ -54,6 +86,15 @@ let editorDraggingAt = 0;
 let editorAltPainting = false;
 let lastAltPaintIndex = -1;
 let workspaceResizeObserver: ResizeObserver | undefined;
+
+function toggleMapSettings(): void {
+  settingsOpen.value = !settingsOpen.value;
+  if (settingsOpen.value) playerSettingsOpen.value = false;
+}
+function togglePlayerSettings(): void {
+  playerSettingsOpen.value = !playerSettingsOpen.value;
+  if (playerSettingsOpen.value) settingsOpen.value = false;
+}
 
 function constrainEditorPan(): void {
   const workspace = boardWorkspace.value, boardHost = editorBoard.value;
@@ -87,6 +128,15 @@ function resetFromDefinition(definition?: MapDefinition | null): void {
   width.value = definition?.columns ?? 9; height.value = definition ? definition.terrain.length / definition.columns : 9;
   widthInput.value = String(width.value); heightInput.value = String(height.value);
   players.value = definition?.players ?? 2; playersInput.value = String(players.value); name.value = definition?.name ?? "新地图";
+  playerNames.value = Array.from({ length: players.value }, (_, i) => definition?.playerNames?.[i] || `玩家 ${i + 1}`);
+  playerColors.value = Array.from({ length: players.value }, (_, i) => definition?.playerColors?.[i] ?? PLAYER_COLOR_OPTIONS[i % PLAYER_COLOR_OPTIONS.length]!.value);
+  const usedModIds = definition
+    ? [...new Set(definition.terrain.split("").map((symbol) => {
+      const terrainId = definition.terrainLegend[symbol];
+      return allTerrainOptions.value.find((option) => option.id === terrainId)?.modId;
+    }).filter((id): id is string => Boolean(id)))]
+    : [];
+  selectedTerrainModIds.value = [...new Set([...(definition?.requiredTerrainModIds ?? []), ...usedModIds])];
   const count = width.value * height.value;
   terrain.value = Array.from({ length: count }, (_, i) => {
     if (!definition) return "core/plain";
@@ -106,6 +156,8 @@ watch([width, height], () => {
 });
 watch(players, (value) => {
   selectedSeat.value = Math.min(selectedSeat.value, value);
+  playerNames.value = Array.from({ length: value }, (_, i) => playerNames.value[i]?.trim() || `玩家 ${i + 1}`);
+  playerColors.value = Array.from({ length: value }, (_, i) => playerColors.value[i] ?? PLAYER_COLOR_OPTIONS[i % PLAYER_COLOR_OPTIONS.length]!.value);
   teams.value = Array.from({ length: value }, (_, i) => teams.value[i] ?? i + 1);
   soldiers.value = soldiers.value.filter((u) => u.seat <= value);
 }, { flush: "sync" });
@@ -121,6 +173,23 @@ function applyPlayerCount(): void {
   const next = Math.max(1, Math.min(64, Math.trunc(Number(playersInput.value) || 1)));
   playersInput.value = String(next);
   players.value = next;
+}
+function updatePlayerColor(index: number, color: string): void {
+  playerColors.value = changeSeatColor(playerColors.value, index, color);
+}
+function terrainModIsInUse(modId: string): boolean {
+  const terrainId = terrainModOptions.value.find((mod) => mod.id === modId)?.terrainId;
+  return Boolean(terrainId && terrain.value.includes(terrainId));
+}
+function toggleTerrainMod(modId: string, event: Event): void {
+  const checked = (event.target as HTMLInputElement).checked;
+  if (checked) {
+    if (!selectedTerrainModIds.value.includes(modId)) selectedTerrainModIds.value = [...selectedTerrainModIds.value, modId];
+    return;
+  }
+  if (terrainModIsInUse(modId)) return;
+  selectedTerrainModIds.value = selectedTerrainModIds.value.filter((id) => id !== modId);
+  if (allTerrainOptions.value.some((option) => option.id === selectedTerrain.value && option.modId === modId)) selectedTerrain.value = "core/plain";
 }
 const previewDefinition = computed<MapDefinition>(() => {
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -141,10 +210,12 @@ const previewDefinition = computed<MapDefinition>(() => {
     columns: width.value,
     terrain: terrainCode,
     terrainLegend: legend,
-    requiredTerrainModIds: [...new Set(terrain.value.map((terrainId) => terrainLookup.value.get(terrainId)?.modId).filter((id): id is string => Boolean(id)))],
+    requiredTerrainModIds: [...new Set([...selectedTerrainModIds.value, ...terrain.value.map((terrainId) => terrainLookup.value.get(terrainId)?.modId).filter((id): id is string => Boolean(id))])],
     ...(props.initial?.modSettings ? { modSettings: props.initial.modSettings } : {}),
     ...(props.initial?.cellLinks ? { cellLinks: props.initial.cellLinks } : {}),
     players: players.value,
+    playerNames: Array.from({ length: players.value }, (_, index) => playerNames.value[index]?.trim() || `玩家 ${index + 1}`),
+    playerColors: [...playerColors.value],
     soldiers: soldiers.value.map(({ index, seat, strength }) => [index, seat, strength] as const),
     ...(specialUnits.value.length ? { specialUnits: specialUnits.value.map(({ index, kind, strength }) => [index, kind, strength] as const) } : {}),
     teams: Array.from({ length: players.value }, (_, index) => {
@@ -154,8 +225,36 @@ const previewDefinition = computed<MapDefinition>(() => {
     matchConditionIds: []
   };
 });
-const previewState = computed(() => createMatchFromMapDefinition(previewDefinition.value, installedMapCatalogs));
-const previewPoweredUnitIds = computed(() => [...getPoweredUnitIds(previewState.value, installedMapCatalogs.terrains)]);
+const editorCatalogs = computed(() => {
+  const exact = props.initial ? resolveMapCatalogs(JSON.stringify(props.initial)) : null;
+  if (!exact) return installedMapCatalogs;
+  const terrains = { ...installedMapCatalogs.terrains };
+  const terrainModIds = { ...installedMapCatalogs.terrainModIds };
+  const mods = { ...installedMapCatalogs.mods };
+  for (const modId of props.initial?.requiredTerrainModIds ?? []) {
+    const pinned = exact.mods?.[modId];
+    if (!pinned) continue;
+    const previousTerrain = mods[modId]?.terrain;
+    if (previousTerrain) {
+      delete terrains[previousTerrain.id];
+      delete terrainModIds[previousTerrain.id];
+    }
+    mods[modId] = pinned;
+    if (pinned.terrain) {
+      terrains[pinned.terrain.id] = pinned.terrain;
+      terrainModIds[pinned.terrain.id] = modId;
+    }
+  }
+  return { terrains, terrainModIds, mods };
+});
+const editorTerrainVisualAssets = computed(() => terrainVisualAssetsForCatalogs(editorCatalogs.value));
+const previewState = computed(() => createMatchFromMapDefinition(previewDefinition.value, editorCatalogs.value));
+const playerOptions = computed(() => Array.from({ length: players.value }, (_, index) => ({
+  seat: index + 1,
+  name: playerNames.value[index]?.trim() || `玩家 ${index + 1}`,
+  color: playerColors.value[index] ?? "#668fb8"
+})));
+const previewPoweredUnitIds = computed(() => [...getPoweredUnitIds(previewState.value, editorCatalogs.value.terrains ?? installedMapCatalogs.terrains)]);
 watch(previewDefinition, (definition) => emit("draft", definition), { immediate: true });
 
 function paintCellId(cellId: CellId): void {
@@ -284,8 +383,8 @@ function saveMap(): void {
     const definition: MapDefinition = {
       version: 1, id: props.initial?.id ?? `custom-${createId()}`, name: name.value.trim() || "未命名地图", columns: width.value,
       terrain: terrain.value.map((id) => byTerrain.get(id)!).join(""), terrainLegend: legend,
-      requiredTerrainModIds: [...new Set(terrain.value.map((id) => terrainLookup.value.get(id)?.modId).filter((id): id is string => Boolean(id)))],
-      players: players.value, soldiers: soldiers.value.map((u) => [u.index, u.seat, u.strength] as const),
+      requiredTerrainModIds: [...new Set([...selectedTerrainModIds.value, ...terrain.value.map((id) => terrainLookup.value.get(id)?.modId).filter((id): id is string => Boolean(id))])],
+      players: players.value, playerNames: Array.from({ length: players.value }, (_, index) => playerNames.value[index]?.trim() || `玩家 ${index + 1}`), playerColors: [...playerColors.value], soldiers: soldiers.value.map((u) => [u.index, u.seat, u.strength] as const),
       ...(specialUnits.value.length ? { specialUnits: specialUnits.value.map((u) => [u.index, u.kind, u.strength] as const) } : {}),
       teams: Array.from({ length: players.value }, (_, index) => {
         const team = Number(teams.value[index]);
@@ -300,20 +399,35 @@ function createId(): string { return typeof crypto.randomUUID === "function" ? c
 
 <template>
   <section class="editor-shell">
-    <header class="editor-head"><div class="editor-title"><p class="eyebrow">MAP EDITOR</p><h2>{{ initial ? '编辑地图' : '创建地图' }}</h2></div><div class="editor-head-actions"><button class="quiet-button" @click="settingsOpen = !settingsOpen">⚙ <span>地图设置</span></button><button class="quiet-button" @click="emit('cancel')">返回地图库</button><button class="save-button" @click="saveMap">保存地图</button></div></header>
+    <header class="editor-head"><div class="editor-title"><p class="eyebrow">MAP EDITOR</p><h2>{{ initial ? '编辑地图' : '创建地图' }}</h2></div><div class="editor-head-actions"><button class="quiet-button" @click="toggleMapSettings">⚙ <span>地图设置</span></button><button class="quiet-button" @click="togglePlayerSettings">♟ <span>玩家位置</span><small>{{ players }}</small></button><button class="quiet-button" @click="emit('cancel')">取消编辑</button><button class="save-button" @click="saveMap">保存地图</button></div></header>
     <div class="editor-layout">
       <div ref="boardWorkspace" class="board-workspace" @pointerdown="onEditorPointerDown" @pointermove="onEditorPointerMove" @pointerup="onEditorPointerUp" @pointercancel="onEditorPointerUp" @wheel.prevent="onEditorWheel">
         <div ref="editorBoard" class="editor-board">
-          <HexBoard preview editable :view-zoom="editorZoom" :view-pan="editorPan" :state="previewState" :selected-unit-id="null" :legal-action-cell-ids="[]" :actionable-unit-ids="[]" :powered-unit-ids="previewPoweredUnitIds" @cell-click="paintCellId" @cell-pointer-enter="onCellPointerEnter" @cell-press-start="onCellPressStart" />
+          <HexBoard preview editable :view-zoom="editorZoom" :view-pan="editorPan" :state="previewState" :selected-unit-id="null" :legal-action-cell-ids="[]" :actionable-unit-ids="[]" :powered-unit-ids="previewPoweredUnitIds" :terrain-catalog="editorCatalogs.terrains" :terrain-visual-assets="editorTerrainVisualAssets" @cell-click="paintCellId" @cell-pointer-enter="onCellPointerEnter" @cell-press-start="onCellPressStart" />
         </div>
         <div class="board-caption">{{ width }} × {{ height }} 格 <span>·</span> {{ soldiers.length + specialUnits.length }} 个初始单位 <span>·</span> 点击绘制，按住 Alt 拖动批量绘制</div>
       </div>
-      <MapEditorToolbar v-model:mode="placementMode" v-model:selected-terrain="selectedTerrain" v-model:unit-preset="unitPreset" v-model:strength="strength" v-model:fill-radius="fillRadius" :terrain-options="terrainOptions" :player-count="players" />
+      <MapEditorToolbar v-model:mode="placementMode" v-model:selected-terrain="selectedTerrain" v-model:unit-preset="unitPreset" v-model:strength="strength" v-model:fill-radius="fillRadius" :terrain-options="terrainOptions" :player-options="playerOptions" />
       <aside v-if="settingsOpen" class="editor-settings" role="dialog" aria-label="地图设置">
         <div class="side-title"><span>地图设置</span><button class="settings-close" aria-label="关闭设置" @click="settingsOpen = false">×</button></div>
         <label>地图名称<input v-model="name" maxlength="60" /></label>
-        <div class="form-grid"><label>宽度<input v-model="widthInput" type="number" min="1" max="64" @change="applyBoardSize" /></label><label>高度<input v-model="heightInput" type="number" min="1" max="64" @change="applyBoardSize" /></label></div>
-        <details class="advanced-settings" open><summary>对局规则 <small>{{ players }} 位玩家 · 初始 {{ strength }} 点</small></summary><div class="form-grid"><label>玩家位<input v-model="playersInput" type="number" min="1" max="64" @change="applyPlayerCount" /></label><label>初始点数<input v-model.number="strength" type="number" min="1" max="65535" @change="strength = Math.max(1, Math.min(65535, Math.trunc(strength || 1)))" /></label></div><div class="team-settings"><label v-for="(_, index) in teams" :key="index">玩家 {{ index + 1 }}<input v-model.number="teams[index]" type="number" min="1" max="64" /></label><small>相同队伍号表示同队。</small></div><p class="compat-note">阻挡不反击；野怪会反击，次数取决于所在地皮。</p></details>
+        <div class="form-grid"><div class="number-setting"><label for="map-width">宽度</label><NumberStepper id="map-width" :model-value="Number(widthInput)" :min="1" :max="64" aria-label="地图宽度" @update:model-value="widthInput = String($event)" @change="applyBoardSize" /></div><div class="number-setting"><label for="map-height">高度</label><NumberStepper id="map-height" :model-value="Number(heightInput)" :min="1" :max="64" aria-label="地图高度" @update:model-value="heightInput = String($event)" @change="applyBoardSize" /></div></div>
+        <div class="map-mod-picker">
+          <div class="map-mod-heading"><strong>此地图可使用的地形 Mod</strong><small>{{ selectedTerrainModIds.length }} 已选</small></div>
+          <p>先选择 Mod，底部地形工具才会显示它提供的地形。</p>
+          <label v-for="mod in terrainModOptions" :key="mod.id" class="map-mod-option">
+            <input type="checkbox" :checked="selectedTerrainModIds.includes(mod.id)" :disabled="selectedTerrainModIds.includes(mod.id) && terrainModIsInUse(mod.id)" @change="toggleTerrainMod(mod.id, $event)" />
+            <span><strong>{{ mod.name }}</strong><small>{{ mod.id }} · {{ mod.terrainId }}{{ terrainModIsInUse(mod.id) ? ' · 棋盘上使用中' : '' }}</small></span>
+          </label>
+          <p v-if="!terrainModOptions.length" class="map-mod-empty">本机尚未安装额外地形 Mod，可先到创意工坊订阅并安装。</p>
+        </div>
+      </aside>
+      <aside v-if="playerSettingsOpen" class="editor-settings player-settings" role="dialog" aria-label="玩家位置设置">
+        <div class="side-title"><span>玩家位置</span><button class="settings-close" aria-label="关闭玩家位置设置" @click="playerSettingsOpen = false">×</button></div>
+        <p class="player-settings-intro">设置出生位置名称与队伍。点击色块可自定义颜色；若颜色已被使用，会和原位置自动交换。</p>
+        <div class="seat-count-field"><label for="map-player-count">玩家位置数量</label><NumberStepper id="map-player-count" :model-value="Number(playersInput)" :min="1" :max="64" aria-label="玩家位置数量" @update:model-value="playersInput = String($event)" @change="applyPlayerCount" /></div>
+        <div class="seat-settings-list"><div v-for="(_, index) in teams" :key="index" class="seat-setting"><label class="seat-mark-picker" :style="{ '--seat-color': playerColors[index] }" :title="`更改玩家 ${index + 1} 色块`"><span>{{ index + 1 }}</span><input type="color" :value="playerColors[index]" :aria-label="`玩家 ${index + 1} 色块颜色`" @change="updatePlayerColor(index, ($event.target as HTMLInputElement).value)" /></label><label class="seat-name-field"><span>位置名称</span><input v-model="playerNames[index]" maxlength="24" :aria-label="`玩家 ${index + 1} 位置名称`" :placeholder="`玩家 ${index + 1}`" /></label><div class="seat-team-field"><label :for="`map-team-${index}`">队伍号</label><NumberStepper :id="`map-team-${index}`" :model-value="teams[index] ?? 1" :min="1" :max="64" :aria-label="`玩家 ${index + 1} 队伍号`" size="compact" @update:model-value="teams[index] = $event" /></div></div></div>
+        <small class="team-hint">相同队伍号表示同队。点数根据棋盘单位和回合规则计算，不在这里设置。</small>
       </aside>
       <p v-if="formError" class="form-error editor-error" role="alert">{{ formError }}</p>
     </div>
@@ -337,4 +451,25 @@ function createId(): string { return typeof crypto.randomUUID === "function" ? c
 .toolbar-choice{position:relative;display:flex;align-items:center}.choice-trigger{display:flex;align-items:center;justify-content:space-between;gap:9px;min-width:100px;height:36px;margin:0;padding:5px 9px;border:1px solid rgba(143,188,206,.25);border-radius:7px;color:#e4edf4;background:#090d13;font-size:12px;white-space:nowrap}.choice-trigger i,.choice-popover i{width:18px;height:18px;flex:none;border:1px solid rgba(255,255,255,.28);border-radius:50%}.choice-trigger span{color:#91a8b7;font-size:14px}.choice-popover{position:absolute;z-index:10;bottom:calc(100% + 9px);left:0;display:grid;gap:3px;width:190px;max-height:min(44dvh,340px);box-sizing:border-box;overflow:auto;padding:6px;border:1px solid rgba(143,188,206,.28);border-radius:9px;background:#0a121d;box-shadow:0 12px 32px rgba(0,0,0,.55)}.choice-popover button{display:flex;align-items:center;gap:9px;min-height:33px;margin:0;padding:5px 8px;border:0;border-radius:5px;color:#dbe8f0;background:transparent;text-align:left;font-size:11px}.choice-popover button:hover,.choice-popover button[aria-selected="true"]{background:#17364a;color:#fff}.choice-popover small{margin-left:auto;color:#80c9c5;font-size:9px}.choice-popover .choice-group-title{padding:5px 8px 3px;color:#83a0b5;font-size:9px;font-weight:800}.unit-choice .choice-trigger{min-width:110px}.erase-button{display:flex;flex-direction:column;align-items:center;justify-content:center;min-width:42px;height:36px;margin:0;padding:1px 5px;border:1px solid rgba(143,188,206,.22);border-radius:7px;color:#d9e6ef;background:#101923;font-size:18px;line-height:1}.erase-button small{font-size:8px;line-height:1.2}.erase-button.active{border-color:#f07883;color:#ffc3ca;background:#492631}
 @media(max-width:720px){.choice-trigger{min-width:84px;height:33px;padding:4px 6px;font-size:10px}.choice-trigger i,.choice-popover i{width:16px;height:16px}.choice-popover{width:min(190px,calc(100vw - 24px));max-height:min(38dvh,280px)}.unit-choice .choice-trigger{min-width:92px}.erase-button{min-width:35px;height:33px}.erase-button small{font-size:7px}}
 .editor-board{inset:0!important}
+.editor-head-actions .quiet-button small{display:inline-grid;place-items:center;min-width:17px;height:17px;margin-left:2px;border-radius:99px;color:#b9e6e2;background:rgba(88,167,162,.18);font-size:9px}.player-settings{width:min(440px,calc(100vw - 24px));gap:11px}.player-settings-intro{margin:-3px 0 0;color:#8fa9bc;font-size:10px;line-height:1.5}.editor-settings .seat-count-field{display:grid;grid-template-columns:1fr 82px;align-items:center;gap:8px}.editor-settings .seat-count-field input{text-align:center}.seat-settings-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(185px,1fr));align-content:start;gap:7px;max-height:min(64dvh,620px);overflow:auto;padding:2px 4px 2px 0}.seat-setting{display:grid;grid-template-columns:28px minmax(0,1fr);align-items:center;gap:6px 8px;padding:8px;border:1px solid rgba(136,177,204,.17);border-radius:9px;background:rgba(20,41,60,.48)}.editor-settings .seat-mark-picker{position:relative;display:grid;place-items:center;grid-row:1/3;width:30px;height:33px;align-self:center;clip-path:polygon(50% 0,94% 24%,94% 76%,50% 100%,6% 76%,6% 24%);background:var(--seat-color);color:#f2f7fa}.seat-mark-picker span{color:white;font-size:10px;font-weight:900;text-shadow:0 1px 2px #101723;pointer-events:none}.editor-settings .seat-mark-picker input[type="color"]{position:absolute;inset:0;width:100%;height:100%;min-height:0;padding:0;border:0;border-radius:0;opacity:0;cursor:pointer}.editor-settings .seat-mark-picker:focus-within{outline:2px solid #82e8d7;outline-offset:2px}.editor-settings .seat-setting label{min-width:0}.editor-settings .seat-setting label span{color:#89a5bb;font-size:9px}.editor-settings .seat-setting input{min-width:0;min-height:32px;padding:5px 7px}.editor-settings .seat-name-field input{font-size:11px}.editor-settings .seat-team-field{display:grid;grid-template-columns:1fr 54px;align-items:center;gap:6px}.editor-settings .seat-team-field input{text-align:center}.team-hint{color:#829caf;font-size:9px;line-height:1.45}.player-settings .team-hint{padding-top:9px;border-top:1px solid rgba(140,180,202,.15)}
+</style>
+
+<style scoped>
+.map-mod-picker{display:grid;gap:7px;padding-top:10px;border-top:1px solid rgba(140,180,202,.15)}
+.map-mod-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;color:#d8e8f2;font-size:10px}
+.map-mod-heading small{color:#76d8ca;font-size:9px}
+.editor-settings .map-mod-picker>p{margin:0;color:#829caf;font-size:9px;line-height:1.5}
+.editor-settings .map-mod-option{display:flex;align-items:center;gap:8px;padding:8px;border:1px solid rgba(136,177,204,.18);border-radius:8px;background:rgba(20,41,60,.48);cursor:pointer}
+.editor-settings .map-mod-option input{flex:none;width:15px;height:15px;min-height:0;margin:0;accent-color:#72dccb}
+.editor-settings .map-mod-option span{display:grid;gap:3px;min-width:0}
+.editor-settings .map-mod-option strong{overflow:hidden;color:#dcebf4;font-size:10px;text-overflow:ellipsis;white-space:nowrap}
+.editor-settings .map-mod-option small{overflow-wrap:anywhere;color:#819bad;font-size:8px}
+.map-mod-empty{padding:7px;border-radius:7px;background:rgba(16,35,51,.6)}
+</style>
+
+<style scoped>
+.number-setting{display:grid;min-width:0;gap:4px}
+.number-setting>label{color:#a9c1d2;font-size:10px}
+.editor-settings .seat-count-field{grid-template-columns:minmax(0,1fr) 108px}
+.editor-settings .seat-team-field{grid-template-columns:minmax(0,1fr) 84px}
 </style>

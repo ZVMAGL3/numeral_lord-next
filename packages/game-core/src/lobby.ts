@@ -1,3 +1,5 @@
+import type { ModContentLock } from "./state.js";
+
 /** Lifecycle of an online room before and after the map starts. */
 export type LobbyPhase = "lobby" | "playing";
 
@@ -33,6 +35,10 @@ export interface LobbyMember {
   readonly ready: boolean;
   /** Content available to this browser for constructing the selected match. */
   readonly installedModIds: readonly string[];
+  /** Installed package versions, keyed by Mod ID, for match compatibility checks. */
+  readonly installedModVersions: Readonly<Record<string, string>>;
+  /** Canonical SHA-256 identities, keyed by Mod ID, for exact compatibility checks. */
+  readonly installedModContentHashes?: Readonly<Record<string, string>>;
   /** Selected map dependencies absent from this browser. Empty means playable. */
   readonly missingModIds: readonly string[];
 }
@@ -45,6 +51,10 @@ export interface LobbyRoomState {
   readonly mapPlayerCount: number;
   /** Required executable terrain Mod package IDs from the selected map code. */
   readonly requiredTerrainModIds: readonly string[];
+  /** Current exact releases selected by the room host for this map's Mod IDs. */
+  readonly effectiveTerrainModReleases: readonly ModContentLock[];
+  /** Required Mods whose installed versions differ between participating members. */
+  readonly modVersionMismatchIds: readonly string[];
   /** Room-host overrides; map-authored values and Mod defaults remain in the map/SDK. */
   readonly roomModSettings: LobbyModSettings;
   readonly settings: LobbySettings;
@@ -70,6 +80,8 @@ export interface MatchPlayerAssignment {
 export interface MatchStartPayload {
   /** Start all clients from the same map definition. */
   readonly mapCode: string;
+  /** Release identities frozen for this match from the host's active Mods. */
+  readonly effectiveTerrainModReleases: readonly ModContentLock[];
   readonly settings: LobbySettings;
   /** Exact same validated host overrides used by each browser's shared core. */
   readonly roomModSettings: LobbyModSettings;

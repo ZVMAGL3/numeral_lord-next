@@ -18,8 +18,6 @@ const actionStrengthDecay: CapabilityBinding = {
 };
 /** A powered unit must retain one point at its origin, so one point cannot act. */
 const poweredActionThreshold: CapabilityBinding = { id: "core/powered-action-threshold", config: { minimumStrength: 2 } };
-/** Each powered unit supplies one reinforcement point during its owner's turn. */
-const poweredIncome: CapabilityBinding = { id: "core/powered-income", config: { amount: 1 } };
 /** 标记该单位参与地形的“攻击占领进入反应”；占领后仍未通电才失活。 */
 const exhaustAfterAttack: CapabilityBinding = { id: "core/exhaust-after-attack" };
 
@@ -39,10 +37,8 @@ export const coreUnitMod = defineMod({
       defaultConfig: { amount: 1, minimumStrength: 1 }
     },
     { id: "core/powered-action-threshold", target: "unit", defaultConfig: { minimumStrength: 2 } },
-    { id: "core/powered-income", target: "unit", defaultConfig: { amount: 1 } },
     { id: "core/exhaust-after-attack", target: "unit", defaultConfig: {} }
   ],
-  terrains: [],
   units: [{
     id: "core/roamer",
     displayName: "游兵",
@@ -54,7 +50,6 @@ export const coreUnitMod = defineMod({
       counterattackLimit,
       actionStrengthDecay,
       poweredActionThreshold,
-      poweredIncome,
       exhaustAfterAttack
     ]
   }, {

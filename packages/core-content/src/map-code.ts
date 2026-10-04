@@ -1,4 +1,4 @@
-import { getHexNeighbours, getPlayerColor, hasTerrainCapability, startMatch, toCellId } from "@numeral-lord/game-core";
+import { getPlayerColor, hasTerrainCapability, startMatch, toCellId } from "@numeral-lord/game-core";
 import type {
   CellTriggerLink,
   CellId,
@@ -14,7 +14,7 @@ import type {
 } from "@numeral-lord/game-core";
 import { coreMatchConditionCatalog } from "./match-conditions.js";
 import { legacyDemoMap } from "./legacy-demo-map.js";
-import { coreTerrainCatalog } from "./terrains.js";
+import { coreTerrainCatalog, coreTerrainMod } from "./terrains.js";
 import { coreUnitCatalog } from "./units.js";
 import { resolveModSettings, validateModSettings, type ModCatalog } from "./mod-settings.js";
 import type { ModSettings } from "@numeral-lord/game-sdk";
@@ -51,6 +51,10 @@ export interface MapDefinition {
   /** Optional directed relationships, resolved by their enter/leave trigger. */
   readonly cellLinks?: readonly MapCellLink[];
   readonly players: number;
+  /** Editable display names for map seats. Missing names keep the legacy 玩家 N fallback. */
+  readonly playerNames?: readonly string[];
+  /** Optional per-seat hex colors; missing colors use the legacy nine-color palette. */
+  readonly playerColors?: readonly string[];
   readonly soldiers: readonly MapSoldier[];
   /** Optional neutral map pieces, stored as [cell index, kind, strength]. */
   readonly specialUnits?: readonly MapSpecialUnit[];
@@ -139,8 +143,13 @@ export function parseMapCode(raw: string, catalogs: MapCatalogs = {}): MapDefini
 }
 
 /** Normalize and validate before exporting, so copied codes always load. */
-export function serializeMapCode(definition: MapDefinition, catalogs: MapCatalogs = {}): string {
+export function serializeMapCode(
+  definition: MapDefinition,
+  catalogs: MapCatalogs = {}
+): string {
   const normalized = validateMapDefinition(definition, catalogs);
+  // Older shared maps may still contain requiredTerrainModLocks. Validation
+  // intentionally drops that obsolete field: a map declares Mod IDs only.
   const code = JSON.stringify(normalized);
   if (code.length > MAX_MAP_CODE_LENGTH) throw new Error("地图码超过 64 KiB。");
   return code;
@@ -166,8 +175,10 @@ export function createMatchFromMapDefinition(definition: MapDefinition, options:
   const selectedMods = map.requiredTerrainModIds
     .map((modId) => options.mods?.[modId])
     .filter((mod): mod is NonNullable<typeof mod> => mod !== undefined);
-  const spatialPatterns = selectedMods.flatMap((mod) => mod.spatialPatterns ?? []).sort((left, right) => left.id.localeCompare(right.id));
-  const rules = selectedMods.flatMap((mod) => mod.rules ?? []).sort((left, right) => left.id.localeCompare(right.id));
+  const spatialPatterns = [...(coreTerrainMod.spatialPatterns ?? []), ...selectedMods.flatMap((mod) => mod.spatialPatterns ?? [])]
+    .sort((left, right) => left.id.localeCompare(right.id));
+  const rules = [...(coreTerrainMod.rules ?? []), ...selectedMods.flatMap((mod) => mod.rules ?? [])]
+    .sort((left, right) => left.id.localeCompare(right.id));
   const rows = map.terrain.length / map.columns;
   const cells = {} as Record<CellId, MapCell>;
   const units = {} as Record<UnitId, UnitState>;
@@ -204,13 +215,11 @@ export function createMatchFromMapDefinition(definition: MapDefinition, options:
   for (const source of Object.values(cells)) {
     const terrain = terrainCatalog[source.terrainId];
     if (!terrain) continue;
-    if (hasTerrainCapability(terrain, "core/adjacent-hostile-exhaustion")) {
-      for (const neighbour of getHexNeighbours(source.coordinate, { columns: map.columns, rows })) {
-        addCellLink(source.id, toCellId(neighbour), "enter", "core/adjacent-hostile-exhaustion");
-      }
-    }
     if (hasTerrainCapability(terrain, "core/exhaust-unpowered-after-capture")) {
       addCellLocalTrigger(source.id, "enter", "core/exhaust-unpowered-after-capture");
+    }
+    if (hasTerrainCapability(terrain, "core/exhaust-on-entry")) {
+      addCellLocalTrigger(source.id, "enter", "core/exhaust-on-entry");
     }
     if (hasTerrainCapability(terrain, "core/departure-garrison")) addCellLocalTrigger(source.id, "leave", "core/departure-garrison");
     if (hasTerrainCapability(terrain, "core/exhaust-on-departure")) addCellLocalTrigger(source.id, "leave", "core/exhaust-on-departure");
@@ -228,8 +237,9 @@ export function createMatchFromMapDefinition(definition: MapDefinition, options:
       id: playerId,
       teamId,
       seat,
-      displayName: options.playerDisplayNames?.[playerId]?.trim().slice(0, 24) || `玩家 ${seat}`,
+      displayName: options.playerDisplayNames?.[playerId]?.trim().slice(0, 24) || map.playerNames?.[seat - 1] || `玩家 ${seat}`,
       color: options.playerColors?.[playerId]
+        ?? map.playerColors?.[seat - 1]
         ?? getPlayerColor(DEFAULT_PLAYER_COLOR_IDS[(seat - 1) % DEFAULT_PLAYER_COLOR_IDS.length])!,
       reinforcementPoints: 0
     };
@@ -279,7 +289,11 @@ export function createMatchFromMapDefinition(definition: MapDefinition, options:
     players,
     teams
   };
-  return startMatch(initialState, terrainCatalog, unitCatalog, matchConditionCatalog).state;
+  try {
+    return startMatch(initialState, terrainCatalog, unitCatalog, matchConditionCatalog).state;
+  } catch {
+    throw new Error("无法初始化地图规则；请检查地图依赖的地块 Mod 和胜负条件是否有效。");
+  }
 }
 
 function validateMapDefinition(input: unknown, catalogs: MapCatalogs): MapDefinition {
@@ -303,6 +317,22 @@ function validateMapDefinition(input: unknown, catalogs: MapCatalogs): MapDefini
     throw new Error("地图玩家位数必须在 1 到 64 之间。");
   }
   const players = data.players as number;
+  let playerNames: string[] | undefined;
+  if (data.playerNames !== undefined) {
+    if (!Array.isArray(data.playerNames) || data.playerNames.length !== players
+      || data.playerNames.some((name) => typeof name !== "string" || name.trim().length === 0 || name.trim().length > 24)) {
+      throw new Error("玩家位置名称必须为每个玩家位填写 1 到 24 个字符。");
+    }
+    playerNames = (data.playerNames as string[]).map((name) => name.trim());
+  }
+  let playerColors: string[] | undefined;
+  if (data.playerColors !== undefined) {
+    if (!Array.isArray(data.playerColors) || data.playerColors.length !== players
+      || data.playerColors.some((color) => typeof color !== "string" || !/^#[0-9a-fA-F]{6}$/.test(color))) {
+      throw new Error("玩家色块必须为每个玩家位设置有效的六位十六进制颜色。");
+    }
+    playerColors = (data.playerColors as string[]).map((color) => color.toUpperCase());
+  }
   if (!isRecord(data.terrainLegend)) throw new Error("地图缺少地形代码表。");
   const terrainCatalog = catalogs.terrains ?? DEFAULT_MAP_TERRAIN_CATALOG;
   const terrainLegend: Record<string, string> = {};
@@ -327,8 +357,8 @@ function validateMapDefinition(input: unknown, catalogs: MapCatalogs): MapDefini
   if (!Array.isArray(declaredTerrainModIds) || declaredTerrainModIds.some((id) => typeof id !== "string" || id.length === 0 || id.length > 120 || id.trim() !== id) || new Set(declaredTerrainModIds).size !== declaredTerrainModIds.length) {
     throw new Error("地块 Mod 依赖列表无效。");
   }
-  if (declaredTerrainModIds.length !== inferredTerrainModIds.size || declaredTerrainModIds.some((id) => !inferredTerrainModIds.has(id))) {
-    throw new Error("地块 Mod 依赖与地图实际使用的地形不一致。");
+  if ([...inferredTerrainModIds].some((id) => !declaredTerrainModIds.includes(id))) {
+    throw new Error("地块 Mod 依赖缺少地图实际使用的地形。");
   }
   const modSettings = validateModSettings(
     data.modSettings,
@@ -406,10 +436,14 @@ function validateMapDefinition(input: unknown, catalogs: MapCatalogs): MapDefini
     columns,
     terrain: data.terrain,
     terrainLegend,
-    requiredTerrainModIds: [...inferredTerrainModIds],
+    // Keep explicitly selected Mods even before a tile from them is placed:
+    // map settings are also the allow-list of terrain available in the editor.
+    requiredTerrainModIds: [...declaredTerrainModIds] as string[],
     ...(modSettings ? { modSettings } : {}),
     ...(cellLinks.length ? { cellLinks } : {}),
     players,
+    ...(playerNames ? { playerNames } : {}),
+    ...(playerColors ? { playerColors } : {}),
     soldiers,
     ...(specialUnits.length ? { specialUnits } : {}),
     teams: [...teams] as number[],

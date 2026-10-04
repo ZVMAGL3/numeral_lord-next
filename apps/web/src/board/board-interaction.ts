@@ -9,6 +9,16 @@ import {
   type UnitId
 } from "@numeral-lord/game-core";
 
+/** Combat targets already receive their own red/white outline, not the generic cyan move hint. */
+export function getMovementHintCellIds(
+  legalCellIds: readonly CellId[],
+  counterattackCellIds: readonly CellId[],
+  noCounterattackCellIds: readonly CellId[]
+): readonly CellId[] {
+  const combatTargets = new Set([...counterattackCellIds, ...noCounterattackCellIds]);
+  return legalCellIds.filter((cellId) => !combatTargets.has(cellId));
+}
+
 /**
  * Per-client board interaction state. It is intentionally not part of
  * GameState and is never sent through the PvP relay; move previews can reveal
@@ -16,9 +26,10 @@ import {
  */
 export function useBoardInteraction(
   getGame: () => GameState,
-  terrains: TerrainCatalog,
+  terrainSource: TerrainCatalog | (() => TerrainCatalog),
   units: UnitCatalog
 ) {
+  const terrains = () => typeof terrainSource === "function" ? terrainSource() : terrainSource;
   const currentSelectedUnitId = ref<UnitId | null>(null);
   const currentSourceCellId = ref<CellId | null>(null);
   const currentSelectionWasUserInitiated = ref(false);
@@ -31,17 +42,17 @@ export function useBoardInteraction(
   /** Legal cells are always recalculated from this tab's selection and the latest canonical board. */
   const legalActionCellIds = computed<readonly CellId[]>(() => {
     const unitId = currentSelectedUnitId.value;
-    return unitId ? getLegalActionDestinationIds(getGame(), unitId, terrains, units) : [];
+    return unitId ? getLegalActionDestinationIds(getGame(), unitId, terrains(), units) : [];
   });
 
   const counterattackCellIds = computed<readonly CellId[]>(() => legalActionCellIds.value.filter((cellId) => {
     const targetId = getGame().cells[cellId]?.unitId;
-    return Boolean(targetId && canCounterattack(getGame(), targetId, terrains, units));
+    return Boolean(targetId && canCounterattack(getGame(), targetId, terrains(), units));
   }));
 
   const noCounterattackCellIds = computed<readonly CellId[]>(() => legalActionCellIds.value.filter((cellId) => {
     const targetId = getGame().cells[cellId]?.unitId;
-    return Boolean(targetId && !canCounterattack(getGame(), targetId, terrains, units));
+    return Boolean(targetId && !canCounterattack(getGame(), targetId, terrains(), units));
   }));
 
   function clear(): void {
@@ -53,7 +64,7 @@ export function useBoardInteraction(
   function select(unitId: UnitId, userInitiated = true): boolean {
     const game = getGame();
     const unit = game.units[unitId];
-    if (!unit || getLegalActionDestinationIds(game, unitId, terrains, units).length === 0) {
+    if (!unit || getLegalActionDestinationIds(game, unitId, terrains(), units).length === 0) {
       clear();
       return false;
     }

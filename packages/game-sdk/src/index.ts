@@ -2,6 +2,8 @@ import type { GameCommand, GameState, MatchConditionModule, PlayerId } from "@nu
 import type { SpatialPatternDefinition } from "@numeral-lord/game-core";
 import type { ModRuleDefinition } from "@numeral-lord/game-core";
 
+export { hashModContent } from "./content-hash.js";
+
 export type CapabilityTarget = "terrain" | "unit" | "match";
 
 export interface CapabilityDefinition<Config = unknown> {
@@ -31,7 +33,6 @@ interface ModSettingBase {
   readonly description?: string;
   /** The public capability field this option configures at runtime. */
   readonly target: {
-    readonly terrainId: string;
     readonly capabilityId: string;
     readonly configKey: string;
   };
@@ -52,6 +53,58 @@ export interface TerrainDefinition {
   readonly displayName: string;
   /** 此地形从公共能力池中选中的能力；空数组表示没有游戏能力。 */
   readonly capabilities: readonly CapabilityBinding[];
+  /** Optional data-only art; it cannot affect simulation rules. */
+  readonly visuals?: TerrainVisualDefinition;
+}
+
+/** A small, immutable image asset embedded in a versioned terrain Mod release. */
+export interface TerrainVisualAsset {
+  readonly id: string;
+  /** Validated PNG, WebP, or SVG data URL; assets are part of the release content hash. */
+  readonly dataUrl: string;
+}
+
+/** Load a packaged SVG file into the data URL used by the shared Mod definition. */
+export async function loadTerrainSvgAsset(url: URL): Promise<string> {
+  let bytes: Uint8Array;
+  if (url.protocol === "file:") {
+    const nodeProcess = (globalThis as typeof globalThis & {
+      process?: { getBuiltinModule?: (specifier: string) => unknown };
+    }).process;
+    const fileSystem = nodeProcess?.getBuiltinModule?.("node:fs/promises") as {
+      readFile(path: URL): Promise<Uint8Array>;
+    } | undefined;
+    if (!fileSystem) throw new Error("Cannot load a packaged SVG file in this runtime.");
+    bytes = await fileSystem.readFile(url);
+  } else {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Unable to load packaged SVG asset: ${response.status}`);
+    bytes = new Uint8Array(await response.arrayBuffer());
+  }
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return `data:image/svg+xml;base64,${btoa(binary)}`;
+}
+
+export interface TerrainVisualLayer {
+  readonly assetId: string;
+  readonly scale: number;
+  readonly opacity: number;
+  /** Normalized offsets relative to the tile radius. */
+  readonly offsetX: number;
+  readonly offsetY: number;
+  /** Only show this overlay while a unit occupies the terrain cell. */
+  readonly whenOccupied?: boolean;
+}
+
+export interface TerrainVisualDefinition {
+  readonly baseColor?: string;
+  readonly baseAssetId?: string;
+  /** Opacity of the base color or image, from fully transparent to opaque. */
+  readonly baseOpacity?: number;
+  /** Leave the base layer transparent; the optional top layer may still be drawn. */
+  readonly baseTransparent?: boolean;
+  readonly overlay?: TerrainVisualLayer;
 }
 
 export interface UnitDefinition {
@@ -100,12 +153,65 @@ export interface ModDefinition {
   readonly spatialPatterns?: readonly SpatialPatternDefinition[];
   /** Serializable event rules interpreted by game-core. */
   readonly rules?: readonly ModRuleDefinition[];
-  readonly terrains: readonly TerrainDefinition[];
+  /** Immutable, validated raster assets referenced by terrain visual definitions. */
+  readonly visualAssets?: readonly TerrainVisualAsset[];
+  /** A terrain Mod has one terrain; unit and rules Mods may omit it. */
+  readonly terrain?: TerrainDefinition;
   readonly units: readonly UnitDefinition[];
   readonly commandRules: readonly CommandRule[];
   readonly victoryConditions: readonly VictoryCondition[];
 }
 
+/** Authoring shape for an ordinary Mod, which owns at most one terrain. */
+export interface TerrainModAuthoringDefinition extends Omit<ModDefinition, "terrain" | "settings"> {
+  readonly name: string;
+  readonly settings?: readonly ModSettingDefinition[];
+  readonly terrain: Omit<TerrainDefinition, "id" | "displayName">;
+}
+
+export interface TerrainModRuntimeDefinition extends ModDefinition {
+  readonly terrain: TerrainDefinition;
+}
+
+/** Canonical simulation/art fields shared by map locks, workshop releases, and clients. */
+export type ModContentIdentitySource = Pick<ModDefinition,
+  "id" | "version" | "capabilities" | "settings" | "spatialPatterns" | "rules" | "visualAssets" | "terrain">;
+
+export function modContentIdentity(mod: ModContentIdentitySource): unknown {
+  const terrain = mod.terrain;
+  const terrainContent = terrain ? {
+    capabilities: terrain.capabilities,
+    ...(terrain.visuals ? { visuals: terrain.visuals } : {})
+  } : undefined;
+  return {
+    id: mod.id,
+    version: mod.version,
+    capabilities: mod.capabilities,
+    ...(mod.settings ? { settings: mod.settings } : {}),
+    ...(mod.spatialPatterns ? { spatialPatterns: mod.spatialPatterns } : {}),
+    ...(mod.rules ? { rules: mod.rules } : {}),
+    ...(mod.visualAssets ? { visualAssets: mod.visualAssets } : {}),
+    ...(terrainContent ? { terrain: terrainContent } : {})
+  };
+}
+
 export function defineMod(definition: ModDefinition): ModDefinition {
   return definition;
+}
+
+/**
+ * Build a one-terrain Mod from its single source of truth. Runtime terrain IDs
+ * are derived from the Mod ID, and the terrain display name follows the Mod name.
+ */
+export function defineTerrainMod(definition: TerrainModAuthoringDefinition): TerrainModRuntimeDefinition {
+  const match = /^mod-([a-z0-9]+(?:-[a-z0-9]+)*)$/.exec(definition.id);
+  if (!match) throw new Error("Terrain Mod ID must use the mod-name format.");
+  if (!definition.name.trim()) throw new Error("Terrain Mod name is required.");
+  const { name, terrain, settings, ...mod } = definition;
+  const terrainId = `mod/${match[1]}`;
+  return {
+    ...mod,
+    ...(settings ? { settings } : {}),
+    terrain: { ...terrain, id: terrainId, displayName: name }
+  };
 }

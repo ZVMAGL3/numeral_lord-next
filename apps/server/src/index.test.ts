@@ -3,13 +3,36 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LobbyRoomState, MatchStartPayload } from "@numeral-lord/game-core/node";
 import { DEFAULT_MAP_CODE, DEFAULT_MAP_DEFINITION, coreTerrainCatalog, createMatchFromMapCode, serializeMapCode } from "@numeral-lord/core-content";
 import { oilFieldMod, oilFieldTerrainCatalog } from "@numeral-lord/oil-field-mod";
-import { MAX_CLIENT_MESSAGE_BYTES, PvpRelayRoom, createGameServer } from "./index.js";
+import { hashModContent, modContentIdentity } from "@numeral-lord/game-sdk";
+import { MAX_CLIENT_MESSAGE_BYTES, PvpRelayRoom, createGameServer, startServer } from "./index.js";
 
 const installedMapCatalogs = {
   terrains: { ...coreTerrainCatalog, ...oilFieldTerrainCatalog },
-  terrainModIds: Object.fromEntries(oilFieldMod.terrains.map((terrain) => [terrain.id, oilFieldMod.id])),
+  terrainModIds: { [oilFieldMod.terrain.id]: oilFieldMod.id },
   mods: { [oilFieldMod.id]: oilFieldMod }
 };
+
+describe("服务启动顺序", () => {
+  it("先准备工坊存储，再开始接收客户端连接", async () => {
+    const events: string[] = [];
+    await startServer(0, "127.0.0.1", {
+      createGameServer: () => ({ listen: async () => { events.push("listen"); } }),
+      isWorkshopEnabled: () => true,
+      initializeWorkshopStore: async () => { events.push("workshop-ready"); }
+    });
+    expect(events).toEqual(["workshop-ready", "listen"]);
+  });
+
+  it("工坊准备失败时不接流量，让服务启动失败而不是让首次访问报离线", async () => {
+    const listen = vi.fn(async () => undefined);
+    await expect(startServer(0, "127.0.0.1", {
+      createGameServer: () => ({ listen }),
+      isWorkshopEnabled: () => true,
+      initializeWorkshopStore: async () => { throw new Error("数据库初始化失败"); }
+    })).rejects.toThrow("数据库初始化失败");
+    expect(listen).not.toHaveBeenCalled();
+  });
+});
 
 interface SentMessage {
   readonly type: string | number;
@@ -35,6 +58,7 @@ class TestPvpRelayRoom extends PvpRelayRoom {
   readonly broadcasts: BroadcastMessage[] = [];
   readonly handlers = new Map<string | number, MessageHandler>();
   metadataSnapshot: unknown;
+  privateSnapshot = false;
 
   override onMessage<T = unknown>(
     type: string | number | "*",
@@ -62,6 +86,10 @@ class TestPvpRelayRoom extends PvpRelayRoom {
 
   override async setMetadata(metadata: unknown): Promise<void> {
     this.metadataSnapshot = metadata;
+  }
+
+  override async setPrivate(isPrivate = true): Promise<void> {
+    this.privateSnapshot = isPrivate;
   }
 
   receive(type: string, client: FakeClient, payload: Record<string, unknown> = {}): void {
@@ -104,6 +132,12 @@ function mapCodeForSeats(seats: number): string {
   }, installedMapCatalogs);
 }
 
+function installedContentHash(modId: string): string {
+  const mod = installedMapCatalogs.mods[modId as keyof typeof installedMapCatalogs.mods];
+  if (!mod) throw new Error(`Missing test Mod ${modId}`);
+  return hashModContent(modContentIdentity(mod));
+}
+
 function join(
   room: TestPvpRelayRoom,
   sessionId: string,
@@ -113,7 +147,17 @@ function join(
 ): FakeClient {
   const client = fakeClient(sessionId);
   room.clients.push(client);
-  room.onJoin(client, { accountId, name, installedModIds });
+  room.onJoin(client, {
+    accountId,
+    name,
+    installedModIds,
+    installedModVersions: Object.fromEntries(installedModIds.map((id) => [id, oilFieldMod.version])),
+    installedModContentHashes: Object.fromEntries(installedModIds.flatMap((id) => {
+      const mod = installedMapCatalogs.mods[id as keyof typeof installedMapCatalogs.mods];
+      if (!mod) return [];
+      return [[id, hashModContent(modContentIdentity(mod))] as const];
+    }))
+  });
   return client;
 }
 
@@ -171,6 +215,57 @@ describe("PvpRelayRoom lobby contract", () => {
       ["bob", null, false],
       ["dan", null, false]
     ]);
+  });
+
+  it("publishes public room metadata for the live battle lobby", () => {
+    const room = createRoom(3);
+    expect(room.metadataSnapshot).toMatchObject({
+      visibility: "public",
+      phase: "lobby",
+      mapName: "测试地图 3 人",
+      mapPlayerCount: 3,
+      playerCount: 0,
+      openSeats: 3
+    });
+
+    join(room, "alice", "Alice");
+    expect(room.metadataSnapshot).toMatchObject({
+      visibility: "public",
+      phase: "lobby",
+      playerCount: 1,
+      openSeats: 2,
+      hostName: "Alice"
+    });
+    join(room, "bob", "Bob");
+    expect(room.metadataSnapshot).toMatchObject({ playerCount: 2, openSeats: 1 });
+  });
+
+  it("hides an empty match from public listings and republishes it when a player reclaims a seat", async () => {
+    const room = createRoom(2);
+    const host = join(room, "host", "房主", "stable-host");
+    const peer = join(room, "peer", "棋手", "stable-peer");
+    room.receive("lobby-ready", host, { ready: true });
+    room.receive("lobby-ready", peer, { ready: true });
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").phase).toBe("playing");
+
+    dropSocket(room, host);
+    await room.onLeave(host, 1000);
+    expect(room.metadataSnapshot).toMatchObject({ visibility: "public" });
+
+    dropSocket(room, peer);
+    await room.onLeave(peer, 1000);
+    expect(room.metadataSnapshot).toMatchObject({ visibility: "private", phase: "playing" });
+    expect(room.privateSnapshot).toBe(true);
+
+    const resumedHost = join(room, "host-return", "房主", "stable-host");
+    expect(room.metadataSnapshot).toMatchObject({ visibility: "public", phase: "playing" });
+    expect(room.privateSnapshot).toBe(false);
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").members.find(
+      (member) => member.accountId === "stable-host"
+    )).toMatchObject({ sessionId: "host-return", seat: 1, participating: true });
+    room.receive("room-sync", resumedHost);
+    expect(lastSent<Record<string, unknown>>(resumedHost, "room-role"))
+      .toMatchObject({ seat: 1, participating: true, playerId: "player-1" });
   });
 
   it("replaces and disconnects the old tab when a browser identity joins the same room again", () => {
@@ -323,12 +418,23 @@ describe("PvpRelayRoom lobby contract", () => {
 
     room.receive("player-intent", peer, {
       parentCommandId: null,
-      command: { type: "end-action-phase", commandId: "local-command", actorId: "spoofed", expectedSequence: 0 }
+      ignoredClientField: "drop-me",
+      command: { type: "end-action-phase", commandId: "local-command", actorId: "spoofed", expectedSequence: 0, ignored: true }
     });
-    expect(lastBroadcast<{ command: { actorId: string }; parentCommandId: null }>(room, "player-intent"))
-      .toMatchObject({ command: { actorId: "player-2" }, parentCommandId: null });
+    const relayed = lastBroadcast<Record<string, unknown>>(room, "player-intent");
+    expect(relayed).toEqual({
+      parentCommandId: null,
+      playerId: "player-2",
+      command: { type: "end-action-phase", commandId: "local-command", actorId: "player-2", expectedSequence: 0 }
+    });
+    expect(relayed).not.toHaveProperty("ignoredClientField");
     expect(host.sent.some((message) => message.type === "player-intent")).toBe(true);
     expect(peer.sent.some((message) => message.type === "player-intent")).toBe(false);
+
+    room.receive("player-intent", peer, {
+      command: { type: "end-action-phase", commandId: "x".repeat(129), actorId: "spoofed", expectedSequence: 0 }
+    });
+    expect(lastSent<{ reason: string }>(peer, "intent-rejected").reason).toBe("invalid-command-payload");
 
     room.receive("command-conflict", peer, { sequence: 4, commandHeadId: "different-history" });
     expect(lastSent<{ sessionId: string; sequence: number }>(host, "command-conflict"))
@@ -572,10 +678,146 @@ describe("PvpRelayRoom lobby contract", () => {
     expect(lastBroadcast<LobbyRoomState>(room, "room-state").members[0]?.ready).toBe(false);
     expect(room.broadcasts.some((message) => message.type === "match-start")).toBe(false);
 
-    room.receive("lobby-installed-mods", host, { installedModIds: [oilFieldMod.id] });
+    room.receive("lobby-installed-mods", host, {
+      installedModIds: [oilFieldMod.id],
+      installedModVersions: { [oilFieldMod.id]: oilFieldMod.version },
+      installedModContentHashes: { [oilFieldMod.id]: installedContentHash(oilFieldMod.id) }
+    });
     expect(lastBroadcast<LobbyRoomState>(room, "room-state").members[0]?.missingModIds).toEqual([]);
     room.receive("lobby-ready", host, { ready: true });
     expect(lastBroadcast<LobbyRoomState>(room, "room-state").phase).toBe("playing");
+  });
+
+  it("blocks readiness and match start while participating clients have different required Mod versions", () => {
+    const sharedHash = `sha256:${"5".repeat(64)}`;
+    const room = createRoom(2);
+    const host = fakeClient("host");
+    room.clients.push(host);
+    room.onJoin(host, {
+      accountId: "account-host", name: "房主", installedModIds: [oilFieldMod.id],
+      installedModVersions: { [oilFieldMod.id]: "0.1.0" },
+      installedModContentHashes: { [oilFieldMod.id]: sharedHash }
+    });
+    const peer = fakeClient("peer");
+    room.clients.push(peer);
+    room.onJoin(peer, {
+      accountId: "account-peer", name: "对手", installedModIds: [oilFieldMod.id],
+      installedModVersions: { [oilFieldMod.id]: "0.2.0" },
+      installedModContentHashes: { [oilFieldMod.id]: sharedHash }
+    });
+
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").modVersionMismatchIds).toEqual([oilFieldMod.id]);
+    room.receive("lobby-ready", host, { ready: true });
+    expect(lastSent<{ message: string }>(host, "lobby-error").message).toContain("版本或内容不一致");
+    room.receive("lobby-ready", peer, { ready: true });
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").phase).toBe("lobby");
+
+    room.receive("lobby-installed-mods", host, {
+      installedModIds: [oilFieldMod.id],
+      installedModVersions: { [oilFieldMod.id]: "0.2.0" },
+      installedModContentHashes: { [oilFieldMod.id]: sharedHash }
+    });
+    const updated = lastBroadcast<LobbyRoomState>(room, "room-state");
+    expect(updated.modVersionMismatchIds).toEqual([]);
+    expect(updated.members.every((member) => !member.ready)).toBe(true);
+    room.receive("lobby-ready", host, { ready: true });
+    room.receive("lobby-ready", peer, { ready: true });
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").phase).toBe("playing");
+  });
+
+  it("blocks same-version clients when a required Mod content fingerprint is missing", () => {
+    const room = createRoom(2);
+    const host = fakeClient("host");
+    room.clients.push(host);
+    room.onJoin(host, {
+      accountId: "account-host", name: "缺少指纹的客户端", installedModIds: [oilFieldMod.id],
+      installedModVersions: { [oilFieldMod.id]: oilFieldMod.version }
+    });
+    const peer = join(room, "peer");
+
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").modVersionMismatchIds).toEqual([oilFieldMod.id]);
+    room.receive("lobby-ready", host, { ready: true });
+    expect(lastSent<{ message: string }>(host, "lobby-error").message).toContain("版本或内容不一致");
+    room.receive("lobby-ready", peer, { ready: true });
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").phase).toBe("lobby");
+  });
+
+  it("blocks readiness when a participant's content differs from the host-selected release", () => {
+    const mapCode = serializeMapCode(DEFAULT_MAP_DEFINITION, installedMapCatalogs);
+    const contentHash = hashModContent(modContentIdentity(oilFieldMod));
+    const room = new TestPvpRelayRoom();
+    room.onCreate({ mapCode });
+    const host = fakeClient("host");
+    room.clients.push(host);
+    room.onJoin(host, {
+      accountId: "account-host", name: "房主", installedModIds: [oilFieldMod.id],
+      installedModVersions: { [oilFieldMod.id]: oilFieldMod.version },
+      installedModContentHashes: { [oilFieldMod.id]: contentHash }
+    });
+    const peer = fakeClient("peer");
+    room.clients.push(peer);
+    room.onJoin(peer, {
+      accountId: "account-peer", name: "对手", installedModIds: [oilFieldMod.id],
+      installedModVersions: { [oilFieldMod.id]: oilFieldMod.version },
+      installedModContentHashes: {
+        [oilFieldMod.id]: `sha256:${contentHash[7] === "0" ? "1" : "0"}${contentHash.slice(8)}`
+      }
+    });
+
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").modVersionMismatchIds).toEqual([oilFieldMod.id]);
+    room.receive("lobby-ready", host, { ready: true });
+    expect(lastSent<{ message: string }>(host, "lobby-error").message).toContain("版本或内容不一致");
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").phase).toBe("lobby");
+  });
+
+  it("ignores legacy map version locks and uses the host's active release for every participant", () => {
+    const hostHash = `sha256:${"1".repeat(64)}`;
+    const oldMapCode = JSON.stringify({
+      ...DEFAULT_MAP_DEFINITION,
+      requiredTerrainModLocks: [{ id: oilFieldMod.id, version: "0.0.1", contentHash: `sha256:${"0".repeat(64)}` }]
+    });
+    const room = new TestPvpRelayRoom();
+    room.onCreate({ mapCode: oldMapCode });
+    const host = fakeClient("host");
+    room.clients.push(host);
+    room.onJoin(host, {
+      accountId: "account-host", name: "房主", installedModIds: [oilFieldMod.id],
+      installedModVersions: { [oilFieldMod.id]: "0.2.0" },
+      installedModContentHashes: { [oilFieldMod.id]: hostHash }
+    });
+    const peer = fakeClient("peer");
+    room.clients.push(peer);
+    room.onJoin(peer, {
+      accountId: "account-peer", name: "对手", installedModIds: [oilFieldMod.id],
+      installedModVersions: { [oilFieldMod.id]: "0.1.0" },
+      installedModContentHashes: { [oilFieldMod.id]: `sha256:${"2".repeat(64)}` }
+    });
+
+    let state = lastBroadcast<LobbyRoomState>(room, "room-state");
+    expect(state.mapCode).not.toContain("requiredTerrainModLocks");
+    expect(state.effectiveTerrainModReleases).toEqual([{ id: oilFieldMod.id, version: "0.2.0", contentHash: hostHash }]);
+    expect(state.modVersionMismatchIds).toEqual([oilFieldMod.id]);
+
+    room.receive("lobby-installed-mods", peer, {
+      installedModIds: [oilFieldMod.id],
+      installedModVersions: { [oilFieldMod.id]: "0.2.0" },
+      installedModContentHashes: { [oilFieldMod.id]: hostHash }
+    });
+    state = lastBroadcast<LobbyRoomState>(room, "room-state");
+    expect(state.modVersionMismatchIds).toEqual([]);
+    expect(state.mapCode).not.toContain("requiredTerrainModLocks");
+  });
+
+  it("treats a client that reports an installed required Mod without a version as incompatible", () => {
+    const room = createRoom(2);
+    const host = fakeClient("host");
+    room.clients.push(host);
+    room.onJoin(host, { accountId: "account-host", name: "旧客户端", installedModIds: [oilFieldMod.id] });
+    const peer = join(room, "peer");
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").modVersionMismatchIds).toEqual([oilFieldMod.id]);
+    room.receive("lobby-ready", host, { ready: true });
+    room.receive("lobby-ready", peer, { ready: true });
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").phase).toBe("lobby");
   });
 
   it("accepts only host Mod overrides declared by the map and preserves them across rematch", () => {
@@ -754,6 +996,9 @@ describe("PvpRelayRoom lobby contract", () => {
 
     dropSocket(room, host);
     await room.onLeave(host, 1000);
+
+    expect(lastBroadcast<LobbyRoomState>(room, "room-state").members.find((member) => member.sessionId === "host"))
+      .toMatchObject({ connected: false, seat: 1 });
 
     const handoffIndex = peer.sent.findIndex((message) => message.type === "host-snapshot"
       && (message.payload as { handoff?: boolean }).handoff === true);

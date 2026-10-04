@@ -9,7 +9,7 @@ import {
   remainingMatchSeconds,
   remainingTurnSeconds,
   startMatchClocks
-} from "../../web/src/match-clock.js";
+} from "../../web/src/rooms/match-clock.js";
 
 const settings: LobbySettings = {
   friendlyFire: false,
@@ -19,7 +19,7 @@ const settings: LobbySettings = {
 };
 const initial = createMatchFromMapCode(DEFAULT_MAP_CODE, {
   terrains: { ...coreTerrainCatalog, ...oilFieldTerrainCatalog },
-  terrainModIds: Object.fromEntries(oilFieldMod.terrains.map((terrain) => [terrain.id, oilFieldMod.id]))
+  terrainModIds: { [oilFieldMod.terrain.id]: oilFieldMod.id }
 });
 
 function turn(state: GameState, phase: GameState["turn"]["phase"], playerId = state.turn.currentPlayerId, round = state.turn.round): GameState {

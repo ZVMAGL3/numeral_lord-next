@@ -1,10 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { coreMatchConditionCatalog } from "../../core-content/src/match-conditions.js";
 import { createMatchFromMapCode, DEFAULT_MAP_CODE } from "../../core-content/src/map-code.js";
-import { coreTerrainCatalog } from "../../core-content/src/terrains.js";
+import { coreTerrainCatalog, coreTerrainMod } from "../../core-content/src/terrains.js";
+import { desertTerrainCatalog, DESERT_TERRAIN_ID } from "../../desert-terrain-mod/src/index.js";
 import { oilFieldMod, oilFieldTerrainCatalog } from "../../oil-field-mod/src/index.js";
-import { applyCommand, canCounterattack, finishMatch, getActionableUnitIds, getLegalActionDestinationIds, getPoweredUnitIds, startMatch } from "./engine.js";
+import { applyCommand, calculateReinforcementIncome, canCounterattack, finishMatch, getActionableUnitIds, getLegalActionDestinationIds, getPotentiallyActionableUnitIds, getPoweredUnitIds, getReinforceableUnitIds, startMatch } from "./engine.js";
 import { applyIntent, getLegalIntents } from "./simulation.js";
+import { applyModRules } from "./mod-rules.js";
+import * as spatialPatterns from "./spatial-pattern.js";
+import type { ModRuleDefinition } from "./mod-rules.js";
+import type { SpatialPatternDefinition } from "./spatial-pattern.js";
 import type { TerrainCatalog, UnitCatalog } from "./content.js";
 import { toCellId } from "./hex.js";
 import type {
@@ -24,8 +29,10 @@ const id = (value: string) => value as UnitId;
 
 const terrains: TerrainCatalog = {
   mountain: { id: "mountain", displayName: "山地", capabilities: [] },
+  isolated: { id: "isolated", displayName: "孤立地", capabilities: [{ id: "core/occupiable" }] },
   plain: { id: "plain", displayName: "平原", capabilities: [
     { id: "core/occupiable" }, { id: "core/power-conductor" },
+    { id: "core/income-source", config: { amount: 1, requires: "powered-occupant", when: "owner-turn-start" } },
     { id: "core/exhaust-unpowered-after-capture" }
   ] },
   ocean: {
@@ -33,7 +40,7 @@ const terrains: TerrainCatalog = {
     displayName: "海洋",
     capabilities: [
       { id: "core/occupiable" },
-      { id: "core/exhaust-on-departure", config: { destinationTerrainIdNot: "ocean" } },
+      { id: "core/exhaust-on-departure", config: { triggerMode: "terrain-transition" } },
       { id: "core/exhaust-unpowered-after-capture" }
     ]
   },
@@ -44,6 +51,7 @@ const terrains: TerrainCatalog = {
       { id: "core/occupiable" },
       { id: "core/power-conductor" },
       { id: "core/power-source" },
+      { id: "core/income-source", config: { amount: 1, requires: "powered-occupant", when: "owner-turn-start" } },
       { id: "core/survival-anchor" },
       { id: "core/adjacent-hostile-exhaustion" },
       { id: "core/exhaust-unpowered-after-capture" }
@@ -75,7 +83,6 @@ const unitCatalog: UnitCatalog = {
       { id: "core/counterattack-limit", config: { maxPerActionPhase: 1 } },
       { id: "core/action-strength-decay", config: { amount: 1, minimumStrength: 1 } },
       { id: "core/powered-action-threshold", config: { minimumStrength: 2 } },
-      { id: "core/powered-income", config: { amount: 1 } },
       { id: "core/exhaust-after-attack" }
     ]
   }
@@ -119,6 +126,19 @@ function fixture(): GameState {
   };
 }
 
+function withCoreTerrainRules(state: GameState): GameState {
+  return {
+    ...state,
+    settings: {
+      ...state.settings,
+      modRuleSet: {
+        patterns: coreTerrainMod.spatialPatterns ?? [],
+        rules: coreTerrainMod.rules ?? []
+      }
+    }
+  };
+}
+
 describe("core turn rules", () => {
   const siegeCatalog: UnitCatalog = {
     ...unitCatalog,
@@ -135,6 +155,88 @@ describe("core turn rules", () => {
       [id("p2-home")]: { ...state.units[id("p2-home")]!, definitionId: "cannon" }
     } };
   }
+
+  it("supports area exhaustion only when a unit crosses the selected zone boundary", () => {
+    const sourceCapabilityId = "mod/test/zone-source";
+    const zonePatternId = "mod-test/outer-two-rings";
+    const pattern = {
+      id: zonePatternId,
+      starts: { op: "all", items: [
+        { op: "terrain-has", capabilityId: sourceCapabilityId },
+        { op: "unit-team-is", team: "other" }
+      ] },
+      expression: {
+        op: "hex-range", min: 1, max: 2,
+        where: { op: "cell-exists" }
+      },
+      result: { entity: "cell" },
+      excludeStarts: true
+    } satisfies SpatialPatternDefinition;
+    const rules: readonly ModRuleDefinition[] = [
+      {
+        id: "mod-test/exhaust-enter-zone", trigger: "unit-enter", target: { scope: "trigger-unit" },
+        conditions: [{ op: "crosses-pattern-boundary", patternId: zonePatternId, direction: "enter" }],
+        effects: [{ type: "exhaust-unit" }]
+      },
+      {
+        id: "mod-test/exhaust-leave-zone", trigger: "unit-leave", target: { scope: "trigger-unit" },
+        conditions: [{ op: "crosses-pattern-boundary", patternId: zonePatternId, direction: "leave" }],
+        effects: [{ type: "exhaust-unit" }]
+      }
+    ];
+    const zoneTerrains: TerrainCatalog = {
+      ...terrains,
+      stronghold: {
+        ...terrains.stronghold!,
+        capabilities: [...terrains.stronghold!.capabilities, { id: sourceCapabilityId }]
+      }
+    };
+    const makeMove = (fromColumn: number, toColumn: number) => {
+      const base = fixture();
+      const oldScoutCellId = toCellId({ column: 1, row: 1 });
+      const oldEnemyHomeCellId = toCellId({ column: 3, row: 1 });
+      const zoneSourceCellId = toCellId({ column: 4, row: 1 });
+      const sourceCellId = toCellId({ column: fromColumn, row: 1 });
+      const destinationCellId = toCellId({ column: toColumn, row: 1 });
+      const emptyOldScoutCell = { ...base.cells[oldScoutCellId]! };
+      delete (emptyOldScoutCell as { unitId?: UnitId }).unitId;
+      const emptyDestinationCell = { ...base.cells[destinationCellId]!, terrainId: "plain" };
+      delete (emptyDestinationCell as { unitId?: UnitId }).unitId;
+      const emptyOldHomeCell = { ...base.cells[oldEnemyHomeCellId]!, terrainId: "plain" };
+      delete (emptyOldHomeCell as { unitId?: UnitId }).unitId;
+      const state: GameState = {
+        ...base,
+        settings: { ...base.settings, modRuleSet: { patterns: [pattern], rules } },
+        cells: {
+          ...base.cells,
+          [oldScoutCellId]: emptyOldScoutCell,
+          [oldEnemyHomeCellId]: emptyOldHomeCell,
+          [zoneSourceCellId]: { ...base.cells[zoneSourceCellId]!, terrainId: "stronghold", unitId: id("p2-home") },
+          [sourceCellId]: { ...base.cells[sourceCellId]!, terrainId: "plain", unitId: id("p1-scout") },
+          [destinationCellId]: emptyDestinationCell
+        },
+        units: {
+          ...base.units,
+          [id("p1-scout")]: { ...base.units[id("p1-scout")]!, cellId: sourceCellId, strength: 3 },
+          [id("p2-home")]: { ...base.units[id("p2-home")]!, cellId: zoneSourceCellId }
+        }
+      };
+      const result = applyCommand(state, {
+        type: "move-unit", commandId: `zone-${fromColumn}-${toColumn}`, actorId: p1,
+        expectedSequence: 0, unitId: id("p1-scout"), destinationId: destinationCellId
+      }, zoneTerrains, unitCatalog);
+      return { result, arrivedUnitId: result.accepted ? result.state.cells[destinationCellId]?.unitId : undefined };
+    };
+
+    const entering = makeMove(1, 2);
+    const movingWithin = makeMove(3, 2);
+    const leaving = makeMove(2, 1);
+    for (const { result } of [entering, movingWithin, leaving]) expect(result.accepted).toBe(true);
+    if (!entering.result.accepted || !movingWithin.result.accepted || !leaving.result.accepted) return;
+    expect(entering.result.state.turn.exhaustedUnitIds).toContain(entering.arrivedUnitId);
+    expect(movingWithin.result.state.turn.exhaustedUnitIds).not.toContain(movingWithin.arrivedUnitId);
+    expect(leaving.result.state.turn.exhaustedUnitIds).toContain(leaving.arrivedUnitId);
+  });
   const siegeCommand = {
     type: "attack-unit" as const, commandId: "siege", actorId: p2, expectedSequence: 0,
     unitId: id("p2-home"), targetId: toCellId({ column: 0, row: 1 })
@@ -168,6 +270,202 @@ describe("core turn rules", () => {
     const movedId = result.state.cells[destinationId]?.unitId;
     expect(movedId).toBeDefined();
     expect(result.state.units[movedId!]?.markers).toEqual(["mod-test/arrived"]);
+  });
+
+  it("lets Mod rules read validated map or room settings for conditions and effect amounts", () => {
+    const destinationId = toCellId({ column: 2, row: 1 });
+    const resourceTerrainId = "mod/test/resource";
+    const terrainCatalog: TerrainCatalog = {
+      ...terrains,
+      [resourceTerrainId]: { id: resourceTerrainId, displayName: "测试资源地", capabilities: [
+        { id: "core/occupiable" }, { id: "mod/test/resource" }
+      ] }
+    };
+    const state: GameState = {
+      ...fixture(),
+      cells: { ...fixture().cells, [destinationId]: { ...fixture().cells[destinationId]!, terrainId: resourceTerrainId } },
+      settings: {
+        friendlyFire: false,
+        modSettings: { "mod-test": { bonusPoints: 4, enabled: true } },
+        modRuleSet: { patterns: [], rules: [{
+          id: "mod-test/configured-resource-reward",
+          trigger: "unit-enter",
+          target: { scope: "trigger-unit" },
+          conditions: [
+            { op: "at-cell-matches", predicate: { op: "terrain-has", capabilityId: resourceTerrainId } },
+            { op: "mod-setting-equals", settingId: "enabled", value: true }
+          ],
+          effects: [
+            { type: "grant-points-from-setting", settingId: "bonusPoints" },
+            { type: "change-strength-from-setting", settingId: "bonusPoints" }
+          ]
+        }] }
+      }
+    };
+    const result = applyCommand(state, {
+      type: "move-unit", commandId: "mod-configured-reward", actorId: p1, expectedSequence: 0,
+      unitId: id("p1-scout"), destinationId
+    }, terrainCatalog, unitCatalog);
+
+    expect(result.accepted).toBe(true);
+    if (!result.accepted) return;
+    const movedId = result.state.cells[destinationId]?.unitId;
+    expect(movedId).toBeDefined();
+    expect(result.state.players[p1]?.reinforcementPoints).toBe(4);
+    expect(result.state.units[movedId!]?.strength).toBe(5);
+  });
+
+  it("keeps cached spatial selections isolated by terrain-catalog identity", () => {
+    const pattern = {
+      id: "mod-test/catalog-scoped-query",
+      result: { entity: "unit" as const, distinctBy: "id" as const },
+      starts: { op: "terrain-has" as const, capabilityId: "mod/test/query-start" },
+      expression: { op: "repeat" as const, min: 0, max: 0, item: {
+        op: "step" as const,
+        relation: "hex-neighbor" as const,
+        where: { op: "terrain-has" as const, capabilityId: "mod/test/query-start" }
+      } }
+    };
+    const state: GameState = {
+      ...fixture(),
+      settings: {
+        friendlyFire: false,
+        modRuleSet: {
+          patterns: [pattern],
+          rules: [{
+            id: "mod-test/catalog-scoped-effect",
+            trigger: "turn-start",
+            target: { scope: "pattern-units", patternId: pattern.id },
+            effects: [{ type: "change-strength", amount: 1 }]
+          }]
+        }
+      }
+    };
+    const matchingCatalog: TerrainCatalog = {
+      ...terrains,
+      plain: { ...terrains.plain!, capabilities: [...terrains.plain!.capabilities, { id: "mod/test/query-start" }] }
+    };
+    const nonMatchingCatalog: TerrainCatalog = {
+      ...terrains,
+      plain: { ...terrains.plain!, capabilities: terrains.plain!.capabilities.filter((item) => item.id !== "mod/test/query-start") }
+    };
+
+    const matching = applyModRules(state, state, undefined, matchingCatalog, true);
+    const nonMatching = applyModRules(state, state, undefined, nonMatchingCatalog, true);
+    expect(matching.units[id("p1-scout")]?.strength).toBe(3);
+    expect(nonMatching.units[id("p1-scout")]?.strength).toBe(2);
+  });
+
+  it("resolves a rule's spatial target once across effects that cannot alter selection", () => {
+    const pattern: SpatialPatternDefinition = {
+      id: "mod-test/stable-targets",
+      starts: { op: "unit-owner-is", owner: "actor" },
+      expression: { op: "repeat", min: 0, max: 0, item: {
+        op: "step", relation: "hex-neighbor", where: { op: "cell-exists" }
+      } },
+      result: { entity: "unit", distinctBy: "id" }
+    };
+    const state: GameState = {
+      ...fixture(),
+      settings: {
+        friendlyFire: false,
+        modRuleSet: {
+          patterns: [pattern],
+          rules: [{
+            id: "mod-test/reuse-targets",
+            trigger: "turn-start",
+            target: { scope: "pattern-units", patternId: pattern.id, owner: "actor" },
+            effects: [
+              { type: "grant-points", amount: 1 },
+              { type: "grant-points", amount: 2 },
+              { type: "exhaust-unit" }
+            ]
+          }]
+        }
+      }
+    };
+    const selectSpy = vi.spyOn(spatialPatterns, "selectSpatialPatternUnits");
+    try {
+      const result = applyModRules(state, state, undefined, terrains, true);
+      expect(selectSpy).toHaveBeenCalledTimes(1);
+      expect(result.players[p1]?.reinforcementPoints).toBe(6);
+      expect(result.turn.exhaustedUnitIds).toEqual([id("p1-home"), id("p1-scout")]);
+    } finally {
+      selectSpy.mockRestore();
+    }
+  });
+
+  it("reselects a pattern target after a marker effect changes its membership", () => {
+    const marker = "mod-test/promoted";
+    const pattern: SpatialPatternDefinition = {
+      id: "mod-test/unpromoted-targets",
+      starts: {
+        op: "all",
+        items: [
+          { op: "unit-owner-is", owner: "actor" },
+          { op: "not", item: { op: "unit-has-marker", marker } }
+        ]
+      },
+      expression: { op: "repeat", min: 0, max: 0, item: {
+        op: "step", relation: "hex-neighbor", where: { op: "cell-exists" }
+      } },
+      result: { entity: "unit", distinctBy: "id" }
+    };
+    const state: GameState = {
+      ...fixture(),
+      settings: {
+        friendlyFire: false,
+        modRuleSet: {
+          patterns: [pattern],
+          rules: [{
+            id: "mod-test/promote-then-act",
+            trigger: "turn-start",
+            target: { scope: "pattern-units", patternId: pattern.id, owner: "actor" },
+            effects: [{ type: "set-unit-marker", marker }, { type: "exhaust-unit" }]
+          }]
+        }
+      }
+    };
+    const result = applyModRules(state, state, undefined, terrains, true);
+    expect(result.units[id("p1-home")]?.markers).toContain(marker);
+    expect(result.units[id("p1-scout")]?.markers).toContain(marker);
+    expect(result.turn.exhaustedUnitIds).toEqual([]);
+  });
+
+  it("rejects the command cleanly when a Mod spatial rule exceeds its evaluation limits", () => {
+    const state: GameState = {
+      ...fixture(),
+      settings: {
+        friendlyFire: false,
+        modRuleSet: {
+          patterns: [{
+            id: "mod-test/invalid-repeat",
+            result: { entity: "unit", distinctBy: "id" },
+            starts: { op: "terrain-has", capabilityId: "core/occupiable" },
+            expression: { op: "repeat", min: 0, max: 5_000, item: {
+              op: "step", relation: "hex-neighbor", where: { op: "terrain-has", capabilityId: "core/occupiable" }
+            } }
+          }],
+          rules: [{
+            id: "mod-test/evaluate-invalid-repeat",
+            trigger: "unit-enter",
+            target: { scope: "trigger-unit" },
+            conditions: [{ op: "pattern-includes-trigger-unit", patternId: "mod-test/invalid-repeat" }],
+            effects: [{ type: "exhaust-unit" }]
+          }]
+        }
+      }
+    };
+    const result = applyCommand(state, {
+      type: "move-unit", commandId: "bad-mod-rule", actorId: p1, expectedSequence: 0,
+      unitId: id("p1-scout"), destinationId: toCellId({ column: 2, row: 1 })
+    }, terrains, unitCatalog);
+
+    expect(result).toEqual({
+      accepted: false,
+      state,
+      error: { code: "mod-rule-error", message: "地块 Mod 规则计算失败，操作未生效。请检查地图依赖的 Mod 版本。" }
+    });
   });
 
   it("compiles capture exhaustion into the enter triggers of each opted-in terrain", () => {
@@ -323,6 +621,32 @@ describe("core turn rules", () => {
     expect(result.state.turn.exhaustedUnitIds).toContain(id("p1-scout"));
   });
 
+  it("does not exhaust a roamer moving between cells of the same terrain in transition mode", () => {
+    const state = fixture();
+    const sourceCellId = toCellId({ column: 2, row: 0 });
+    const destinationCellId = toCellId({ column: 1, row: 0 });
+    const oldCellId = toCellId({ column: 1, row: 1 });
+    const oldCell = { ...state.cells[oldCellId]! };
+    delete (oldCell as { unitId?: UnitId }).unitId;
+    const stateOnOcean: GameState = {
+      ...state,
+      cells: {
+        ...state.cells,
+        [oldCellId]: oldCell,
+        [sourceCellId]: { ...state.cells[sourceCellId]!, terrainId: "ocean", unitId: id("p1-scout") },
+        [destinationCellId]: { ...state.cells[destinationCellId]!, terrainId: "ocean" }
+      },
+      units: { ...state.units, [id("p1-scout")]: { ...state.units[id("p1-scout")]!, cellId: sourceCellId, strength: 3 } }
+    };
+    const result = applyCommand(stateOnOcean, {
+      type: "move-unit", commandId: "move-within-ocean", actorId: p1, expectedSequence: 0,
+      unitId: id("p1-scout"), destinationId: destinationCellId
+    }, terrains, unitCatalog);
+    expect(result.accepted).toBe(true);
+    if (!result.accepted) return;
+    expect(result.state.turn.exhaustedUnitIds).not.toContain(id("p1-scout"));
+  });
+
   it("exhausts an unpowered roamer after attacking a unit", () => {
     const state = fixture();
     const oldTargetCell = toCellId({ column: 3, row: 1 });
@@ -394,7 +718,7 @@ describe("core turn rules", () => {
     expect(result.state.turn.exhaustedUnitIds).toContain(arrivedUnitId);
   });
 
-  it("does not exhaust a roamer that becomes powered by capturing a stronghold", () => {
+  it("exhausts a sea roamer that captures a stronghold, despite becoming powered there", () => {
     const state = fixture();
     const sourceCell = toCellId({ column: 1, row: 1 });
     const targetCell = toCellId({ column: 2, row: 1 });
@@ -409,6 +733,12 @@ describe("core turn rules", () => {
     void ignoredNewHomeUnit;
     const attackState: GameState = {
       ...state,
+      cellTriggers: {
+        [sourceCell]: {
+          enter: [],
+          leave: [{ relationId: "core/exhaust-on-departure" }]
+        }
+      },
       cells: {
         ...state.cells,
         [sourceCell]: { ...state.cells[sourceCell]!, terrainId: "ocean" },
@@ -433,7 +763,8 @@ describe("core turn rules", () => {
     const arrivedUnitId = result.state.cells[targetCell]?.unitId;
     expect(arrivedUnitId).toBeDefined();
     expect(getPoweredUnitIds(result.state, terrains).has(arrivedUnitId!)).toBe(true);
-    expect(result.state.turn.exhaustedUnitIds).not.toContain(arrivedUnitId);
+    expect(result.state.turn.exhaustedUnitIds).toContain(arrivedUnitId);
+    expect(result.events.find((event) => event.type === "unit-exhausted")?.message).toContain("离开该地形");
   });
 
   it("does not exhaust a roamer that connects to power by capturing a plain", () => {
@@ -455,7 +786,7 @@ describe("core turn rules", () => {
       ...state,
       cells: {
         ...state.cells,
-        [sourceCell]: { ...state.cells[sourceCell]!, terrainId: "ocean" },
+        [sourceCell]: { ...state.cells[sourceCell]!, terrainId: "isolated" },
         [oldP1HomeCell]: clearUnit(state.cells[oldP1HomeCell]!),
         [oldP2HomeCell]: { ...state.cells[oldP2HomeCell]!, terrainId: "plain", unitId: id("p1-support") },
         [newP1HomeCell]: { ...state.cells[newP1HomeCell]!, terrainId: "stronghold", unitId: id("p1-home") },
@@ -583,8 +914,8 @@ describe("core turn rules", () => {
       mods: { [oilFieldMod.id]: runtimeMod }
     });
 
-    expect(match.settings.modRuleSet?.patterns).toEqual([pattern]);
-    expect(match.settings.modRuleSet?.rules).toEqual([rule]);
+    expect(match.settings.modRuleSet?.patterns).toContainEqual(pattern);
+    expect(match.settings.modRuleSet?.rules).toContainEqual(rule);
   });
 
   it("uses Mod powered-unit patterns as a deduplicated owner-scoped override", () => {
@@ -700,7 +1031,7 @@ describe("core turn rules", () => {
   });
 
   it("keeps enemy stronghold exhaustion ahead of power gained from a capture", () => {
-    const state = fixture();
+    const state = withCoreTerrainRules(fixture());
     const sourceCell = toCellId({ column: 1, row: 1 });
     const targetCell = toCellId({ column: 2, row: 1 });
     const targetId = id("p2-target");
@@ -728,8 +1059,7 @@ describe("core turn rules", () => {
     expect(arrivedUnitId).toBeDefined();
     expect(getPoweredUnitIds(result.state, terrains).has(arrivedUnitId!)).toBe(true);
     expect(result.state.turn.exhaustedUnitIds).toContain(arrivedUnitId);
-    expect(result.events.find((event) => event.type === "unit-exhausted")?.message)
-      .toContain("敌方据点封锁区");
+    expect(result.events.some((event) => event.type === "unit-exhausted")).toBe(true);
   });
 
   it("does not run destination enter reactions on a defender when a powered attack fails", () => {
@@ -804,8 +1134,8 @@ describe("core turn rules", () => {
     expect(result.state.units[arrivedUnitId!]?.strength).toBe(3);
   });
 
-  it("prioritizes an occupied enemy stronghold zone over powered attack continuation", () => {
-    const state = fixture();
+  it("applies the occupied enemy stronghold area rule before finalizing attack continuation", () => {
+    const state = withCoreTerrainRules(fixture());
     const targetCell = toCellId({ column: 2, row: 1 });
     const targetId = id("p2-target");
     const attackState: GameState = {
@@ -830,7 +1160,7 @@ describe("core turn rules", () => {
     const arrivedUnitId = result.state.cells[targetCell]?.unitId;
     expect(arrivedUnitId).toBeDefined();
     // The attacker is powered, but the occupied enemy stronghold at (3, 1)
-    // still exhausts it because the zone rule has higher priority.
+    // still exhausts it through the shared spatial rule system.
     expect(result.state.turn.exhaustedUnitIds).toEqual([arrivedUnitId]);
   });
 
@@ -840,7 +1170,7 @@ describe("core turn rules", () => {
     const targetId = id("p2-target");
 
     const makeAttackState = (strongholdUnit?: UnitId, strongholdOwner: PlayerId = p2): GameState => {
-      const state = fixture();
+      const state = withCoreTerrainRules(fixture());
       const home = state.units[id("p2-home")]!;
       const units: Record<UnitId, NonNullable<GameState["units"][UnitId]>> = {
         ...state.units,
@@ -902,13 +1232,141 @@ describe("core turn rules", () => {
 
   it("only marks actionable units during the action phase", () => {
     const state = fixture();
-    expect(getActionableUnitIds(state, terrains, unitCatalog)).toContain(id("p1-scout"));
+    const actionable = getActionableUnitIds(state, terrains, unitCatalog);
+    expect(actionable).toContain(id("p1-scout"));
+    expect(getActionableUnitIds(state, terrains, unitCatalog)).toBe(actionable);
 
     const reinforcementState: GameState = {
       ...state,
       turn: { ...state.turn, phase: "reinforcement" }
     };
     expect(getActionableUnitIds(reinforcementState, terrains, unitCatalog)).toEqual(new Set());
+    expect(getActionableUnitIds(reinforcementState, terrains, unitCatalog)).toBe(getActionableUnitIds(reinforcementState, terrains, unitCatalog));
+
+    const exhaustedSnapshot: GameState = {
+      ...state,
+      turn: { ...state.turn, exhaustedUnitIds: [id("p1-scout")] }
+    };
+    const nextActionable = getActionableUnitIds(exhaustedSnapshot, terrains, unitCatalog);
+    expect(nextActionable).not.toBe(actionable);
+    expect(nextActionable).not.toContain(id("p1-scout"));
+  });
+
+  it("highlights every player's units with a legal action without granting opponents control", () => {
+    const state = fixture();
+    const highlighted = getPotentiallyActionableUnitIds(state, terrains, unitCatalog);
+
+    expect(getActionableUnitIds(state, terrains, unitCatalog)).not.toContain(id("p2-home"));
+    expect(highlighted).toContain(id("p1-scout"));
+    expect(highlighted).toContain(id("p2-home"));
+
+    const exhaustedCurrentUnit = {
+      ...state,
+      turn: { ...state.turn, exhaustedUnitIds: [id("p1-scout"), id("p2-home")] }
+    };
+    const withCurrentExhaustion = getPotentiallyActionableUnitIds(exhaustedCurrentUnit, terrains, unitCatalog);
+    expect(withCurrentExhaustion).not.toContain(id("p1-scout"));
+    // The opponent's exhausted marker belongs to the previous action phase;
+    // their hypothetical next turn starts with an empty exhausted list.
+    expect(withCurrentExhaustion).toContain(id("p2-home"));
+  });
+
+  it("only highlights opponent units that can actually act, and shares growth eligibility with validation", () => {
+    const weakOpponent: GameState = {
+      ...fixture(),
+      units: { ...fixture().units, [id("p2-home")]: { ...fixture().units[id("p2-home")]!, strength: 1 } }
+    };
+    expect(getPotentiallyActionableUnitIds(weakOpponent, terrains, unitCatalog)).not.toContain(id("p2-home"));
+
+    const reinforcementState: GameState = {
+      ...fixture(),
+      turn: { ...fixture().turn, phase: "reinforcement" },
+      players: {
+        ...fixture().players,
+        [p1]: { ...fixture().players[p1]!, reinforcementPoints: 2 }
+      }
+    };
+    expect(getReinforceableUnitIds(reinforcementState, terrains)).toEqual(new Set([id("p1-home"), id("p1-scout")]));
+    expect(getReinforceableUnitIds({
+      ...reinforcementState,
+      players: { ...reinforcementState.players, [p1]: { ...reinforcementState.players[p1]!, reinforcementPoints: 0 } }
+    }, terrains)).toEqual(new Set());
+  });
+
+  it("keeps both sides' actionable units highlighted during reinforcement, not merely reinforceable units", () => {
+    const state = fixture();
+    const reinforcementState: GameState = {
+      ...state,
+      turn: {
+        ...state.turn,
+        phase: "reinforcement",
+        // These belong to completed action phases. They should not suppress
+        // highlights for either player's next action phase.
+        exhaustedUnitIds: [id("p1-home"), id("p1-scout"), id("p2-home")]
+      },
+      units: {
+        ...state.units,
+        // Powered one-point units can be reinforced but cannot take an action.
+        [id("p1-scout")]: { ...state.units[id("p1-scout")]!, strength: 1 }
+      }
+    };
+
+    const highlighted = getPotentiallyActionableUnitIds(reinforcementState, terrains, unitCatalog);
+
+    expect(highlighted).toContain(id("p1-home"));
+    expect(highlighted).toContain(id("p2-home"));
+    expect(highlighted).not.toContain(id("p1-scout"));
+    // Current-phase legal-action queries remain unavailable during growth.
+    expect(getLegalActionDestinationIds(reinforcementState, id("p2-home"), terrains, unitCatalog)).toEqual([]);
+  });
+
+  it("lights a powered one-point unit as soon as reinforcement makes it actionable", () => {
+    const initial = fixture();
+    const state: GameState = {
+      ...initial,
+      turn: { ...initial.turn, phase: "reinforcement" },
+      players: {
+        ...initial.players,
+        [p1]: { ...initial.players[p1]!, reinforcementPoints: 2 }
+      },
+      units: {
+        ...initial.units,
+        [id("p1-scout")]: { ...initial.units[id("p1-scout")]!, strength: 1 }
+      }
+    };
+    expect(getPotentiallyActionableUnitIds(state, terrains, unitCatalog)).not.toContain(id("p1-scout"));
+
+    const result = applyCommand(state, {
+      type: "reinforce-unit",
+      commandId: "reinforce-powered-one",
+      actorId: p1,
+      expectedSequence: state.sequence,
+      unitId: id("p1-scout")
+    }, terrains, unitCatalog);
+
+    expect(result.accepted).toBe(true);
+    if (!result.accepted) return;
+    expect(result.state.turn.phase).toBe("reinforcement");
+    expect(result.state.units[id("p1-scout")]?.strength).toBe(2);
+    expect(getPotentiallyActionableUnitIds(result.state, terrains, unitCatalog)).toContain(id("p1-scout"));
+
+    const lastPointState: GameState = {
+      ...state,
+      players: { ...state.players, [p1]: { ...state.players[p1]!, reinforcementPoints: 1 } }
+    };
+    const lastPointResult = applyCommand(lastPointState, {
+      type: "reinforce-unit",
+      commandId: "reinforce-last-point",
+      actorId: p1,
+      expectedSequence: lastPointState.sequence,
+      unitId: id("p1-scout")
+    }, terrains, unitCatalog);
+
+    expect(lastPointResult.accepted).toBe(true);
+    if (!lastPointResult.accepted) return;
+    expect(lastPointResult.state.turn.phase).toBe("action");
+    expect(lastPointResult.state.turn.currentPlayerId).toBe(p2);
+    expect(getPotentiallyActionableUnitIds(lastPointResult.state, terrains, unitCatalog)).toContain(id("p1-scout"));
   });
 
   it("does not expose a powered one-point unit as actionable", () => {
@@ -1087,6 +1545,45 @@ describe("core turn rules", () => {
     expect(result.state.units[artilleryId]).toBeUndefined();
     expect(result.state.turn.counterattacksUsed[result.state.units[id("p2-home")]!.cellId]).toBe(1);
     expect(result.events.map((event) => event.type)).toContain("unit-counterattacked");
+  });
+
+  it("previews ranged attacks only on occupied cells inside the bounded search area", () => {
+    const state = fixture();
+    const artilleryCatalog: UnitCatalog = {
+      ...unitCatalog,
+      artillery: {
+        id: "artillery",
+        displayName: "火炮",
+        capabilities: [
+          { id: "core/move", config: { maxDistance: 1 } },
+          { id: "core/attack", config: { movesIntoTarget: false } },
+          { id: "core/attack-range", config: { min: 2, max: 2 } }
+        ]
+      }
+    };
+    const artilleryId = id("p1-scout");
+    const farCellId = toCellId({ column: 4, row: 1 });
+    const farUnitId = id("p2-far");
+    const artilleryState: GameState = {
+      ...state,
+      cells: { ...state.cells, [farCellId]: { ...state.cells[farCellId]!, unitId: farUnitId } },
+      units: {
+        ...state.units,
+        [artilleryId]: { ...state.units[artilleryId]!, definitionId: "artillery" },
+        [farUnitId]: {
+          id: farUnitId,
+          definitionId: "roamer",
+          ownerId: p2,
+          cellId: farCellId,
+          strength: 2
+        }
+      }
+    };
+
+    const legal = getLegalActionDestinationIds(artilleryState, artilleryId, terrains, artilleryCatalog);
+
+    expect(legal).toContain(toCellId({ column: 3, row: 1 }));
+    expect(legal).not.toContain(farCellId);
   });
 
   it.each([
@@ -1333,24 +1830,8 @@ describe("core turn rules", () => {
   });
 
   it("splits a powered unit and exhausts it after entering an enemy stronghold zone", () => {
-    const homeCellId = toCellId({ column: 3, row: 1 });
     const arrivalCellId = toCellId({ column: 2, row: 1 });
-    const state: GameState = {
-      ...fixture(),
-      // Runtime rule lookup consumes the map-compiled incoming relation rather
-      // than recalculating the six-neighbour geometry on every movement.
-      cellTriggers: {
-        [arrivalCellId]: {
-          enter: [
-            // Same-team and empty/non-source targets are no-ops, but must not
-            // hide a later hostile linked stronghold.
-            { relatedCellId: toCellId({ column: 0, row: 1 }), relationId: "core/adjacent-hostile-exhaustion" },
-            { relatedCellId: homeCellId, relationId: "core/adjacent-hostile-exhaustion" }
-          ],
-          leave: []
-        }
-      }
-    };
+    const state = withCoreTerrainRules(fixture());
     const result = applyCommand(state, {
       type: "move-unit", commandId: "move-1", actorId: p1, expectedSequence: 0,
       unitId: id("p1-scout"), destinationId: arrivalCellId
@@ -1361,12 +1842,13 @@ describe("core turn rules", () => {
     expect(arriving).toBeDefined();
     expect(result.state.units[id("p1-scout")]?.strength).toBe(1);
     expect(result.state.turn.exhaustedUnitIds).toEqual([arriving]);
-    expect(result.events.map((event) => event.type)).toContain("unit-exhausted");
+    expect(result.events.find((event) => event.type === "unit-exhausted")?.message).toContain("触发地块规则");
     expect(result.outcome).toBeUndefined();
   });
 
   it("calculates current-player income at action-phase start, not when action ends", () => {
     const state = fixture();
+    expect(calculateReinforcementIncome(state, p1, terrains)).toBe(2);
     const started = startMatch(state, terrains, unitCatalog);
     expect(started.state.players[p1]?.reinforcementPoints).toBe(2);
     expect(started.events.map((event) => event.type)).toContain("points-granted");
@@ -1392,8 +1874,93 @@ describe("core turn rules", () => {
     expect(next.state.players[p2]?.reinforcementPoints).toBe(1);
   });
 
-  it("automatically enters reinforcement when the final actionable unit is exhausted", () => {
+  it("keeps desert tiles in the power network but gives no income because they have no source", () => {
+    const desert = desertTerrainCatalog[DESERT_TERRAIN_ID];
+    expect(desert).toBeDefined();
+    const desertTerrains: TerrainCatalog = { ...terrains, [desert!.id]: desert! };
+    const scoutCellId = toCellId({ column: 1, row: 1 });
     const state = fixture();
+    const desertState: GameState = {
+      ...state,
+      cells: { ...state.cells, [scoutCellId]: { ...state.cells[scoutCellId]!, terrainId: desert!.id } }
+    };
+
+    expect(getPoweredUnitIds(desertState, desertTerrains)).toContain(id("p1-scout"));
+    expect(calculateReinforcementIncome(desertState, p1, desertTerrains)).toBe(1);
+  });
+
+  it("uses the terrain's own income amount, prerequisite, and turn-start timing", () => {
+    const oilField = oilFieldTerrainCatalog["mod/oil-field"]!;
+    const oilTerrains = { ...terrains, [oilField.id]: oilField };
+    const homeCellId = toCellId({ column: 0, row: 1 });
+    const scoutCellId = toCellId({ column: 1, row: 1 });
+    const state = fixture();
+    const oilState: GameState = {
+      ...state,
+      cells: {
+        ...state.cells,
+        [homeCellId]: { ...state.cells[homeCellId]!, terrainId: "plain" },
+        [scoutCellId]: { ...state.cells[scoutCellId]!, terrainId: oilField.id }
+      }
+    };
+
+    expect(getPoweredUnitIds(oilState, oilTerrains)).not.toContain(id("p1-scout"));
+    expect(calculateReinforcementIncome(oilState, p1, oilTerrains)).toBe(2);
+
+    const poweredOnlyOilField = {
+      ...oilField,
+      capabilities: oilField.capabilities.map((binding) => binding.id === "core/income-source"
+        ? { ...binding, config: { ...binding.config, requires: "powered-occupant" } }
+        : binding)
+    };
+    expect(calculateReinforcementIncome(oilState, p1, { ...oilTerrains, [oilField.id]: poweredOnlyOilField })).toBe(0);
+
+    const wrongTimingOilField = {
+      ...oilField,
+      capabilities: oilField.capabilities.map((binding) => binding.id === "core/income-source"
+        ? { ...binding, config: { ...binding.config, when: "unit-enter" } }
+        : binding)
+    };
+    expect(calculateReinforcementIncome(oilState, p1, { ...oilTerrains, [oilField.id]: wrongTimingOilField })).toBe(0);
+  });
+
+  it("evaluates a custom income prerequisite against the occupying unit", () => {
+    const state = fixture();
+    const homeCellId = toCellId({ column: 0, row: 1 });
+    const scoutId = id("p1-scout");
+    const plain = terrains.plain!;
+    const customPlain = {
+      ...plain,
+      capabilities: plain.capabilities.map((binding) => binding.id === "core/income-source"
+        ? { ...binding, config: { ...binding.config, condition: {
+          op: "all",
+          items: [
+            { op: "unit-is-powered" },
+            { op: "unit-has-marker", marker: "income-eligible" }
+          ]
+        } } }
+        : binding)
+    };
+    const customTerrains = { ...terrains, plain: customPlain };
+
+    // The stronghold still yields one point; the plain waits for both checks.
+    expect(calculateReinforcementIncome(state, p1, customTerrains)).toBe(1);
+    const markedState: GameState = {
+      ...state,
+      units: { ...state.units, [scoutId]: { ...state.units[scoutId]!, markers: ["income-eligible"] } }
+    };
+    expect(calculateReinforcementIncome(markedState, p1, customTerrains)).toBe(2);
+
+    // Removing the sole power source makes the marked occupant ineligible again.
+    const unpoweredState: GameState = {
+      ...markedState,
+      cells: { ...markedState.cells, [homeCellId]: { ...markedState.cells[homeCellId]!, terrainId: "isolated" } }
+    };
+    expect(calculateReinforcementIncome(unpoweredState, p1, customTerrains)).toBe(0);
+  });
+
+  it("automatically enters reinforcement when the final actionable unit is exhausted", () => {
+    const state = withCoreTerrainRules(fixture());
     const homeCellId = toCellId({ column: 0, row: 1 });
     const { [id("p1-home")]: removedHome, ...remainingUnits } = state.units;
     void removedHome;

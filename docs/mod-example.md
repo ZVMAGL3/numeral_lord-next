@@ -21,7 +21,7 @@ packages/oil-field-mod/
 
 ## 地图如何声明依赖、运行时如何装配
 
-地图码的 `terrainLegend` 将字符 `F` 指向 `mod/oil-field`，`requiredTerrainModIds` 包含 `mod-oil-field`。这是地块依赖，不是 `matchConditionIds` 胜负条件。网页端在 `apps/web/src/installed-content.ts` 合并已安装的地形目录：
+地图码的 `terrainLegend` 将字符 `F` 指向 `mod/oil-field`，`requiredTerrainModIds` 包含 `mod-oil-field`。这是地块依赖，不是 `matchConditionIds` 胜负条件。网页端在 `apps/web/src/content/installed-content.ts` 合并已安装的地形目录：
 
 ```ts
 import { oilFieldMod, oilFieldTerrainCatalog } from "@numeral-lord/oil-field-mod";
@@ -31,7 +31,7 @@ const installedTerrainCatalog = {
   ...oilFieldTerrainCatalog
 };
 const terrainModIds = Object.fromEntries(
-  oilFieldMod.terrains.map((terrain) => [terrain.id, oilFieldMod.id])
+  [oilFieldMod.terrain.id, oilFieldMod.id]
 );
 ```
 

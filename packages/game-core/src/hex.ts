@@ -20,6 +20,21 @@ export const HEX_DIRECTIONS = [
 
 export type HexDirection = (typeof HEX_DIRECTIONS)[number];
 
+export interface HexAxialCoordinate {
+  readonly q: number;
+  readonly r: number;
+}
+
+/** Convert this board's even-row-shifted coordinates to parity-free axial coordinates. */
+export function toAxialCoordinate(coordinate: HexCoordinate): HexAxialCoordinate {
+  return { q: coordinate.column - Math.floor((coordinate.row + 1) / 2), r: coordinate.row };
+}
+
+/** Convert parity-free axial coordinates back to this board's even-row-shifted layout. */
+export function fromAxialCoordinate(coordinate: HexAxialCoordinate): HexCoordinate {
+  return { column: coordinate.q + Math.floor((coordinate.r + 1) / 2), row: coordinate.r };
+}
+
 const evenRowOffsets: Readonly<Record<HexDirection, HexCoordinate>> = {
   // The legacy board shifts even rows half a cell to the right. Keep these
   // offsets in exactly the same coordinate system as map.js#around().
@@ -83,21 +98,54 @@ export function getHexDistance(
 ): number | undefined {
   if (!isWithinHexBounds(from, bounds) || !isWithinHexBounds(to, bounds)) return undefined;
   const targetId = toCellId(to);
-  const visited = new Set<CellId>([toCellId(from)]);
-  const frontier: Array<{ readonly coordinate: HexCoordinate; readonly distance: number }> = [{ coordinate: from, distance: 0 }];
-
-  while (frontier.length > 0) {
-    const current = frontier.shift();
-    if (!current) break;
-    if (toCellId(current.coordinate) === targetId) return current.distance;
+  const startId = toCellId(from);
+  const visited = new Set<CellId>([startId]);
+  const frontier: Array<{ readonly coordinate: HexCoordinate; readonly id: CellId; readonly distance: number }> = [
+    { coordinate: from, id: startId, distance: 0 }
+  ];
+  for (let head = 0; head < frontier.length; head += 1) {
+    const current = frontier[head];
+    if (!current) continue;
+    if (current.id === targetId) return current.distance;
     for (const neighbour of getHexNeighbours(current.coordinate, bounds)) {
       const neighbourId = toCellId(neighbour);
       if (visited.has(neighbourId)) continue;
       visited.add(neighbourId);
-      frontier.push({ coordinate: neighbour, distance: current.distance + 1 });
+      frontier.push({ coordinate: neighbour, id: neighbourId, distance: current.distance + 1 });
     }
   }
   return undefined;
+}
+
+/**
+ * Return board-aware distances from one cell, optionally stopping at a range.
+ * A single breadth-first walk is much cheaper than asking for the distance to
+ * every board cell independently when painting legal-action highlights.
+ */
+export function getHexDistances(
+  from: HexCoordinate,
+  bounds: HexBounds,
+  maxDistance = Number.POSITIVE_INFINITY
+): ReadonlyMap<CellId, number> {
+  if (!isWithinHexBounds(from, bounds) || maxDistance < 0) return new Map();
+  const distances = new Map<CellId, number>([[toCellId(from), 0]]);
+  const frontier: Array<{ readonly coordinate: HexCoordinate; readonly id: CellId }> = [
+    { coordinate: from, id: toCellId(from) }
+  ];
+
+  for (let head = 0; head < frontier.length; head += 1) {
+    const current = frontier[head];
+    if (!current) continue;
+    const distance = distances.get(current.id) ?? 0;
+    if (distance >= maxDistance) continue;
+    for (const neighbour of getHexNeighbours(current.coordinate, bounds)) {
+      const neighbourId = toCellId(neighbour);
+      if (distances.has(neighbourId)) continue;
+      distances.set(neighbourId, distance + 1);
+      frontier.push({ coordinate: neighbour, id: neighbourId });
+    }
+  }
+  return distances;
 }
 
 export function toCellId(coordinate: HexCoordinate): CellId {

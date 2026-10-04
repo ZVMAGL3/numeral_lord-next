@@ -20,6 +20,28 @@ export interface TerrainSpec {
   readonly id: string;
   readonly displayName: string;
   readonly capabilities: readonly TerrainCapability[];
+  /** Optional inert artwork; it does not affect simulation. */
+  readonly visuals?: TerrainVisualSpec;
+}
+
+export interface TerrainVisualSpec {
+  readonly baseColor?: string;
+  readonly baseAssetId?: string;
+  /** Opacity of the base color or image, from fully transparent to opaque. */
+  readonly baseOpacity?: number;
+  /** Leave the base layer transparent; the optional top layer may still be drawn. */
+  readonly baseTransparent?: boolean;
+  readonly overlay?: TerrainVisualLayerSpec;
+}
+
+export interface TerrainVisualLayerSpec {
+  readonly assetId: string;
+  readonly scale: number;
+  readonly opacity: number;
+  readonly offsetX: number;
+  readonly offsetY: number;
+  /** Draw this top layer only while a unit occupies the terrain cell. */
+  readonly whenOccupied?: boolean;
 }
 
 export type TerrainCatalog = Readonly<Record<string, TerrainSpec>>;

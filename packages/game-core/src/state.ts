@@ -5,6 +5,13 @@ export type PlayerId = Brand<string, "PlayerId">;
 export type TeamId = Brand<string, "TeamId">;
 export type UnitId = Brand<string, "UnitId">;
 
+/** Immutable identity of the exact data-only Mod release a map was saved with. */
+export interface ModContentLock {
+  readonly id: string;
+  readonly version: string;
+  readonly contentHash: string;
+}
+
 /** Every player completes actions first, then independently allocates points. */
 export type MatchPhase = "action" | "reinforcement" | "finished";
 export type UnitPowerState = "roaming" | "powered";
@@ -76,7 +83,7 @@ export interface MatchSettings {
   readonly modSettings?: Readonly<Record<string, Readonly<Record<string, number | boolean | string>>>>;
   /** Generic capability values resolved from Mod setting schemas, by terrain and capability ID. */
   readonly terrainCapabilityOverrides?: Readonly<Record<string, Readonly<Record<string, Readonly<Record<string, unknown>>>>>>;
-  /** Version-pinned data-only Mod rule snapshot loaded with the selected map. */
+  /** Data-only Mod rule snapshot loaded with the selected map. */
   readonly modRuleSet?: {
     readonly patterns: readonly import("./spatial-pattern.js").SpatialPatternDefinition[];
     readonly rules: readonly import("./mod-rules.js").ModRuleDefinition[];

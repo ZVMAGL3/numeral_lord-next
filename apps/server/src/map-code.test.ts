@@ -12,13 +12,79 @@ import {
 import { applyCommand, canCounterattack } from "@numeral-lord/game-core";
 import type { CellId, PlayerId, UnitId } from "@numeral-lord/game-core";
 import { oilFieldMod, oilFieldTerrainCatalog } from "@numeral-lord/oil-field-mod";
+import { decayTerrainCatalog, decayTerrainMod } from "@numeral-lord/decay-terrain-mod";
+import { hashModContent } from "@numeral-lord/game-sdk";
 
 const installedMapCatalogs = {
-  terrains: { ...coreTerrainCatalog, ...oilFieldTerrainCatalog },
-  terrainModIds: Object.fromEntries(oilFieldMod.terrains.map((terrain) => [terrain.id, oilFieldMod.id]))
+  terrains: { ...coreTerrainCatalog, ...oilFieldTerrainCatalog, ...decayTerrainCatalog },
+  terrainModIds: {
+    [oilFieldMod.terrain.id]: oilFieldMod.id,
+    [decayTerrainMod.terrain.id]: decayTerrainMod.id
+  },
+  mods: { [oilFieldMod.id]: oilFieldMod, [decayTerrainMod.id]: decayTerrainMod }
 };
 
 describe("shared map code", () => {
+  it("does not treat the obsolete core/desert ID as either a built-in terrain or a Mod alias", () => {
+    expect(coreTerrainCatalog).not.toHaveProperty("core/desert");
+    const staleMap = {
+      ...DEFAULT_MAP_DEFINITION,
+      terrainLegend: { ...DEFAULT_MAP_DEFINITION.terrainLegend, M: "core/desert" }
+    };
+    expect(() => parseMapCode(JSON.stringify(staleMap), installedMapCatalogs)).toThrow(/未知的地形或 Mod/);
+  });
+
+  it("hashes equivalent JSON Mod content canonically", () => {
+    expect(hashModContent({})).toBe("sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a");
+    expect(hashModContent({ b: 2, a: 1 })).toBe(hashModContent({ a: 1, b: 2 }));
+  });
+
+  it("drains all of the current player's units on decay terrain, including roamers, at their turn start", () => {
+    const map = {
+      version: 1 as const,
+      id: "decay-test",
+      name: "衰蚀地测试",
+      columns: 7,
+      terrain: "SDPDDDS",
+      terrainLegend: { S: "core/stronghold", D: "mod/decay-terrain", P: "core/plain" },
+      requiredTerrainModIds: [decayTerrainMod.id],
+      players: 2,
+      // Player 1's unit at cell 3 is an unpowered roamer: the plain tile at
+      // cell 2 breaks its connection to their stronghold at cell 0.
+      soldiers: [[0, 1, 3], [1, 1, 3], [3, 1, 3], [5, 2, 3], [6, 2, 3]] as const,
+      specialUnits: [[4, "blocker", 3]] as const,
+      teams: [1, 2],
+      matchConditionIds: []
+    };
+    const catalogs = {
+      terrains: { ...coreTerrainCatalog, ...decayTerrainCatalog },
+      terrainModIds: { "mod/decay-terrain": decayTerrainMod.id },
+      mods: { [decayTerrainMod.id]: decayTerrainMod }
+    };
+    const initial = createMatchFromMapCode(serializeMapCode(map, catalogs), catalogs);
+    expect(initial.units["seat-1-cell-1" as UnitId]?.strength).toBe(2);
+    expect(initial.units["seat-1-cell-3" as UnitId]?.strength).toBe(2);
+    expect(initial.units["seat-2-cell-5" as UnitId]?.strength).toBe(3);
+    expect(initial.units["blocker-cell-4" as UnitId]?.strength).toBe(3);
+
+    const actionEnd = applyCommand(initial, {
+      type: "end-action-phase", commandId: "decay-action-end", actorId: "player-1" as PlayerId,
+      expectedSequence: initial.sequence
+    }, catalogs.terrains, coreUnitCatalog);
+    expect(actionEnd.accepted).toBe(true);
+    if (!actionEnd.accepted) return;
+    const turnEnd = applyCommand(actionEnd.state, {
+      type: "end-reinforcement-phase", commandId: "decay-reinforcement-end", actorId: "player-1" as PlayerId,
+      expectedSequence: actionEnd.state.sequence
+    }, catalogs.terrains, coreUnitCatalog);
+    expect(turnEnd.accepted).toBe(true);
+    if (!turnEnd.accepted) return;
+    expect(turnEnd.state.units["seat-1-cell-1" as UnitId]?.strength).toBe(2);
+    expect(turnEnd.state.units["seat-1-cell-3" as UnitId]?.strength).toBe(2);
+    expect(turnEnd.state.units["seat-2-cell-5" as UnitId]?.strength).toBe(2);
+    expect(turnEnd.state.units["blocker-cell-4" as UnitId]?.strength).toBe(3);
+  });
+
   it("uses lobby-selected legacy colors when creating a headless match", () => {
     const state = createMatchFromMapCode(DEFAULT_MAP_CODE, {
       ...installedMapCatalogs,
@@ -28,21 +94,121 @@ describe("shared map code", () => {
     expect(state.players["player-2" as PlayerId]?.color).toBe("#53AEBB");
   });
 
+  it("round trips editable map seat names and uses them as default player display names", () => {
+    const definition = { ...DEFAULT_MAP_DEFINITION, playerNames: ["赤方", "蓝方"] };
+    const code = serializeMapCode(definition, installedMapCatalogs);
+    expect(parseMapCode(code, installedMapCatalogs).playerNames).toEqual(["赤方", "蓝方"]);
+    expect(createMatchFromMapCode(code, installedMapCatalogs).players["player-1" as PlayerId]?.displayName).toBe("赤方");
+    expect(createMatchFromMapCode(code, {
+      ...installedMapCatalogs,
+      playerDisplayNames: { "player-1": "在线昵称" }
+    }).players["player-1" as PlayerId]?.displayName).toBe("在线昵称");
+    expect(createMatchFromMapCode(DEFAULT_MAP_CODE, installedMapCatalogs).players["player-1" as PlayerId]?.displayName).toBe("玩家 1");
+  });
+
+  it("round trips custom player colors and rejects incomplete or malformed palettes", () => {
+    const definition = { ...DEFAULT_MAP_DEFINITION, playerColors: ["#12ab34", "#aabbcc"] };
+    const code = serializeMapCode(definition, installedMapCatalogs);
+    expect(parseMapCode(code, installedMapCatalogs).playerColors).toEqual(["#12AB34", "#AABBCC"]);
+    const match = createMatchFromMapCode(code, installedMapCatalogs);
+    expect(match.players["player-1" as PlayerId]?.color).toBe("#12AB34");
+    expect(match.players["player-2" as PlayerId]?.color).toBe("#AABBCC");
+    expect(() => serializeMapCode({ ...DEFAULT_MAP_DEFINITION, playerColors: ["#123456"] }, installedMapCatalogs)).toThrow(/六位十六进制颜色/);
+    expect(() => serializeMapCode({ ...DEFAULT_MAP_DEFINITION, playerColors: ["red", "#AABBCC"] }, installedMapCatalogs)).toThrow(/六位十六进制颜色/);
+  });
+
+  it("round trips an editor-replaced void tile as its new terrain", () => {
+    const original = {
+      version: 1 as const,
+      id: "painted-void-test",
+      name: "虚无重绘测试",
+      columns: 2,
+      terrain: "VP",
+      terrainLegend: { V: "core/void", P: "core/plain" },
+      requiredTerrainModIds: [],
+      players: 2,
+      soldiers: [],
+      teams: [1, 2],
+      matchConditionIds: []
+    };
+    const replaced = { ...original, terrain: "PP" };
+    const code = serializeMapCode(replaced, installedMapCatalogs);
+    expect(parseMapCode(code, installedMapCatalogs).terrainLegend).toEqual({ P: "core/plain" });
+    expect(parseMapCode(code, installedMapCatalogs).terrain).toBe("PP");
+  });
+
+  it("rejects missing, empty, or overlong map seat names", () => {
+    expect(() => serializeMapCode({ ...DEFAULT_MAP_DEFINITION, playerNames: ["赤方"] }, installedMapCatalogs)).toThrow(/每个玩家位填写/);
+    expect(() => serializeMapCode({ ...DEFAULT_MAP_DEFINITION, playerNames: ["", "蓝方"] }, installedMapCatalogs)).toThrow(/每个玩家位填写/);
+    expect(() => serializeMapCode({ ...DEFAULT_MAP_DEFINITION, playerNames: ["甲".repeat(25), "蓝方"] }, installedMapCatalogs)).toThrow(/每个玩家位填写/);
+  });
+
   it("round trips 昏晓 and keeps every legacy cell and soldier", () => {
     const map = parseMapCode(DEFAULT_MAP_CODE, installedMapCatalogs);
     expect(map.name).toBe("昏晓");
     expect(map.players).toBe(2);
     expect(map.terrain).toBe(legacyDemoMap.terrain);
     expect(map.requiredTerrainModIds).toEqual(["mod-oil-field"]);
-    expect(serializeMapCode(map, installedMapCatalogs)).toBe(DEFAULT_MAP_CODE);
+    const idOnlyCode = serializeMapCode(map, installedMapCatalogs);
+    expect(idOnlyCode).not.toContain("requiredTerrainModLocks");
+    expect(serializeMapCode(parseMapCode(idOnlyCode, installedMapCatalogs), installedMapCatalogs)).toBe(idOnlyCode);
 
     const state = createMatchFromMapCode(DEFAULT_MAP_CODE, installedMapCatalogs);
     expect(Object.keys(state.cells)).toHaveLength(legacyDemoMap.terrain.length);
     expect(Object.keys(state.units)).toHaveLength(legacyDemoMap.soldiers.length);
     expect(state.players["player-1" as keyof typeof state.players]?.seat).toBe(1);
-    expect(Object.values(state.cellTriggers ?? {}).some((triggers) => triggers.enter.some(
-      (link) => link.relationId === "core/adjacent-hostile-exhaustion"
-    ))).toBe(true);
+    expect(state.settings.modRuleSet?.patterns.some((pattern) => pattern.id === "core-terrain/hostile-stronghold-zone")).toBe(true);
+    expect(state.settings.modRuleSet?.rules.some((rule) => rule.id === "core-terrain/hostile-stronghold-exhaustion")).toBe(true);
+  });
+
+  it("loads old maps with the currently installed Mod even when they contain a legacy version lock", () => {
+    const code = JSON.stringify({
+      ...DEFAULT_MAP_DEFINITION,
+      requiredTerrainModLocks: [{ id: oilFieldMod.id, version: "0.0.1", contentHash: `sha256:${"0".repeat(64)}` }]
+    });
+    const changedMod = {
+      ...oilFieldMod,
+      version: "0.2.0",
+      terrain: { ...oilFieldMod.terrain, displayName: `${oilFieldMod.terrain.displayName}!` }
+    };
+    const changedCatalogs = {
+      ...installedMapCatalogs,
+      mods: { ...installedMapCatalogs.mods, [oilFieldMod.id]: changedMod }
+    };
+    expect(parseMapCode(code, changedCatalogs)).not.toHaveProperty("requiredTerrainModLocks");
+    expect(serializeMapCode(parseMapCode(code, changedCatalogs), changedCatalogs)).not.toContain("requiredTerrainModLocks");
+    expect(() => createMatchFromMapCode(code, changedCatalogs)).not.toThrow();
+  });
+
+  it("keeps map codes independent from Mod version and visual asset fingerprints", () => {
+    const modWithArt = {
+      ...oilFieldMod,
+      visualAssets: [{ id: "ground", dataUrl: "data:image/webp;base64,AAAB" }],
+      terrain: { ...oilFieldMod.terrain, visuals: { baseColor: "#334455", baseAssetId: "ground" } }
+    };
+    const catalogs = {
+      ...installedMapCatalogs,
+      terrains: { ...installedMapCatalogs.terrains, [modWithArt.terrain.id]: modWithArt.terrain },
+      mods: { ...installedMapCatalogs.mods, [oilFieldMod.id]: modWithArt }
+    };
+    const code = serializeMapCode(DEFAULT_MAP_DEFINITION, catalogs);
+    expect(code).not.toContain("requiredTerrainModLocks");
+    expect(parseMapCode(code, catalogs).requiredTerrainModIds).toContain(modWithArt.id);
+
+    const changedArtMod = { ...modWithArt, visualAssets: [{ id: "ground", dataUrl: "data:image/webp;base64,AAAC" }] };
+    expect(() => createMatchFromMapCode(code, {
+      ...catalogs,
+      mods: { ...catalogs.mods, [oilFieldMod.id]: changedArtMod }
+    })).not.toThrow();
+  });
+
+  it("always serializes only Mod IDs, following whichever release the caller provides", () => {
+    const saved = parseMapCode(serializeMapCode(DEFAULT_MAP_DEFINITION, installedMapCatalogs), installedMapCatalogs);
+    const revisedMod = { ...oilFieldMod, version: "0.2.0" };
+    const revisedCatalogs = { ...installedMapCatalogs, mods: { [oilFieldMod.id]: revisedMod } };
+    const revisedCode = serializeMapCode(saved, revisedCatalogs);
+    expect(JSON.parse(revisedCode)).not.toHaveProperty("requiredTerrainModLocks");
+    expect(parseMapCode(revisedCode, revisedCatalogs).requiredTerrainModIds).toEqual([oilFieldMod.id]);
   });
 
   it("compiles arbitrary map-authored point-to-point links into destination lookup lists", () => {

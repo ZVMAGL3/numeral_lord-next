@@ -3,7 +3,7 @@ import {
   serializeMapCode,
   type MapDefinition
 } from "@numeral-lord/core-content";
-import { installedMapCatalogs, installedTerrainMods } from "./installed-content";
+import { installedMapCatalogs, resolveMapCatalogs } from "../content/installed-content";
 
 const STORAGE_KEY = "numeral-lord.map-library.v1";
 const MAX_CUSTOM_MAPS = 32;
@@ -16,11 +16,15 @@ export interface ConfiguredMap {
 
 /** A map code may be saved without its terrain Mods, but cannot be played yet. */
 export function missingTerrainMods(map: ConfiguredMap): string[] {
-  const installedModIds = new Set(installedTerrainMods.map((mod) => mod.id));
-  return map.definition.requiredTerrainModIds.filter((id) => !installedModIds.has(id));
+  const activeCatalogs = resolveMapCatalogs(map.code);
+  return map.definition.requiredTerrainModIds.filter((id) => !activeCatalogs?.mods?.[id]);
 }
 
-const libraryCatalogs = { ...installedMapCatalogs, allowUnknownTerrainMods: true };
+function catalogsForCode(code: string) {
+  const exact = resolveMapCatalogs(code);
+  // Preserve maps for inspection when a required Mod is not installed.
+  return exact ?? { ...installedMapCatalogs, mods: {}, allowUnknownTerrainMods: true };
+}
 
 /** Local-only map library. Room selection sends a complete code to every client. */
 export function loadMapLibrary(): ConfiguredMap[] {
@@ -36,10 +40,11 @@ export function loadMapLibrary(): ConfiguredMap[] {
   for (const value of saved.slice(0, MAX_CUSTOM_MAPS)) {
     if (typeof value !== "string") continue;
     try {
-      const definition = parseMapCode(value, libraryCatalogs);
+      const catalogs = catalogsForCode(value);
+      const definition = parseMapCode(value, catalogs);
       if (seen.has(definition.id)) continue;
       seen.add(definition.id);
-      maps.push({ code: serializeMapCode(definition, libraryCatalogs), definition, isDefault: false });
+      maps.push({ code: serializeMapCode(definition, catalogs), definition, isDefault: false });
     } catch {
       // A stale or damaged local entry does not prevent opening the game.
     }
@@ -49,23 +54,27 @@ export function loadMapLibrary(): ConfiguredMap[] {
 
 export function addMapToLibrary(current: readonly ConfiguredMap[], rawCode: string): ConfiguredMap[] {
   if (rawCode.length > 128_000) throw new Error("地图码过长，请检查粘贴内容。");
-  const definition = parseMapCode(rawCode, libraryCatalogs);
+  const catalogs = catalogsForCode(rawCode);
+  const definition = parseMapCode(rawCode, catalogs);
   if (current.some((map) => map.definition.id === definition.id)) {
     throw new Error(`地图「${definition.name}」已经在地图库中。`);
   }
   if (current.length >= MAX_CUSTOM_MAPS) throw new Error("本机最多可保存 32 张自定义地图。");
-  const next = [...current, { code: serializeMapCode(definition, libraryCatalogs), definition, isDefault: false }];
+  const next = [...current, { code: serializeMapCode(definition, catalogs), definition, isDefault: false }];
   persistCustomMaps(next);
   return next;
 }
 
 export function saveMapToLibrary(current: readonly ConfiguredMap[], rawCode: string): ConfiguredMap[] {
   if (rawCode.length > 128_000) throw new Error("地图数据过长。");
-  const definition = parseMapCode(rawCode, libraryCatalogs);
+  const definition = parseMapCode(rawCode, installedMapCatalogs);
   const existing = current.find((map) => map.definition.id === definition.id);
   const exists = existing !== undefined;
   if (!exists && current.length >= MAX_CUSTOM_MAPS) throw new Error("本机最多可保存 32 张自定义地图。");
-  const entry: ConfiguredMap = { code: serializeMapCode(definition, libraryCatalogs), definition, isDefault: false };
+  const code = serializeMapCode(definition, installedMapCatalogs);
+  // Maps retain Mod IDs only; loading them always follows the active local
+  // release, and rooms use the host's active release for all participants.
+  const entry: ConfiguredMap = { code, definition: parseMapCode(code, installedMapCatalogs), isDefault: false };
   const next = exists
     ? current.map((map) => map.definition.id === definition.id ? entry : map)
     : [...current, entry];

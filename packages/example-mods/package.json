@@ -1,0 +1,23 @@
+{
+  "name": "@numeral-lord/example-mods",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@numeral-lord/content-schema": "workspace:*",
+    "@numeral-lord/game-core": "workspace:*",
+    "@numeral-lord/game-sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "vitest": "5.0.1"
+  }
+}

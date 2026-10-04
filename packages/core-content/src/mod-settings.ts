@@ -52,11 +52,11 @@ export function resolveModSettings(
       const value = validRoom?.[modId]?.[setting.id] ?? mapValues?.[modId]?.[setting.id] ?? setting.defaultValue;
       validateSettingValue(setting, value);
       resolved[setting.id] = value;
-      const terrain = mod.terrains.find((candidate) => candidate.id === setting.target.terrainId);
+      const terrain = mod.terrain;
       if (!terrain?.capabilities.some((capability) => capability.id === setting.target.capabilityId)) {
         throw new Error(`Mod 参数 ${modId}/${setting.id} 没有对应地形能力。`);
       }
-      const byCapability = overrides[setting.target.terrainId] ??= Object.create(null);
+      const byCapability = overrides[terrain.id] ??= Object.create(null);
       const config = byCapability[setting.target.capabilityId] ??= Object.create(null);
       config[setting.target.configKey] = value;
     }

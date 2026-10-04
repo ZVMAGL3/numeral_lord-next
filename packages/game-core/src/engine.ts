@@ -11,8 +11,8 @@ import {
   type UnitCatalog,
   type UnitSpec
 } from "./content.js";
-import { getHexDistance, getHexNeighbours, toCellId, type HexBounds } from "./hex.js";
-import { selectSpatialPatternUnits, type SpatialPatternDefinition } from "./spatial-pattern.js";
+import { getHexDistance, getHexDistances, getHexNeighbours, toCellId, type HexBounds } from "./hex.js";
+import { matchesSpatialPredicate, selectSpatialExpressionCellsFrom, selectSpatialPatternUnits, type SpatialExpression, type SpatialPatternDefinition, type SpatialPredicate } from "./spatial-pattern.js";
 import { applyModRules } from "./mod-rules.js";
 import type {
   CellId,
@@ -68,6 +68,7 @@ export interface CommandFailure {
     | "insufficient-points"
     | "unit-not-powered"
     | "invalid-command"
+    | "mod-rule-error"
     | "unknown-command";
   readonly message: string;
 }
@@ -110,12 +111,25 @@ const CAPABILITY = {
   conductor: "core/power-conductor",
   source: "core/power-source",
   income: "core/income-source",
+  entryExhaustion: "core/exhaust-on-entry",
   departureExhaustion: "core/exhaust-on-departure",
-  hostileExhaustion: "core/adjacent-hostile-exhaustion",
   attackCaptureExhaustion: "core/exhaust-unpowered-after-capture",
   departureGarrison: "core/departure-garrison",
+  terrainMovement: "core/terrain-movement",
   counterattackTerrainLimit: "core/counterattack-terrain-limit"
 } as const;
+
+function getTerrainMovementRule(terrain: TerrainSpec): {
+  readonly enabled: boolean;
+  readonly expression?: SpatialExpression;
+} {
+  const config = getTerrainCapability(terrain, CAPABILITY.terrainMovement)?.config;
+  const expression = isRecord(config?.expression) ? config.expression as SpatialExpression : undefined;
+  return {
+    enabled: config?.enabled !== false,
+    ...(expression ? { expression } : {})
+  };
+}
 
 const UNIT_CAPABILITY = {
   move: "core/move",
@@ -126,7 +140,6 @@ const UNIT_CAPABILITY = {
   terrainBoundCounterattack: "core/terrain-bound-counterattack",
   actionStrengthDecay: "core/action-strength-decay",
   poweredActionThreshold: "core/powered-action-threshold",
-  poweredIncome: "core/powered-income",
   attackExhaustion: "core/exhaust-after-attack"
 } as const;
 
@@ -135,6 +148,21 @@ const UNIT_CAPABILITY = {
 // ask the same question for several units without repeating the BFS. WeakMaps
 // release old snapshots after a command replaces them.
 const poweredCache = new WeakMap<GameState, WeakMap<TerrainCatalog, ReadonlySet<UnitId>>>();
+const legalDestinationCache = new WeakMap<
+  GameState,
+  WeakMap<TerrainCatalog, WeakMap<UnitCatalog, Map<UnitId, readonly CellId[]>>>
+>();
+const actionableUnitCache = new WeakMap<
+  GameState,
+  WeakMap<TerrainCatalog, WeakMap<UnitCatalog, ReadonlySet<UnitId>>>
+>();
+const potentialActionableCache = new WeakMap<
+  GameState,
+  WeakMap<TerrainCatalog, WeakMap<UnitCatalog, ReadonlySet<UnitId>>>
+>();
+const reinforceableCache = new WeakMap<GameState, WeakMap<TerrainCatalog, ReadonlySet<UnitId>>>();
+const exhaustedUnitSetCache = new WeakMap<GameState, ReadonlySet<UnitId>>();
+const noUnitIds: ReadonlySet<UnitId> = new Set();
 
 /** The built-in power network is itself a serializable spatial pattern. */
 export const POWER_NETWORK_PATTERN: SpatialPatternDefinition = {
@@ -225,13 +253,13 @@ export function applyCommand(
       return finalizeCommand(state, attackUnit(state, command, terrains, units), terrains, units, matchConditions, command);
     case "reinforce-unit":
       if (state.turn.phase !== "reinforcement") return fail(state, "wrong-phase", "请先结束行动，进入加点回合。");
-      return finalizeCommand(state, reinforceUnit(state, command, terrains, units), terrains, units, matchConditions, command);
+      return finalizeCommand(state, reinforceUnit(state, command, terrains), terrains, units, matchConditions, command);
     case "end-action-phase":
       if (state.turn.phase !== "action") return fail(state, "wrong-phase", "当前不是行动回合。");
       return finalizeCommand(state, endActionPhase(state), terrains, units, matchConditions, command);
     case "end-reinforcement-phase":
       if (state.turn.phase !== "reinforcement") return fail(state, "wrong-phase", "当前不是加点回合。");
-      return finalizeCommand(state, endReinforcementPhase(state, terrains, units), terrains, units, matchConditions, command);
+      return finalizeCommand(state, endReinforcementPhase(state, terrains), terrains, units, matchConditions, command);
   }
 }
 
@@ -289,9 +317,10 @@ export function startMatch(
   if (!current || state.turn.phase !== "action") return { state, events: [] };
   const draft = createDraft(state);
   const events: GameEvent[] = [];
-  grantReinforcementIncome(draft, current, terrains, units, events);
+  grantReinforcementIncome(draft, current, terrains, events);
   events.push({ type: "turn-started", message: `现在轮到 ${current.displayName} 的行动回合。` });
-  const withRules = applyModRules(state, asDraftState(draft), undefined, terrains, true);
+  const withRules = applyModRules(state, asDraftState(draft), undefined, terrains, true,
+    (current, unitId) => getPoweredUnitIds(current, terrains).has(unitId));
   const ruledDraft = createDraft(withRules);
   resolveMatchConditions(ruledDraft, terrains, matchConditions, events);
   return { state: asDraftState(ruledDraft), events };
@@ -367,45 +396,128 @@ export function getLegalActionDestinationIds(
   terrains: TerrainCatalog,
   units: UnitCatalog
 ): readonly CellId[] {
+  // This public query describes actions that can be issued now. The private
+  // owner-scoped variant is also used for future-turn previews during growth.
+  if (state.turn.phase !== "action") return [];
+
+  const cachedByTerrain = legalDestinationCache.get(state);
+  const cachedForTerrain = cachedByTerrain?.get(terrains);
+  const cachedByUnit = cachedForTerrain?.get(units);
+  const cachedDestinations = cachedByUnit?.get(unitId);
+  if (cachedDestinations) return cachedDestinations;
+
+  const destinations = getLegalActionDestinationsForOwner(
+    state,
+    unitId,
+    terrains,
+    units,
+    state.turn.currentPlayerId,
+    getExhaustedUnitIds(state)
+  );
+  const cacheForState = cachedByTerrain ?? new WeakMap<TerrainCatalog, WeakMap<UnitCatalog, Map<UnitId, readonly CellId[]>>>();
+  const cacheForTerrain = cachedForTerrain ?? new WeakMap<UnitCatalog, Map<UnitId, readonly CellId[]>>();
+  const cacheForCatalogs = cachedByUnit ?? new Map<UnitId, readonly CellId[]>();
+  cacheForCatalogs.set(unitId, destinations);
+  cacheForTerrain.set(units, cacheForCatalogs);
+  if (!cachedByTerrain) legalDestinationCache.set(state, cacheForState);
+  if (!cachedForTerrain) cacheForState.set(terrains, cacheForTerrain);
+  return destinations;
+}
+
+/**
+ * Shared legal-action calculation. `actorId` and exhaustion are parameters so
+ * the UI can preview another player's turn without cloning/mutating GameState.
+ */
+function getLegalActionDestinationsForOwner(
+  state: GameState,
+  unitId: UnitId,
+  terrains: TerrainCatalog,
+  units: UnitCatalog,
+  actorId: PlayerId,
+  exhaustedUnitIds: ReadonlySet<UnitId>,
+  poweredUnitIds?: ReadonlySet<UnitId>
+): readonly CellId[] {
   const unit = state.units[unitId];
-  if (state.turn.phase !== "action" || !unit || unit.ownerId !== state.turn.currentPlayerId) return [];
-  if (state.turn.exhaustedUnitIds.includes(unit.id)) return [];
+  if (!unit || unit.ownerId !== actorId) return [];
+  if (exhaustedUnitIds.has(unit.id)) return [];
 
   const sourceCell = state.cells[unit.cellId];
   if (!sourceCell) return [];
   const sourceTerrain = requireTerrain(terrains, sourceCell.terrainId);
+  const powered = (poweredUnitIds ?? getPoweredUnitIds(state, terrains)).has(unit.id);
   const departureGarrison = hasCellTrigger(state, sourceCell.id, "leave", CAPABILITY.departureGarrison, sourceTerrain)
-    ? getDepartureGarrison(sourceTerrain) : undefined;
+    ? getDepartureGarrison(sourceTerrain, powered) : undefined;
   const canLeaveSource = !departureGarrison || unit.strength > departureGarrison.strength;
+  const terrainMovement = getTerrainMovementRule(sourceTerrain);
   const unitDefinition = units[unit.definitionId];
   if (!unitDefinition) return [];
 
-  const powered = getPoweredUnitIds(state, terrains).has(unit.id);
   if (!hasEnoughStrengthToAct(unit, unitDefinition, powered)) return [];
   const legal = new Set<CellId>();
   const moveRange = getConfiguredMax(unitDefinition, UNIT_CAPABILITY.move, "maxDistance");
-  if (moveRange && canLeaveSource) {
-    for (const cell of Object.values(state.cells)) {
-      if (cell.unitId) continue;
-      const terrain = requireTerrain(terrains, cell.terrainId);
-      if (!hasTerrainCapability(terrain, CAPABILITY.occupiable)) continue;
-      const distance = getHexDistance(sourceCell.coordinate, cell.coordinate, state.board);
-      if (distance && distance <= moveRange) legal.add(cell.id);
-    }
-  }
-
+  const mayMove = Boolean(moveRange && canLeaveSource && terrainMovement.enabled);
+  const movementRange = mayMove && !terrainMovement.expression ? moveRange! : 0;
   const attackRange = getAttackRange(unitDefinition);
   const attackCapability = getUnitCapability(unitDefinition, UNIT_CAPABILITY.attack);
   const attackMovesIntoTarget = attackCapability?.config?.movesIntoTarget !== false;
-  if (attackCapability && attackRange && (!attackMovesIntoTarget || canLeaveSource)) {
-    for (const cell of Object.values(state.cells)) {
-      const target = cell.unitId ? state.units[cell.unitId] : undefined;
-      if (!target || (areSameTeam(state, unit.ownerId, target.ownerId) && !state.settings.friendlyFire)) continue;
-      const distance = getHexDistance(sourceCell.coordinate, cell.coordinate, state.board);
-      if (distance !== undefined && distance >= attackRange.min && distance <= attackRange.max) legal.add(cell.id);
+  const mayAttack = Boolean(attackCapability && attackRange
+    && (!attackMovesIntoTarget || (canLeaveSource && terrainMovement.enabled)));
+  const maxDistance = Math.max(movementRange, mayAttack ? attackRange!.max : 0);
+  const distances = maxDistance > 0
+    ? getHexDistances(sourceCell.coordinate, state.board, maxDistance)
+    : new Map<CellId, number>();
+
+  if (movementRange > 0) {
+    for (const [cellId, distance] of distances) {
+      if (distance === 0 || distance > movementRange) continue;
+      const cell = state.cells[cellId];
+      if (!cell || cell.unitId) continue;
+      const terrain = requireTerrain(terrains, cell.terrainId);
+      if (hasTerrainCapability(terrain, CAPABILITY.occupiable)) legal.add(cell.id);
+    }
+  }
+
+  if (mayMove && terrainMovement.expression) {
+    try {
+      for (const cellId of selectSpatialExpressionCellsFrom(
+        state, terrains, [sourceCell.id], terrainMovement.expression, actorId
+      )) {
+        if (cellId === sourceCell.id) continue;
+        const cell = state.cells[cellId];
+        if (!cell || cell.unitId) continue;
+        const terrain = requireTerrain(terrains, cell.terrainId);
+        if (hasTerrainCapability(terrain, CAPABILITY.occupiable)) legal.add(cellId);
+      }
+    } catch {
+      // Malformed or over-budget movement expressions grant no destinations.
+    }
+  }
+
+  if (mayAttack && attackRange) {
+    // `distances` is already bounded to the unit's movement/attack range.
+    // Inspect only those nearby cells: scanning every unit here made the
+    // actionability preview quadratic as armies grew (one full unit scan for
+    // every candidate acting unit).
+    for (const [targetCellId, distance] of distances) {
+      if (distance < attackRange.min || distance > attackRange.max) continue;
+      const targetCell = state.cells[targetCellId];
+      const targetUnitId = targetCell?.unitId;
+      const target = targetUnitId ? state.units[targetUnitId] : undefined;
+      if (!target) continue;
+      if (areSameTeam(state, unit.ownerId, target.ownerId) && !state.settings.friendlyFire) continue;
+      legal.add(targetCellId);
     }
   }
   return [...legal];
+}
+
+/** Reuse the current snapshot's exhaustion lookup across all unit queries. */
+function getExhaustedUnitIds(state: GameState): ReadonlySet<UnitId> {
+  const cached = exhaustedUnitSetCache.get(state);
+  if (cached) return cached;
+  const exhausted = new Set(state.turn.exhaustedUnitIds);
+  exhaustedUnitSetCache.set(state, exhausted);
+  return exhausted;
 }
 
 /** Units that can presently produce at least one legal action. */
@@ -414,12 +526,86 @@ export function getActionableUnitIds(
   terrains: TerrainCatalog,
   units: UnitCatalog
 ): ReadonlySet<UnitId> {
-  if (state.turn.phase !== "action") return new Set<UnitId>();
+  if (state.turn.phase !== "action") return noUnitIds;
 
-  return new Set(Object.values(state.units)
+  const cachedByTerrain = actionableUnitCache.get(state);
+  const cachedForTerrain = cachedByTerrain?.get(terrains);
+  const cached = cachedForTerrain?.get(units);
+  if (cached) return cached;
+
+  const actionable = new Set(Object.values(state.units)
     .filter((unit) => unit.ownerId === state.turn.currentPlayerId)
     .filter((unit) => getLegalActionDestinationIds(state, unit.id, terrains, units).length > 0)
     .map((unit) => unit.id));
+  const cacheForState = cachedByTerrain ?? new WeakMap<TerrainCatalog, WeakMap<UnitCatalog, ReadonlySet<UnitId>>>();
+  const cacheForTerrain = cachedForTerrain ?? new WeakMap<UnitCatalog, ReadonlySet<UnitId>>();
+  cacheForTerrain.set(units, actionable);
+  cacheForState.set(terrains, cacheForTerrain);
+  if (!cachedByTerrain) actionableUnitCache.set(state, cacheForState);
+  return actionable;
+}
+
+/**
+ * Units with a legal action when each living player's turn is considered in
+ * isolation. During action, current-player exhaustion is honored while
+ * opponents are previewed with a fresh action phase. During reinforcement,
+ * every player is previewed with fresh exhaustion because those units will
+ * act in a later action phase, after exhaustion has reset.
+ */
+export function getPotentiallyActionableUnitIds(
+  state: GameState,
+  terrains: TerrainCatalog,
+  units: UnitCatalog
+): ReadonlySet<UnitId> {
+  if (state.turn.phase !== "action" && state.turn.phase !== "reinforcement") return new Set<UnitId>();
+
+  const cachedByTerrain = potentialActionableCache.get(state);
+  const cachedForTerrain = cachedByTerrain?.get(terrains);
+  const cached = cachedForTerrain?.get(units);
+  if (cached) return cached;
+
+  const isActionPhase = state.turn.phase === "action";
+  const potential = new Set(isActionPhase ? getActionableUnitIds(state, terrains, units) : []);
+  const powered = getPoweredUnitIds(state, terrains);
+  for (const unit of Object.values(state.units)) {
+    if (!state.players[unit.ownerId]) continue;
+    // The active player's current exhausted actions matter only while they
+    // are still acting. In reinforcement everyone is being previewed for a
+    // future action phase, so stale exhaustion must not suppress highlights.
+    if (isActionPhase && unit.ownerId === state.turn.currentPlayerId) continue;
+    if (getLegalActionDestinationsForOwner(state, unit.id, terrains, units, unit.ownerId, noUnitIds, powered).length > 0) {
+      potential.add(unit.id);
+    }
+  }
+
+  const cacheForState = cachedByTerrain ?? new WeakMap<TerrainCatalog, WeakMap<UnitCatalog, ReadonlySet<UnitId>>>();
+  const cacheForCatalogs = cachedForTerrain ?? new WeakMap<UnitCatalog, ReadonlySet<UnitId>>();
+  cacheForCatalogs.set(units, potential);
+  if (!cachedByTerrain) potentialActionableCache.set(state, cacheForState);
+  if (!cachedForTerrain) cacheForState.set(terrains, cacheForCatalogs);
+  return potential;
+}
+
+/** Units the current player can reinforce during this phase. */
+export function getReinforceableUnitIds(
+  state: GameState,
+  terrains: TerrainCatalog
+): ReadonlySet<UnitId> {
+  const cachedByTerrain = reinforceableCache.get(state);
+  const cached = cachedByTerrain?.get(terrains);
+  if (cached) return cached;
+  if (state.turn.phase !== "reinforcement" || (state.players[state.turn.currentPlayerId]?.reinforcementPoints ?? 0) < 1) {
+    return new Set<UnitId>();
+  }
+
+  const powered = getPoweredUnitIds(state, terrains);
+  const reinforceable = new Set(Object.values(state.units)
+    .filter((unit) => unit.ownerId === state.turn.currentPlayerId && powered.has(unit.id))
+    .map((unit) => unit.id));
+  const cacheForState = cachedByTerrain ?? new WeakMap<TerrainCatalog, ReadonlySet<UnitId>>();
+  cacheForState.set(terrains, reinforceable);
+  if (!cachedByTerrain) reinforceableCache.set(state, cacheForState);
+  return reinforceable;
 }
 
 function moveUnit(
@@ -443,8 +629,9 @@ function moveUnit(
   const unitDefinition = units[unit.definitionId];
   if (!unitDefinition) return fail(state, "invalid-unit-definition", "单位没有可用的兵种定义。");
   const sourceTerrain = requireTerrain(terrains, sourceCell.terrainId);
+  const powered = getPoweredUnitIds(state, terrains).has(unit.id);
   const departureGarrison = hasCellTrigger(state, sourceCell.id, "leave", CAPABILITY.departureGarrison, sourceTerrain)
-    ? getDepartureGarrison(sourceTerrain) : undefined;
+    ? getDepartureGarrison(sourceTerrain, powered) : undefined;
   if (departureGarrison && unit.strength <= departureGarrison.strength) {
     return fail(state, "insufficient-strength", "该地形需要留下 1 点留守游兵，至少需要 2 点才能离开。");
   }
@@ -453,17 +640,19 @@ function moveUnit(
   }
   const moveRange = getConfiguredMax(unitDefinition, UNIT_CAPABILITY.move, "maxDistance");
   if (!moveRange) return fail(state, "unit-cannot-move", "该兵种没有移动能力。");
+  if (!getTerrainMovementRule(sourceTerrain).enabled) {
+    return fail(state, "unit-cannot-move", "当前地块不允许单位移动离开。");
+  }
   if (destinationCell.unitId) return fail(state, "occupied-destination", "移动目标必须是空格；攻击请使用攻击能力。");
   const destinationTerrain = requireTerrain(terrains, destinationCell.terrainId);
   if (!hasTerrainCapability(destinationTerrain, CAPABILITY.occupiable)) {
     return fail(state, "blocked-terrain", "山地和虚无不能进入。");
   }
-  const distance = getHexDistance(sourceCell.coordinate, destinationCell.coordinate, state.board);
-  if (!distance || distance > moveRange) return fail(state, "non-adjacent-destination", "目标超出该兵种的移动距离。");
-
-  const powered = getPoweredUnitIds(state, terrains).has(unit.id);
   if (!hasEnoughStrengthToAct(unit, unitDefinition, powered)) {
     return fail(state, "insufficient-strength", "通电兵点数不足，不能行动。");
+  }
+  if (!getLegalActionDestinationIds(state, unit.id, terrains, units).includes(destinationCell.id)) {
+    return fail(state, "non-adjacent-destination", "目标不在该地块允许的移动范围内。");
   }
   // A powered stack must leave its one-point supply anchor in the source cell.
   // Roamer's optional action-strength-decay controls the strength of the
@@ -481,15 +670,14 @@ function moveUnit(
     leaveDepartureGarrison(draft, sourceCell.id, unit, departureGarrison, units, events);
   }
 
-  const arrivedCell = draft.cells[destinationCell.id];
-  const arrivingUnit = arrivedCell?.unitId
-    ? draft.units[arrivedCell.unitId]
-    : undefined;
-  // A hostile occupied stronghold has the highest exhaustion priority: it
-  // must win over the generic one-point/departure rules for the same arrival.
-  if (arrivingUnit) {
-    applyAdjacentHostileExhaustion(draft, arrivingUnit, terrains, events);
-  }
+  applyEntryExhaustion(
+    draft,
+    continuationUnitId,
+    sourceTerrain,
+    destinationTerrain,
+    destinationCell.id,
+    events
+  );
   applyDepartureExhaustion(
     draft,
     continuationUnitId,
@@ -499,9 +687,8 @@ function moveUnit(
     events
   );
   applyMinimumStrengthExhaustion(draft, continuationUnitId, unit, unitDefinition, events);
-  const phaseAdvanced = enterReinforcementIfNoActions(draft, terrains, units, events);
 
-  return succeed(draft, events, continuationUnitId && !phaseAdvanced
+  return succeed(draft, events, continuationUnitId
     && canContinueAction(draft, continuationUnitId, terrains, units) ? {
     continuation: {
       unitId: continuationUnitId,
@@ -542,9 +729,13 @@ function attackUnit(
 
   const movesIntoTarget = attackCapability.config?.movesIntoTarget !== false;
   const sourceTerrain = requireTerrain(terrains, sourceCell.terrainId);
+  if (movesIntoTarget && !getTerrainMovementRule(sourceTerrain).enabled) {
+    return fail(state, "unit-cannot-move", "当前地块不允许单位移动离开并推进占领。");
+  }
+  const powered = getPoweredUnitIds(state, terrains).has(attacker.id);
   const departureGarrison = movesIntoTarget
     && hasCellTrigger(state, sourceCell.id, "leave", CAPABILITY.departureGarrison, sourceTerrain)
-    ? getDepartureGarrison(sourceTerrain)
+    ? getDepartureGarrison(sourceTerrain, powered)
     : undefined;
   if (departureGarrison && attacker.strength <= departureGarrison.strength) {
     return fail(state, "insufficient-strength", "该地形需要留下 1 点留守游兵，至少需要 2 点才能离开。");
@@ -552,7 +743,6 @@ function attackUnit(
   if (departureGarrison && !units[departureGarrison.unitDefinitionId ?? attacker.definitionId]) {
     return fail(state, "invalid-unit-definition", "该地形配置的留守兵种不存在。");
   }
-  const powered = getPoweredUnitIds(state, terrains).has(attacker.id);
   if (!hasEnoughStrengthToAct(attacker, attackerDefinition, powered)) {
     return fail(state, "insufficient-strength", "通电兵点数不足，不能行动。");
   }
@@ -585,17 +775,26 @@ function attackUnit(
     const arrivingUnit = arrivedCell?.unitId ? draft.units[arrivedCell.unitId] : undefined;
     if (arrivingUnit && arrivingUnit.id === continuationUnitId && arrivingUnit.cellId === targetCell.id) {
       // Arrival reactions are resolved against the captured cell's current
-      // state: power may have changed because the capture connected this unit
-      // to a source, or the occupied stronghold itself may now be its source.
-      // The linked hostile-stronghold trigger is deliberately first and cannot
-      // be bypassed by becoming powered on arrival.
-      applyAdjacentHostileExhaustion(draft, arrivingUnit, terrains, events);
+      // state, after capture has updated occupancy and any powered connection.
+      const destinationTerrain = requireTerrain(terrains, targetCell.terrainId);
+      applyEntryExhaustion(draft, arrivingUnit.id, sourceTerrain, destinationTerrain, targetCell.id, events);
+      // An attack that advances off a terrain must resolve the same departure
+      // reaction as an ordinary move. In particular, leaving ocean for land
+      // exhausts the arriving roamer even if a captured stronghold powers it.
+      applyDepartureExhaustion(
+        draft,
+        arrivingUnit.id,
+        sourceCell.id,
+        sourceTerrain,
+        destinationTerrain,
+        events
+      );
       applyCaptureArrivalExhaustion(draft, arrivingUnit.id, attackerDefinition, terrains, events);
     }
   }
 
-  // Generic one-point exhaustion is deliberately after the stronghold-zone
-  // check so the zone rule remains the highest-priority reason for arrival.
+  // Native minimum-strength exhaustion is resolved here. Declarative spatial
+  // zone effects are applied by finalizeCommand before continuation is checked.
   applyMinimumStrengthExhaustion(draft, continuationUnitId, attacker, attackerDefinition, events);
 
   // Ranged/non-entering attacks have no terrain arrival reaction, so retain
@@ -614,9 +813,7 @@ function attackUnit(
       events.push({ type: "unit-exhausted", message: "游兵完成攻击，本回合失去行动力。" });
     }
   }
-  const phaseAdvanced = enterReinforcementIfNoActions(draft, terrains, units, events);
-
-  return succeed(draft, events, continuationUnitId && !phaseAdvanced
+  return succeed(draft, events, continuationUnitId
     && canContinueAction(draft, continuationUnitId, terrains, units) ? {
     continuation: {
       unitId: continuationUnitId,
@@ -628,8 +825,7 @@ function attackUnit(
 function reinforceUnit(
   state: GameState,
   command: Extract<GameCommand, { type: "reinforce-unit" }>,
-  terrains: TerrainCatalog,
-  units: UnitCatalog
+  terrains: TerrainCatalog
 ): CommandResult {
   const unit = state.units[command.unitId];
   if (!unit) return fail(state, "unknown-unit", "找不到要强化的单位。");
@@ -638,7 +834,7 @@ function reinforceUnit(
   if (!player || player.reinforcementPoints < 1) {
     return fail(state, "insufficient-points", "没有可用点数。");
   }
-  if (!getPoweredUnitIds(state, terrains).has(unit.id)) {
+  if (!getReinforceableUnitIds(state, terrains).has(unit.id)) {
     return fail(state, "unit-not-powered", "游兵不能投入点数；请先连接到据点。");
   }
 
@@ -649,7 +845,7 @@ function reinforceUnit(
     type: "unit-reinforced",
     message: `${player.displayName} 为单位投入了 1 点。`
   }];
-  advanceTurnIfNoReinforcementPoints(draft, terrains, units, events);
+  advanceTurnIfNoReinforcementPoints(draft, terrains, events);
   return succeed(draft, events);
 }
 
@@ -665,13 +861,13 @@ function endActionPhase(state: GameState): CommandResult {
   return succeed(draft, events);
 }
 
-function endReinforcementPhase(state: GameState, terrains: TerrainCatalog, units: UnitCatalog): CommandResult {
+function endReinforcementPhase(state: GameState, terrains: TerrainCatalog): CommandResult {
   const current = state.players[state.turn.currentPlayerId];
   if (!current) return fail(state, "not-current-player", "找不到当前行动玩家。");
 
   const draft = createDraft(state);
   const events: GameEvent[] = [{ type: "reinforcement-phase-ended", message: `${current.displayName} 结束了加点回合。` }];
-  startNextActionPhase(draft, terrains, units, events);
+  startNextActionPhase(draft, terrains, events);
   return succeed(draft, events);
 }
 
@@ -869,41 +1065,6 @@ function getCounterattackLimit(terrain: TerrainSpec, unit: UnitSpec): number {
   return getConfiguredMax(unit, UNIT_CAPABILITY.counterattackLimit, "maxPerActionPhase") ?? 1;
 }
 
-function applyAdjacentHostileExhaustion(
-  draft: Draft,
-  arrivingUnit: UnitState,
-  terrains: TerrainCatalog,
-  events: GameEvent[]
-): void {
-  const cell = draft.cells[arrivingUnit.cellId];
-  if (!cell) return;
-
-  // Maps loaded by core-content carry a precompiled inbound-link index, so a
-  // move reads only relationships attached to the arrival cell. The geometric
-  // fallback supports older snapshots and hand-built states which predate the
-  // index; it can be removed once those snapshots are no longer accepted.
-  const links = draft.state.cellTriggers?.[cell.id]?.enter
-    ?? getHexNeighbours(cell.coordinate, draft.state.board).map((neighbour) => ({
-      relatedCellId: toCellId(neighbour),
-      relationId: CAPABILITY.hostileExhaustion
-    }));
-  for (const link of links) {
-    if (link.relationId !== CAPABILITY.hostileExhaustion) continue;
-    if (!link.relatedCellId) continue;
-    const strongholdCell = draft.cells[link.relatedCellId];
-    const owner = strongholdCell?.unitId ? draft.units[strongholdCell.unitId] : undefined;
-    if (!strongholdCell || !owner || areSameTeam(draft.state, arrivingUnit.ownerId, owner.ownerId)) {
-      continue;
-    }
-    const terrain = requireTerrain(terrains, strongholdCell.terrainId);
-    if (!hasTerrainCapability(terrain, CAPABILITY.hostileExhaustion)) continue;
-
-    if (exhaustUnitForCurrentPhase(draft, arrivingUnit.id)) {
-      events.push({ type: "unit-exhausted", message: "单位进入敌方据点封锁区，本回合失去行动力。" });
-    }
-  }
-}
-
 /** A terrain may exhaust a unit when it leaves, independently of movement. */
 function applyDepartureExhaustion(
   draft: Draft,
@@ -917,10 +1078,31 @@ function applyDepartureExhaustion(
   if (!hasCellTrigger(draft.state, sourceCellId, "leave", CAPABILITY.departureExhaustion, sourceTerrain)) return;
   const capability = getTerrainCapability(sourceTerrain, CAPABILITY.departureExhaustion);
   if (!capability) return;
+  if (capability.config?.triggerMode === "terrain-transition" && sourceTerrain.id === destinationTerrain.id) return;
+  // Read old releases without changing their behaviour; new Mods use triggerMode.
   const destinationTerrainIdNot = capability.config?.destinationTerrainIdNot;
   if (typeof destinationTerrainIdNot === "string" && destinationTerrain.id === destinationTerrainIdNot) return;
   if (exhaustUnitForCurrentPhase(draft, unitId)) {
     events.push({ type: "unit-exhausted", message: "单位离开该地形，本回合失去行动力。" });
+  }
+}
+
+/** A terrain may exhaust a unit when it enters, optionally only from another terrain type. */
+function applyEntryExhaustion(
+  draft: Draft,
+  unitId: UnitId | undefined,
+  sourceTerrain: TerrainSpec,
+  destinationTerrain: TerrainSpec,
+  destinationCellId: CellId,
+  events: GameEvent[]
+): void {
+  if (!unitId || !draft.units[unitId]) return;
+  if (!hasCellTrigger(draft.state, destinationCellId, "enter", CAPABILITY.entryExhaustion, destinationTerrain)) return;
+  const capability = getTerrainCapability(destinationTerrain, CAPABILITY.entryExhaustion);
+  if (!capability) return;
+  if (capability.config?.triggerMode === "terrain-transition" && sourceTerrain.id === destinationTerrain.id) return;
+  if (exhaustUnitForCurrentPhase(draft, unitId)) {
+    events.push({ type: "unit-exhausted", message: "单位进入该地形，本回合失去行动力。" });
   }
 }
 
@@ -959,6 +1141,8 @@ function exhaustUnitForCurrentPhase(draft: Draft, unitId: UnitId): boolean {
 interface DepartureGarrison {
   /** The strength reserved in the terrain's source cell. */
   readonly strength: number;
+  /** 留兵触发前置条件；缺省时按旧定义解释为无条件留兵。 */
+  readonly requires: "occupied" | "powered-occupant";
   /** Optional explicit unit type for the resident; defaults to the departing type. */
   readonly unitDefinitionId?: string;
 }
@@ -968,14 +1152,20 @@ interface DepartureGarrison {
  * rule instead of a power rule: oil fields intentionally do not conduct or
  * supply electricity, yet can still keep a one-point roaming resident.
  */
-function getDepartureGarrison(terrain: TerrainSpec): DepartureGarrison | undefined {
+function getDepartureGarrison(terrain: TerrainSpec, departingUnitIsPowered: boolean): DepartureGarrison | undefined {
   const capability = getTerrainCapability(terrain, CAPABILITY.departureGarrison);
   const config = capability?.config;
   const strength = config?.strength;
   if (typeof strength !== "number" || !Number.isInteger(strength) || strength < 1) return undefined;
+  const configuredRequirement = config?.requires;
+  if (configuredRequirement !== undefined
+    && configuredRequirement !== "occupied" && configuredRequirement !== "powered-occupant") return undefined;
+  const requires = configuredRequirement ?? "occupied";
+  if (requires === "powered-occupant" && !departingUnitIsPowered) return undefined;
   const unitDefinitionId = config?.unitDefinitionId;
   return {
     strength,
+    requires,
     ...(typeof unitDefinitionId === "string" ? { unitDefinitionId } : {})
   };
 }
@@ -1034,36 +1224,44 @@ function leaveDepartureGarrison(
   }
 }
 
+/** Predict the points awarded to a player at the start of their next turn. */
+export function calculateReinforcementIncome(
+  state: GameState,
+  playerId: PlayerId,
+  terrains: TerrainCatalog
+): number {
+  const powered = getPoweredUnitIds(state, terrains);
+  let income = 0;
+  for (const cell of Object.values(state.cells)) {
+    if (!cell.unitId) continue;
+    const unit = state.units[cell.unitId];
+    if (!unit) continue;
+    if (unit.ownerId !== playerId) continue;
+    const terrain = requireTerrain(terrains, cell.terrainId);
+    const source = getMatchTerrainCapability(state, terrain, CAPABILITY.income);
+    if (!source?.config) continue;
+    const amount = source.config.amount;
+    const requires = source.config.requires;
+    const condition = source.config.condition;
+    const when = source.config.when;
+    // 旧版收益定义没有 when 字段时，沿用原来的“己方回合开始”时机。
+    if (typeof amount !== "number" || when !== undefined && when !== "owner-turn-start") continue;
+    if (requires !== undefined && requires !== "occupied" && requires !== "powered-occupant") continue;
+    if (requires === "powered-occupant" && !powered.has(unit.id)) continue;
+    if (condition !== undefined && (!isRecord(condition) || typeof condition.op !== "string"
+      || !matchesSpatialPredicate(state, terrains, cell.id, playerId, condition as unknown as SpatialPredicate, powered))) continue;
+    if (amount > 0) income += amount;
+  }
+  return income;
+}
+
 function grantReinforcementIncome(
   draft: Draft,
   player: PlayerState,
   terrains: TerrainCatalog,
-  units: UnitCatalog,
   events: GameEvent[]
 ): void {
-  const draftState = asDraftState(draft);
-  const powered = getPoweredUnitIds(draftState, terrains);
-  let income = 0;
-  for (const unit of Object.values(draft.units)) {
-    if (unit.ownerId !== player.id) continue;
-    const cell = draft.cells[unit.cellId];
-    if (!cell) continue;
-    const definition = units[unit.definitionId];
-    const poweredIncome = definition
-      ? getUnitCapability(definition, UNIT_CAPABILITY.poweredIncome)?.config?.amount
-      : undefined;
-    if (powered.has(unit.id) && typeof poweredIncome === "number" && poweredIncome > 0) {
-      income += poweredIncome;
-    }
-    const terrain = requireTerrain(terrains, cell.terrainId);
-    const source = getMatchTerrainCapability(draftState, terrain, CAPABILITY.income);
-    if (!source?.config) continue;
-    const amount = source.config.amount;
-    const requires = source.config.requires;
-    if (typeof amount !== "number") continue;
-    if (requires === "powered-occupant" && !powered.has(unit.id)) continue;
-    income += amount;
-  }
+  const income = calculateReinforcementIncome(asDraftState(draft), player.id, terrains);
   if (income > 0) {
     draft.players[player.id] = {
       ...(draft.players[player.id] ?? player),
@@ -1089,7 +1287,7 @@ function enterReinforcementIfNoActions(
   events: GameEvent[]
 ): boolean {
   if (draft.turn.phase !== "action") return false;
-  if (getActionableUnitIds(asDraftState(draft), terrains, units).size > 0) return false;
+  if (hasAnyActionableUnit(asDraftState(draft), terrains, units)) return false;
   const current = draft.players[draft.turn.currentPlayerId];
   events.push({
     type: "action-phase-ended",
@@ -1097,6 +1295,16 @@ function enterReinforcementIfNoActions(
   });
   enterReinforcementPhase(draft, events);
   return true;
+}
+
+/** Short-circuit phase checks; callers only need to know whether one action exists. */
+function hasAnyActionableUnit(state: GameState, terrains: TerrainCatalog, units: UnitCatalog): boolean {
+  if (state.turn.phase !== "action") return false;
+  for (const unit of Object.values(state.units)) {
+    if (unit.ownerId === state.turn.currentPlayerId
+      && getLegalActionDestinationIds(state, unit.id, terrains, units).length > 0) return true;
+  }
+  return false;
 }
 
 /** A continuation is emitted only when its concrete result unit can act again. */
@@ -1113,13 +1321,12 @@ function canContinueAction(
 function advanceTurnIfNoReinforcementPoints(
   draft: Draft,
   terrains: TerrainCatalog,
-  units: UnitCatalog,
   events: GameEvent[]
 ): boolean {
   const current = draft.players[draft.turn.currentPlayerId];
   if (!current || current.reinforcementPoints > 0) return false;
   events.push({ type: "reinforcement-phase-ended", message: `${current.displayName} 已用完点数，自动结束加点回合。` });
-  startNextActionPhase(draft, terrains, units, events);
+  startNextActionPhase(draft, terrains, events);
   return true;
 }
 
@@ -1127,7 +1334,6 @@ function advanceTurnIfNoReinforcementPoints(
 function startNextActionPhase(
   draft: Draft,
   terrains: TerrainCatalog,
-  units: UnitCatalog,
   events: GameEvent[]
 ): void {
   const current = draft.players[draft.turn.currentPlayerId];
@@ -1146,7 +1352,7 @@ function startNextActionPhase(
     exhaustedUnitIds: [],
     counterattacksUsed: {}
   };
-  grantReinforcementIncome(draft, next, terrains, units, events);
+  grantReinforcementIncome(draft, next, terrains, events);
   events.push({ type: "turn-started", message: `现在轮到 ${next.displayName} 的行动回合。` });
 }
 
@@ -1170,9 +1376,21 @@ function finalizeCommand(
   // Native transitions (move/attack/reinforce) are resolved first; data-only
   // Mod rules then observe that committed result and may apply deterministic
   // follow-up effects before power-loss and victory checks run.
-  const ruledState = applyModRules(previousState, result.state, command, terrains);
+  let ruledState: GameState;
+  try {
+    ruledState = applyModRules(previousState, result.state, command, terrains, false,
+      (current, unitId) => getPoweredUnitIds(current, terrains).has(unitId));
+  } catch {
+    return fail(previousState, "mod-rule-error", "地块 Mod 规则计算失败，操作未生效。请检查地图依赖的 Mod 版本。");
+  }
   const draft = createDraft(ruledState);
   const events = [...result.events];
+  const alreadyReportedExhaustion = new Set(result.state.turn.exhaustedUnitIds);
+  for (const unitId of ruledState.turn.exhaustedUnitIds) {
+    if (!alreadyReportedExhaustion.has(unitId) && ruledState.units[unitId]) {
+      events.push({ type: "unit-exhausted", message: "单位触发地块规则，本回合失去行动力。" });
+    }
+  }
   applyPowerLossAfterTransition(previousState, draft, terrains, events);
   resolveMatchConditions(draft, terrains, matchConditions, events);
 

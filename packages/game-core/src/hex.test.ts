@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   fromCellId,
   getHexNeighbour,
+  getHexDistances,
+  getHexDistance,
   getHexNeighbours,
   isWithinHexBounds,
   toCellId
@@ -38,6 +40,18 @@ describe("odd-row hex grid", () => {
       { column: 1, row: 1 },
       { column: 0, row: 1 }
     ]);
+  });
+
+  it("computes one bounded distance map for a unit's action range", () => {
+    const bounds = { columns: 7, rows: 7 };
+    const distances = getHexDistances({ column: 3, row: 3 }, bounds, 2);
+
+    expect(distances.get(toCellId({ column: 3, row: 3 }))).toBe(0);
+    expect(distances.get(toCellId({ column: 4, row: 3 }))).toBe(1);
+    expect(distances.get(toCellId({ column: 5, row: 3 }))).toBe(2);
+    expect(getHexDistance({ column: 3, row: 3 }, { column: 5, row: 3 }, bounds)).toBe(2);
+    expect(distances.has(toCellId({ column: 6, row: 3 }))).toBe(false);
+    expect([...distances.values()].every((distance) => distance <= 2)).toBe(true);
   });
 
   it("checks bounds and serializes stable cell identifiers", () => {

@@ -12,7 +12,7 @@ Environment=NODE_ENV=production
 Environment=PORT=2571
 Environment=HOST=127.0.0.1
 Environment=WORKSHOP_ENABLED=1
-Environment=WORKSHOP_PUBLISH_ENABLED=0
+Environment=WORKSHOP_PUBLISH_ENABLED=1
 Environment=PATH=/opt/numeral-lord-runtime/current/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 ExecStart=/opt/numeral-lord-runtime/current/bin/node --import tsx src/index.ts
 Restart=on-failure

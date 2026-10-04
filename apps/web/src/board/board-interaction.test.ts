@@ -1,10 +1,20 @@
 import { describe, expect, it } from "vitest";
 import { ref } from "vue";
 import { DEFAULT_MAP_CODE, createMatchFromMapCode } from "@numeral-lord/core-content";
-import { getLegalActionDestinationIds } from "@numeral-lord/game-core";
+import { getLegalActionDestinationIds, type CellId } from "@numeral-lord/game-core";
 import { coreUnitCatalog } from "@numeral-lord/core-content";
-import { installedMapCatalogs, installedTerrainCatalog } from "./installed-content.js";
-import { useBoardInteraction } from "./board-interaction.js";
+import { installedMapCatalogs, installedTerrainCatalog } from "../content/installed-content.js";
+import { getMovementHintCellIds, useBoardInteraction } from "./board-interaction.js";
+
+describe("board action highlights", () => {
+  it("does not draw the cyan movement outline over red/white combat target frames", () => {
+    const legal = ["1,0", "2,0", "3,0", "4,0"] as CellId[];
+    const counterattack = ["2,0"] as CellId[];
+    const noCounterattack = ["3,0"] as CellId[];
+
+    expect(getMovementHintCellIds(legal, counterattack, noCounterattack)).toEqual(["1,0", "4,0"]);
+  });
+});
 
 describe("private board interaction state", () => {
   it("derives movement and counterattack previews only from the locally selected unit", () => {

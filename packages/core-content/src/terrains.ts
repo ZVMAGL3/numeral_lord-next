@@ -33,6 +33,12 @@ const occupiedPowerSource: CapabilityBinding = {
   id: "core/power-source"
 };
 
+/** 平原和据点在己方回合开始时，为被占领且通电的地块提供 1 点收益。 */
+const poweredTerrainIncome: CapabilityBinding = {
+  id: "core/income-source",
+  config: { amount: 1, requires: "powered-occupant", when: "owner-turn-start" }
+};
+
 /**
  * A survival anchor is deliberately distinct from power production. A map may
  * put a power source on a generator without making it a "lose this and die"
@@ -57,12 +63,15 @@ const exhaustUnpoweredCapturingUnit: CapabilityBinding = {
   id: "core/exhaust-unpowered-after-capture"
 };
 
+// 平原和沙漠共享驻兵、导电与战斗行为；收益由各地形单独声明。
+const plainCapabilities = [occupiable, powerConductor, oneCounterattack, exhaustUnpoweredCapturingUnit] as const;
+
 /** 离开海洋进入陆地后，本次行动的单位本回合不能再次行动。 */
 const oceanDepartureExhaustion: CapabilityBinding = {
   id: "core/exhaust-on-departure",
   config: {
-    // 在海洋内部移动不触发；进入任意非海洋地形时触发。
-    destinationTerrainIdNot: "core/ocean"
+    // 只在离开海洋地形时触发；海洋格之间移动不触发。
+    triggerMode: "terrain-transition"
   }
 };
 
@@ -90,10 +99,22 @@ export const coreTerrainMod = defineMod({
       defaultConfig: {}
     },
     {
+      // 移动默认沿用兵种范围；仅绑定中的 expression 存在时使用自定义目标。
+      id: "core/terrain-movement",
+      target: "terrain",
+      defaultConfig: { enabled: true }
+    },
+    {
       // 可导电：本身不生产电，只能作为电力网络中的通路。
       id: "core/power-conductor",
       target: "terrain",
       defaultConfig: {}
+    },
+    {
+      // 地块收益由占领关系、通电前置条件和结算时机共同决定。
+      id: "core/income-source",
+      target: "terrain",
+      defaultConfig: { amount: 0, requires: "occupied", when: "owner-turn-start" }
     },
     {
       // 防守方在这块地皮上每个进攻回合可反击的次数。0 表示不能反击，
@@ -114,10 +135,16 @@ export const coreTerrainMod = defineMod({
       defaultConfig: {}
     },
     {
+      // 进入地形后的失活反应；触发范围由 binding 的 triggerMode 选择。
+      id: "core/exhaust-on-entry",
+      target: "terrain",
+      defaultConfig: { triggerMode: "each-cell" }
+    },
+    {
       // 离开触发器：由地形声明，不绑定某个兵种。
       id: "core/exhaust-on-departure",
       target: "terrain",
-      defaultConfig: { destinationTerrainIdNot: "core/ocean" }
+      defaultConfig: { triggerMode: "each-cell" }
     },
     {
       // 封锁区：据点占据时，敌方单位走入其相邻格后会失去当前回合行动力。
@@ -133,53 +160,34 @@ export const coreTerrainMod = defineMod({
       defaultConfig: {}
     },
   ],
-
-  // 每项都是独立地形定义；数组顺序不表示继承关系。
-  terrains: [
-    {
-      // 用于地图数据和程序判断的 id。
-      id: "core/void",
-      // 用于 UI 显示的中文名。
-      displayName: "虚无",
-      // 不带 occupiable，因此不能进入；其他游戏能力也一律没有。
-      capabilities: []
-    },
-    {
-      id: "core/mountain",
-      displayName: "山地",
-      // 规则与虚无相同，只预留不同美术表现。
-      capabilities: []
-    },
-    {
-      id: "core/ocean",
-      displayName: "海洋",
-      // 可驻兵，但没有 power-conductor，所以其中单位默认保持游兵。
-      capabilities: [occupiable, oceanDepartureExhaustion, oneCounterattack, exhaustUnpoweredCapturingUnit]
-    },
-    {
-      id: "core/plain",
-      displayName: "平原",
-      // 可驻兵且可传电；平原本身不产点。
-      capabilities: [occupiable, powerConductor, oneCounterattack, exhaustUnpoweredCapturingUnit]
-    },
-    {
-      id: "core/stronghold",
-      displayName: "据点",
-      capabilities: [
-        // 下面四项是组合关系，彼此不继承：
-        // 可驻兵、可传电、被占据时供电、相邻敌方单位耗尽。
-        // 通电兵的收益属于单位能力 `core/powered-income`，不属于据点。
-        occupiable,
-        powerConductor,
-        occupiedPowerSource,
-        // 这是胜负锚点，不等同于供电能力；地图可单独选择胜负模块。
-        survivalAnchor,
-        adjacentHostileExhaustion,
-        exhaustUnpoweredCapturingUnit,
-        strongholdCounterattackLimit
+  // Built-in stronghold suppression is expressed through the same spatial
+  // pattern and transition rule available to data-only Mods, rather than as a
+  // special engine movement branch.
+  spatialPatterns: [{
+    id: "core-terrain/hostile-stronghold-zone",
+    starts: {
+      op: "all",
+      items: [
+        { op: "terrain-has", capabilityId: "core/adjacent-hostile-exhaustion" },
+        { op: "unit-team-is", team: "other" }
       ]
     },
-  ],
+    expression: {
+      op: "repeat",
+      min: 1,
+      max: 1,
+      item: { op: "step", relation: "hex-neighbor", where: { op: "cell-exists" } }
+    },
+    result: { entity: "cell" }
+  }],
+  rules: [{
+    id: "core-terrain/hostile-stronghold-exhaustion",
+    trigger: "unit-enter",
+    target: { scope: "trigger-unit" },
+    conditions: [{ op: "cell-in-pattern", patternId: "core-terrain/hostile-stronghold-zone" }],
+    effects: [{ type: "exhaust-unit" }]
+  }],
+
   // 首批地皮包暂不定义新兵种；兵种在独立内容包中加入。
   units: [],
   // 具体命令规则将在阶段 A/B 实现后从这里注册。
@@ -189,9 +197,23 @@ export const coreTerrainMod = defineMod({
 });
 
 /**
- * Runtime lookup table consumed by game-core. The same terrain declarations
- * remain available through coreTerrainMod to map editors and future Mod tools.
+ * Runtime lookup table consumed by game-core. Core terrain types are engine
+ * catalog entries, not a multi-terrain Mod package.
  */
-export const coreTerrainCatalog = Object.fromEntries(
-  coreTerrainMod.terrains.map((terrain) => [terrain.id, terrain])
-) as TerrainCatalog;
+export const coreTerrainCatalog: TerrainCatalog = {
+  "core/void": { id: "core/void", displayName: "虚无", capabilities: [] },
+  "core/mountain": { id: "core/mountain", displayName: "山地", capabilities: [] },
+  "core/ocean": {
+    id: "core/ocean", displayName: "海洋",
+    capabilities: [occupiable, oceanDepartureExhaustion, oneCounterattack, exhaustUnpoweredCapturingUnit]
+  },
+  "core/plain": {
+    id: "core/plain", displayName: "平原",
+    capabilities: [...plainCapabilities, poweredTerrainIncome]
+  },
+  "core/stronghold": {
+    id: "core/stronghold", displayName: "据点",
+    capabilities: [occupiable, powerConductor, occupiedPowerSource, poweredTerrainIncome, survivalAnchor,
+      adjacentHostileExhaustion, exhaustUnpoweredCapturingUnit, strongholdCounterattackLimit]
+  }
+};

@@ -1,4 +1,4 @@
-import { DEFAULT_MAP_CODE } from "@numeral-lord/core-content";
+import { TEST_MAP_CODE } from "../../../packages/core-content/test-fixtures/maps.js";
 import type { TerrainModDefinition } from "@numeral-lord/content-schema";
 import { decayTerrainMod } from "@numeral-lord/decay-terrain-mod";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -505,7 +505,7 @@ describe("workshop persistence and data-only Mod objects", () => {
   });
 
   it("publishes a JSON map without installing its required terrain Mod", async () => {
-    const published = await store.publishMap({ code: DEFAULT_MAP_CODE, description: "内置地形示例" }, "地图作者");
+    const published = await store.publishMap({ code: TEST_MAP_CODE, description: "内置地形示例" }, "地图作者");
     expect(published.kind).toBe("map");
 
     const catalog = await store.list();
@@ -528,13 +528,13 @@ describe("workshop persistence and data-only Mod objects", () => {
   });
 
   it("imports the legacy JSON once and persists the same portable records in local SQLite", async () => {
-    await store.publishMap({ code: DEFAULT_MAP_CODE, description: "旧 JSON 地图" }, "旧作者");
+    await store.publishMap({ code: TEST_MAP_CODE, description: "旧 JSON 地图" }, "旧作者");
     const sqlitePath = join(dataDirectory, "local.sqlite");
     const sqlite = new SqliteWorkshopStore(sqlitePath, dataDirectory);
     try {
       const firstRead = await sqlite.list();
       expect(firstRead.maps).toMatchObject([{ mapId: "1001", name: "昏晓", authorName: "旧作者" }]);
-      const customCode = JSON.stringify({ ...(JSON.parse(DEFAULT_MAP_CODE) as object), id: "sqlite-custom-map" });
+      const customCode = JSON.stringify({ ...(JSON.parse(TEST_MAP_CODE) as object), id: "sqlite-custom-map" });
       await sqlite.publishMap({ code: customCode, description: "本地数据库地图" }, "本地玩家");
     } finally {
       sqlite.close();
@@ -543,7 +543,7 @@ describe("workshop persistence and data-only Mod objects", () => {
     const reopened = new SqliteWorkshopStore(sqlitePath, dataDirectory);
     try {
       expect((await reopened.list()).maps.map((map) => map.name)).toEqual(["昏晓", "昏晓"]);
-      await expect(reopened.publishMap({ code: DEFAULT_MAP_CODE, description: "重复" }, "其他作者"))
+      await expect(reopened.publishMap({ code: TEST_MAP_CODE, description: "重复" }, "其他作者"))
         .rejects.toThrow(/已经发布/);
     } finally {
       reopened.close();
@@ -706,8 +706,8 @@ describe("workshop persistence and data-only Mod objects", () => {
   });
 
   it("rejects duplicate, oversized and invalid capability objects", async () => {
-    await store.publishMap({ code: DEFAULT_MAP_CODE, description: "" }, "A");
-    await expect(store.publishMap({ code: DEFAULT_MAP_CODE, description: "" }, "B"))
+    await store.publishMap({ code: TEST_MAP_CODE, description: "" }, "A");
+    await expect(store.publishMap({ code: TEST_MAP_CODE, description: "" }, "B"))
       .rejects.toThrow(/已经发布/);
     await expect(store.publishMap({ code: "x".repeat(65_537), description: "" }, "A"))
       .rejects.toBeInstanceOf(WorkshopInputError);
@@ -756,7 +756,7 @@ describe("workshop persistence and data-only Mod objects", () => {
 
   it("serializes concurrent publication writes without losing entries", async () => {
     const codes = Array.from({ length: 5 }, (_, index) => {
-      const map = JSON.parse(DEFAULT_MAP_CODE) as Record<string, unknown>;
+      const map = JSON.parse(TEST_MAP_CODE) as Record<string, unknown>;
       map.id = `parallel-${index}`;
       return JSON.stringify(map);
     });

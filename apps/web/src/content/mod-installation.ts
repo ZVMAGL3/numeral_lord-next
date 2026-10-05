@@ -2,7 +2,9 @@ import type { TerrainModDefinition } from "@numeral-lord/content-schema";
 import { hashModContent, modContentIdentity } from "@numeral-lord/game-sdk";
 
 const DATABASE_NAME = "numeral-lord-content";
-const DATABASE_VERSION = 5;
+// Version 6 removes app-bundled / stale Mod packages from every browser once.
+// User subscriptions remain intact so the external Workshop can reinstall them.
+const DATABASE_VERSION = 6;
 const STORE_NAME = "installed-terrain-mods";
 const SUBSCRIPTION_STORE = "subscribed-terrain-mods";
 const RELEASE_STORE = "terrain-mod-releases";
@@ -44,7 +46,7 @@ export function cloneTerrainModDefinition(definition: TerrainModDefinition): Ter
 function openDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
-    request.onupgradeneeded = () => {
+    request.onupgradeneeded = (event) => {
       const database = request.result;
       if (!database.objectStoreNames.contains(STORE_NAME)) {
         database.createObjectStore(STORE_NAME, { keyPath: "id" });
@@ -52,6 +54,13 @@ function openDatabase(): Promise<IDBDatabase> {
       if (!database.objectStoreNames.contains(SUBSCRIPTION_STORE)) database.createObjectStore(SUBSCRIPTION_STORE, { keyPath: "id" });
       if (!database.objectStoreNames.contains(RELEASE_STORE)) database.createObjectStore(RELEASE_STORE, { keyPath: "releaseKey" });
       if (database.objectStoreNames.contains("content-meta")) database.deleteObjectStore("content-meta");
+      // Force one clean download from the Workshop after removing bundled Mods.
+      // Subscriptions are intentionally retained; only installed packages and
+      // room-release caches are cleared so they cannot masquerade as built-ins.
+      if (event.oldVersion < 6 && request.transaction) {
+        request.transaction.objectStore(STORE_NAME).clear();
+        request.transaction.objectStore(RELEASE_STORE).clear();
+      }
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("IndexedDB 打开失败。"));

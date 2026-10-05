@@ -13,7 +13,6 @@ import type {
   UnitState
 } from "@numeral-lord/game-core";
 import { coreMatchConditionCatalog } from "./match-conditions.js";
-import { legacyDemoMap } from "./legacy-demo-map.js";
 import { coreTerrainCatalog, coreTerrainMod } from "./terrains.js";
 import { coreUnitCatalog } from "./units.js";
 import { resolveModSettings, validateModSettings, type ModCatalog } from "./mod-settings.js";
@@ -89,7 +88,8 @@ export interface MapMatchOptions extends MapCatalogs {
 
 export const DEFAULT_MAP_TERRAIN_CATALOG: TerrainCatalog = coreTerrainCatalog;
 
-const DEFAULT_LEGEND: Readonly<Record<string, string>> = {
+/** Decode glyphs in old unversioned maps; this mapping never installs a Mod. */
+const LEGACY_MAP_TERRAIN_LEGEND: Readonly<Record<string, string>> = {
   M: "core/plain",
   P: "core/mountain",
   S: "core/stronghold",
@@ -104,30 +104,10 @@ const MAX_CELLS = 4096;
 const MAX_PLAYERS = 64;
 const DEFAULT_PLAYER_COLOR_IDS = ["legacy-1", "legacy-2", "legacy-3", "legacy-4", "legacy-5", "legacy-6", "legacy-7", "legacy-8", "legacy-9"] as const;
 
-/** The old 1001 map is the first built-in map, 昏晓. */
-export const DEFAULT_MAP_DEFINITION: MapDefinition = {
-  version: 1,
-  id: String(legacyDemoMap.id),
-  name: "昏晓",
-  columns: legacyDemoMap.columns,
-  terrain: legacyDemoMap.terrain,
-  terrainLegend: DEFAULT_LEGEND,
-  requiredTerrainModIds: ["mod-oil-field"],
-  players: 2,
-  soldiers: legacyDemoMap.soldiers.map(([index, legacySeat, strength]) => [index, legacySeat + 1, strength]),
-  teams: [1, 2],
-  matchConditionIds: DEFAULT_CONDITIONS
-};
-
-/** Canonical shareable map code. It is ordinary JSON for easy inspection. */
-// The example deliberately references an optional Mod. Exporting its JSON must
-// not implicitly install that Mod; callers pass installed catalogs to load it.
-export const DEFAULT_MAP_CODE = JSON.stringify(DEFAULT_MAP_DEFINITION);
-
 /**
  * Decode and validate a map before adding it to the local library or room.
  * Unknown terrain/Mod and victory-condition ids fail here, not during play.
- * The unversioned old `legacyDemoMap` object is also accepted and upgraded.
+ * Legacy unversioned map objects are also accepted and upgraded.
  */
 export function parseMapCode(raw: string, catalogs: MapCatalogs = {}): MapDefinition {
   if (typeof raw !== "string" || raw.length === 0 || raw.length > MAX_MAP_CODE_LENGTH) {
@@ -487,7 +467,7 @@ function upgradeLegacyMap(input: Record<string, unknown>): Record<string, unknow
     name: typeof input.name === "string" ? input.name : `地图 ${String(input.id ?? "legacy")}`,
     columns: input.columns,
     terrain: input.terrain,
-    terrainLegend: DEFAULT_LEGEND,
+    terrainLegend: LEGACY_MAP_TERRAIN_LEGEND,
     players,
     soldiers: input.soldiers.map((soldier) => {
       if (!Array.isArray(soldier)) return soldier;

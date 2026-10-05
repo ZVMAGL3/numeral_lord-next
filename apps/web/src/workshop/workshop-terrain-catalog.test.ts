@@ -54,6 +54,15 @@ describe("workshop terrain catalog", () => {
     )).toEqual([]);
   });
 
+  it("reinstalls a subscribed Mod after its local package cache is cleared", () => {
+    const latest = [{ id: "workshop-oil-field", modId: "mod-oil-field", version: "0.1.0" }];
+    expect(terrainModUpdateCandidates(
+      latest,
+      [{ id: "mod-oil-field", installedVersion: "0.1.0" }],
+      []
+    )).toEqual([{ id: "mod-oil-field", entry: latest[0] }]);
+  });
+
   it("checks only subscribed Mod updates required by the open map", () => {
     const latest = [
       { id: "oil-v2", modId: "mod-oil-field", version: "0.1.1" },

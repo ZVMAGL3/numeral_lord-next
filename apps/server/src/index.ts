@@ -5,8 +5,7 @@ import {
   applyIntent,
   getLegalIntents
 } from "@numeral-lord/game-core/node";
-import { DEFAULT_MAP_CODE, coreTerrainCatalog, parseMapCode, serializeMapCode, validateModSettings } from "@numeral-lord/core-content";
-import { oilFieldMod, oilFieldTerrainCatalog } from "@numeral-lord/oil-field-mod";
+import { coreTerrainCatalog, parseMapCode, serializeMapCode, validateModSettings } from "@numeral-lord/core-content";
 import type {
   GameIntent,
   GameState,
@@ -35,13 +34,11 @@ import {
 } from "./workshop.js";
 import { defaultWorkshopDataDirectory, getTerrainAssetContentType, workshopTerrainAssetDirectory } from "./workshop-assets.js";
 
-/** Server-side schemas validate map and Mod settings; this does not install Mods on clients. */
-const installedMapCatalogs = {
-  terrains: { ...coreTerrainCatalog, ...oilFieldTerrainCatalog },
-  terrainModIds: { [oilFieldMod.terrain.id]: oilFieldMod.id },
-  mods: { [oilFieldMod.id]: oilFieldMod },
-  // The relay transports maps/mod settings but does not run a client's Mod
-  // code. The owning clients validate custom definitions before play.
+/** The relay validates map structure but never installs or executes terrain Mods. */
+const relayMapCatalogs = {
+  terrains: coreTerrainCatalog,
+  // Unknown Mod IDs/settings may be transported safely; clients that actually
+  // start a match must have the exact installed releases selected by the host.
   allowUnknownTerrainMods: true
 };
 
@@ -99,9 +96,9 @@ export class PvpRelayRoom extends RelayRoom {
   private readonly members = new Map<string, MutableLobbyMember>();
   private readonly lastRoomSyncAtBySession = new Map<string, number>();
   private phase: LobbyRoomState["phase"] = "lobby";
-  private mapPlayerCount = 2;
-  private mapCode = DEFAULT_MAP_CODE;
-  private mapName = "昏晓";
+  private mapPlayerCount = 0;
+  private mapCode = "";
+  private mapName = "";
   private requiredTerrainModIds: readonly string[] = [];
   private effectiveTerrainModReleases: readonly ModContentLock[] = [];
   private roomModSettings: LobbyModSettings = {};
@@ -115,10 +112,12 @@ export class PvpRelayRoom extends RelayRoom {
   private matchStartPayload: MatchStartPayload | undefined;
 
   override onCreate(options: RoomCreateOptions): void {
-    const initialMapCode = options.mapCode ?? DEFAULT_MAP_CODE;
-    const initialMap = parseMapCode(initialMapCode, installedMapCatalogs);
+    if (typeof options.mapCode !== "string" || options.mapCode.trim() === "") {
+      throw new Error("创建房间必须明确提供地图码。");
+    }
+    const initialMap = parseMapCode(options.mapCode, relayMapCatalogs);
     this.roomCreationMetadata = isRecord(options.metadata) ? options.metadata : {};
-    this.mapCode = serializeMapCode(initialMap, installedMapCatalogs);
+    this.mapCode = serializeMapCode(initialMap, relayMapCatalogs);
     this.mapName = initialMap.name;
     this.mapPlayerCount = initialMap.players;
     this.requiredTerrainModIds = initialMap.requiredTerrainModIds;
@@ -765,12 +764,12 @@ export class PvpRelayRoom extends RelayRoom {
     }
     let selectedMap: ReturnType<typeof parseMapCode>;
     try {
-      selectedMap = parseMapCode(requestedCode, installedMapCatalogs);
+      selectedMap = parseMapCode(requestedCode, relayMapCatalogs);
     } catch {
       this.sendError(client, "地图码无法读取，请检查内容后重试。 ");
       return;
     }
-    const canonicalCode = serializeMapCode(selectedMap, installedMapCatalogs);
+    const canonicalCode = serializeMapCode(selectedMap, relayMapCatalogs);
     if (canonicalCode === this.mapCode) return;
 
     this.mapCode = canonicalCode;
@@ -804,13 +803,13 @@ export class PvpRelayRoom extends RelayRoom {
 
   private updateModSettings(client: Client, rawSettings: unknown): void {
     try {
-      // The message replaces the entire room override. Known Mod settings are
-      // schema-validated here; unknown Mod objects receive only safe JSON
-      // values because the relay forwards data and never executes their code.
+      // The message replaces the entire room override. This relay has no
+      // bundled Mod schemas, so it checks declared IDs and safe JSON values;
+      // each client validates settings against its installed release.
       this.roomModSettings = validateModSettings(
         rawSettings,
         this.requiredTerrainModIds,
-        installedMapCatalogs.mods,
+        undefined,
         true
       ) ?? {};
     } catch (error) {

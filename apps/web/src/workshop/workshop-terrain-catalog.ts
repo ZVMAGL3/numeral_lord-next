@@ -69,8 +69,11 @@ export function terrainModUpdateCandidates<T extends VersionedTerrainMod>(
 
   return [...subscriptionsById.keys()].flatMap((id) => {
     const entry = latestByModId.get(id);
-    const installedVersion = installedVersions.get(id) ?? subscriptionsById.get(id)?.installedVersion;
-    return entry && installedVersion && compareModVersions(entry.version, installedVersion) > 0
+    const localInstalledVersion = installedVersions.get(id);
+    const subscribedVersion = subscriptionsById.get(id)?.installedVersion;
+    const needsReinstall = subscribedVersion !== undefined && localInstalledVersion === undefined;
+    const previousVersion = localInstalledVersion ?? subscribedVersion;
+    return entry && (needsReinstall || (previousVersion !== undefined && compareModVersions(entry.version, previousVersion) > 0))
       ? [{ id, entry }]
       : [];
   });

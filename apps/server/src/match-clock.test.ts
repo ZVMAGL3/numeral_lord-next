@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_MAP_CODE, coreTerrainCatalog, createMatchFromMapCode } from "@numeral-lord/core-content";
+import { coreTerrainCatalog, createMatchFromMapCode } from "@numeral-lord/core-content";
+import { TEST_MAP_CODE } from "../../../packages/core-content/test-fixtures/maps.js";
 import { oilFieldMod, oilFieldTerrainCatalog } from "@numeral-lord/oil-field-mod";
 import type { GameState, LobbySettings, PlayerId } from "@numeral-lord/game-core/node";
 import {
@@ -17,7 +18,7 @@ const settings: LobbySettings = {
   matchTimeMinutes: 30,
   randomizePositions: false
 };
-const initial = createMatchFromMapCode(DEFAULT_MAP_CODE, {
+const initial = createMatchFromMapCode(TEST_MAP_CODE, {
   terrains: { ...coreTerrainCatalog, ...oilFieldTerrainCatalog },
   terrainModIds: { [oilFieldMod.terrain.id]: oilFieldMod.id }
 });

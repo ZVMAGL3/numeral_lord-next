@@ -1,10 +1,22 @@
 import { describe, expect, it } from "vitest";
 import { ref } from "vue";
-import { DEFAULT_MAP_CODE, createMatchFromMapCode } from "@numeral-lord/core-content";
+import { coreTerrainCatalog, createMatchFromMapCode, serializeMapCode } from "@numeral-lord/core-content";
+import { TEST_MAP_DEFINITION } from "../../../../packages/core-content/test-fixtures/maps.js";
 import { getLegalActionDestinationIds, type CellId } from "@numeral-lord/game-core";
 import { coreUnitCatalog } from "@numeral-lord/core-content";
-import { installedMapCatalogs, installedTerrainCatalog } from "../content/installed-content.js";
+import { installedTerrainCatalog } from "../content/installed-content.js";
 import { getMovementHintCellIds, useBoardInteraction } from "./board-interaction.js";
+
+const coreTestTerrainLegend = { ...TEST_MAP_DEFINITION.terrainLegend };
+delete coreTestTerrainLegend.F;
+const coreTestMapCatalogs = { terrains: coreTerrainCatalog };
+const coreTestMapCode = serializeMapCode({
+  ...TEST_MAP_DEFINITION,
+  id: "core-only-interaction-test",
+  terrain: TEST_MAP_DEFINITION.terrain.replaceAll("F", "M"),
+  terrainLegend: coreTestTerrainLegend,
+  requiredTerrainModIds: []
+}, coreTestMapCatalogs);
 
 describe("board action highlights", () => {
   it("does not draw the cyan movement outline over red/white combat target frames", () => {
@@ -18,7 +30,7 @@ describe("board action highlights", () => {
 
 describe("private board interaction state", () => {
   it("derives movement and counterattack previews only from the locally selected unit", () => {
-    const game = ref(createMatchFromMapCode(DEFAULT_MAP_CODE, installedMapCatalogs));
+    const game = ref(createMatchFromMapCode(coreTestMapCode, coreTestMapCatalogs));
     const attacker = Object.values(game.value.units).find((unit) => unit.ownerId === game.value.turn.currentPlayerId
       && getLegalActionDestinationIds(game.value, unit.id, installedTerrainCatalog, coreUnitCatalog).length > 0);
     expect(attacker).toBeDefined();
@@ -49,7 +61,7 @@ describe("private board interaction state", () => {
   });
 
   it("does not continue a unit exhausted by the authoritative board update", () => {
-    const game = ref(createMatchFromMapCode(DEFAULT_MAP_CODE, installedMapCatalogs));
+    const game = ref(createMatchFromMapCode(coreTestMapCode, coreTestMapCatalogs));
     const interaction = useBoardInteraction(() => game.value, installedTerrainCatalog, coreUnitCatalog);
     const unit = Object.values(game.value.units).find((candidate) => candidate.ownerId === game.value.turn.currentPlayerId
       && getLegalActionDestinationIds(game.value, candidate.id, installedTerrainCatalog, coreUnitCatalog).length > 0);

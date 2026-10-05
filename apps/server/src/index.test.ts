@@ -1,7 +1,8 @@
 import { getMessageBytes, Protocol, type Client, type MessageContext } from "colyseus";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LobbyRoomState, MatchStartPayload } from "@numeral-lord/game-core/node";
-import { DEFAULT_MAP_CODE, DEFAULT_MAP_DEFINITION, coreTerrainCatalog, createMatchFromMapCode, serializeMapCode } from "@numeral-lord/core-content";
+import { coreTerrainCatalog, createMatchFromMapCode, serializeMapCode } from "@numeral-lord/core-content";
+import { TEST_MAP_CODE, TEST_MAP_DEFINITION } from "../../../packages/core-content/test-fixtures/maps.js";
 import { oilFieldMod, oilFieldTerrainCatalog } from "@numeral-lord/oil-field-mod";
 import { hashModContent, modContentIdentity } from "@numeral-lord/game-sdk";
 import { MAX_CLIENT_MESSAGE_BYTES, PvpRelayRoom, createGameServer, startServer } from "./index.js";
@@ -122,9 +123,9 @@ function createRoom(mapPlayerCount: number): TestPvpRelayRoom {
 }
 
 function mapCodeForSeats(seats: number): string {
-  if (seats === DEFAULT_MAP_DEFINITION.players) return DEFAULT_MAP_CODE;
+  if (seats === TEST_MAP_DEFINITION.players) return TEST_MAP_CODE;
   return serializeMapCode({
-    ...DEFAULT_MAP_DEFINITION,
+    ...TEST_MAP_DEFINITION,
     id: `test-${seats}`,
     name: `测试地图 ${seats} 人`,
     players: seats,
@@ -179,7 +180,7 @@ function lastSent<T>(client: FakeClient, type: string): T {
 }
 
 it("accepts an initial host snapshot beyond Colyseus' 4 KiB transport default", () => {
-  const state = createMatchFromMapCode(DEFAULT_MAP_CODE, installedMapCatalogs);
+  const state = createMatchFromMapCode(TEST_MAP_CODE, installedMapCatalogs);
   const frame = getMessageBytes.raw(Protocol.ROOM_DATA, "host-snapshot", {
     state,
     clock: {},
@@ -196,6 +197,10 @@ it("accepts an initial host snapshot beyond Colyseus' 4 KiB transport default", 
 describe("PvpRelayRoom lobby contract", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it("requires the room creator to select a map instead of silently choosing a demo", () => {
+    expect(() => new TestPvpRelayRoom().onCreate({} as never)).toThrow("创建房间必须明确提供地图码。");
   });
 
   it("sorts participants first by fixed seat, then spectators by join order", () => {
@@ -390,7 +395,7 @@ describe("PvpRelayRoom lobby contract", () => {
 
     expect(late.sent.map((event) => event.type)).toEqual(["room-role", "room-state", "room-host", "host-snapshot"]);
     expect(lastSent<LobbyRoomState>(late, "room-state").phase).toBe("playing");
-    expect(lastSent<LobbyRoomState>(late, "room-state").mapCode).toBe(DEFAULT_MAP_CODE);
+    expect(lastSent<LobbyRoomState>(late, "room-state").mapCode).toBe(TEST_MAP_CODE);
     expect(lastSent<Record<string, unknown>>(late, "room-role")).toMatchObject({
       sessionId: "late",
       participating: false,
@@ -620,7 +625,7 @@ describe("PvpRelayRoom lobby contract", () => {
       "room-role", "room-state", "room-host", "match-start"
     ]);
     expect(lastSent<LobbyRoomState>(late, "room-state").phase).toBe("playing");
-    expect(lastSent<MatchStartPayload>(late, "match-start").mapCode).toBe(DEFAULT_MAP_CODE);
+    expect(lastSent<MatchStartPayload>(late, "match-start").mapCode).toBe(TEST_MAP_CODE);
     expect(host.sent.some((message) => message.type === "snapshot-request")).toBe(true);
   });
 
@@ -631,16 +636,16 @@ describe("PvpRelayRoom lobby contract", () => {
     const third = join(room, "third");
     const fourth = join(room, "fourth");
 
-    room.receive("lobby-map", other, { mapCode: DEFAULT_MAP_CODE });
+    room.receive("lobby-map", other, { mapCode: TEST_MAP_CODE });
     expect(lastBroadcast<LobbyRoomState>(room, "room-state").mapPlayerCount).toBe(4);
 
     room.receive("lobby-map", host, { mapCode: "not a map" });
     expect(lastSent<{ message: string }>(host, "lobby-error").message).toContain("地图码");
     expect(lastBroadcast<LobbyRoomState>(room, "room-state").mapPlayerCount).toBe(4);
 
-    room.receive("lobby-map", host, { mapCode: DEFAULT_MAP_CODE });
+    room.receive("lobby-map", host, { mapCode: TEST_MAP_CODE });
     const state = lastBroadcast<LobbyRoomState>(room, "room-state");
-    expect(state).toMatchObject({ mapCode: DEFAULT_MAP_CODE, mapName: "昏晓", mapPlayerCount: 2 });
+    expect(state).toMatchObject({ mapCode: TEST_MAP_CODE, mapName: "昏晓", mapPlayerCount: 2 });
     expect(state.members.map((member) => [member.sessionId, member.seat, member.participating])).toEqual([
       ["host", 1, true],
       ["other", 2, true],
@@ -648,7 +653,7 @@ describe("PvpRelayRoom lobby contract", () => {
       ["fourth", null, false]
     ]);
     expect(third.sent.findLast((message) => message.type === "room-state")?.payload).toMatchObject({
-      mapCode: DEFAULT_MAP_CODE
+      mapCode: TEST_MAP_CODE
     });
   });
 
@@ -743,7 +748,7 @@ describe("PvpRelayRoom lobby contract", () => {
   });
 
   it("blocks readiness when a participant's content differs from the host-selected release", () => {
-    const mapCode = serializeMapCode(DEFAULT_MAP_DEFINITION, installedMapCatalogs);
+    const mapCode = serializeMapCode(TEST_MAP_DEFINITION, installedMapCatalogs);
     const contentHash = hashModContent(modContentIdentity(oilFieldMod));
     const room = new TestPvpRelayRoom();
     room.onCreate({ mapCode });
@@ -773,7 +778,7 @@ describe("PvpRelayRoom lobby contract", () => {
   it("ignores legacy map version locks and uses the host's active release for every participant", () => {
     const hostHash = `sha256:${"1".repeat(64)}`;
     const oldMapCode = JSON.stringify({
-      ...DEFAULT_MAP_DEFINITION,
+      ...TEST_MAP_DEFINITION,
       requiredTerrainModLocks: [{ id: oilFieldMod.id, version: "0.0.1", contentHash: `sha256:${"0".repeat(64)}` }]
     });
     const room = new TestPvpRelayRoom();
@@ -820,7 +825,7 @@ describe("PvpRelayRoom lobby contract", () => {
     expect(lastBroadcast<LobbyRoomState>(room, "room-state").phase).toBe("lobby");
   });
 
-  it("accepts only host Mod overrides declared by the map and preserves them across rematch", () => {
+  it("relays safe host Mod overrides for declared Mods and preserves them across rematch", () => {
     const room = createRoom(2);
     const host = join(room, "host");
     const peer = join(room, "peer");
@@ -829,8 +834,10 @@ describe("PvpRelayRoom lobby contract", () => {
 
     room.receive("lobby-mod-settings", host, { modSettings: { [oilFieldMod.id]: { incomePerTurn: 7 } } });
     expect(lastBroadcast<LobbyRoomState>(room, "room-state").roomModSettings[oilFieldMod.id]?.incomePerTurn).toBe(7);
-    room.receive("lobby-mod-settings", host, { modSettings: { [oilFieldMod.id]: { incomePerTurn: 21 } } });
-    expect(lastSent<{ message: string }>(host, "lobby-error").message).toContain("0～20");
+    // The relay deliberately has no bundled Mod schema; client installations
+    // validate the value against the selected release before starting play.
+    room.receive("lobby-mod-settings", host, { modSettings: { [oilFieldMod.id]: { incomePerTurn: Number.NaN } } });
+    expect(lastSent<{ message: string }>(host, "lobby-error").message).toContain("Mod 参数值无效");
     expect(lastBroadcast<LobbyRoomState>(room, "room-state").roomModSettings[oilFieldMod.id]?.incomePerTurn).toBe(7);
     room.receive("lobby-mod-settings", host, { modSettings: { "mod-undeclared": { incomePerTurn: 4 } } });
     expect(lastSent<{ message: string }>(host, "lobby-error").message).toContain("配置无效");
@@ -847,9 +854,9 @@ describe("PvpRelayRoom lobby contract", () => {
     const host = join(room, "host", "无 Mod 玩家", "account-host", []);
     room.receive("lobby-mod-settings", host, { modSettings: { [oilFieldMod.id]: { incomePerTurn: 8 } } });
     const plainCode = serializeMapCode({
-      ...DEFAULT_MAP_DEFINITION,
+      ...TEST_MAP_DEFINITION,
       id: "plain-room-map",
-      terrain: DEFAULT_MAP_DEFINITION.terrain.replaceAll("F", "M"),
+      terrain: TEST_MAP_DEFINITION.terrain.replaceAll("F", "M"),
       requiredTerrainModIds: []
     }, { terrains: coreTerrainCatalog });
     room.receive("lobby-map", host, { mapCode: plainCode });
@@ -877,7 +884,7 @@ describe("PvpRelayRoom lobby contract", () => {
     const readyRoom = lastBroadcast<LobbyRoomState>(room, "room-state");
     expect(readyRoom).toMatchObject({
       phase: "lobby",
-      mapCode: DEFAULT_MAP_CODE,
+      mapCode: TEST_MAP_CODE,
       settings: { friendlyFire: true, turnTimeSeconds: 45 }
     });
     expect(readyRoom).not.toHaveProperty("startedAtEpochMs");
@@ -940,7 +947,7 @@ describe("PvpRelayRoom lobby contract", () => {
     join(room, "fourth");
 
     room.receive("lobby-settings", host, { randomizePositions: true });
-    room.receive("lobby-map", host, { mapCode: DEFAULT_MAP_CODE });
+    room.receive("lobby-map", host, { mapCode: TEST_MAP_CODE });
 
     const state = lastBroadcast<LobbyRoomState>(room, "room-state");
     expect(state.members.map((member) => [member.sessionId, member.participating, member.seat])).toEqual([

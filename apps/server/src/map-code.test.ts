@@ -1,14 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
-  DEFAULT_MAP_CODE,
-  DEFAULT_MAP_DEFINITION,
   coreTerrainCatalog,
   coreUnitCatalog,
   createMatchFromMapCode,
-  legacyDemoMap,
   parseMapCode,
   serializeMapCode
 } from "@numeral-lord/core-content";
+import { TEST_MAP_CODE, TEST_MAP_DEFINITION, legacyDemoMap } from "../../../packages/core-content/test-fixtures/maps.js";
 import { applyCommand, canCounterattack } from "@numeral-lord/game-core";
 import type { CellId, PlayerId, UnitId } from "@numeral-lord/game-core";
 import { oilFieldMod, oilFieldTerrainCatalog } from "@numeral-lord/oil-field-mod";
@@ -28,8 +26,8 @@ describe("shared map code", () => {
   it("does not treat the obsolete core/desert ID as either a built-in terrain or a Mod alias", () => {
     expect(coreTerrainCatalog).not.toHaveProperty("core/desert");
     const staleMap = {
-      ...DEFAULT_MAP_DEFINITION,
-      terrainLegend: { ...DEFAULT_MAP_DEFINITION.terrainLegend, M: "core/desert" }
+      ...TEST_MAP_DEFINITION,
+      terrainLegend: { ...TEST_MAP_DEFINITION.terrainLegend, M: "core/desert" }
     };
     expect(() => parseMapCode(JSON.stringify(staleMap), installedMapCatalogs)).toThrow(/未知的地形或 Mod/);
   });
@@ -86,7 +84,7 @@ describe("shared map code", () => {
   });
 
   it("uses lobby-selected legacy colors when creating a headless match", () => {
-    const state = createMatchFromMapCode(DEFAULT_MAP_CODE, {
+    const state = createMatchFromMapCode(TEST_MAP_CODE, {
       ...installedMapCatalogs,
       playerColors: { "player-1": "#CC3563", "player-2": "#53AEBB" }
     });
@@ -95,7 +93,7 @@ describe("shared map code", () => {
   });
 
   it("round trips editable map seat names and uses them as default player display names", () => {
-    const definition = { ...DEFAULT_MAP_DEFINITION, playerNames: ["赤方", "蓝方"] };
+    const definition = { ...TEST_MAP_DEFINITION, playerNames: ["赤方", "蓝方"] };
     const code = serializeMapCode(definition, installedMapCatalogs);
     expect(parseMapCode(code, installedMapCatalogs).playerNames).toEqual(["赤方", "蓝方"]);
     expect(createMatchFromMapCode(code, installedMapCatalogs).players["player-1" as PlayerId]?.displayName).toBe("赤方");
@@ -103,18 +101,18 @@ describe("shared map code", () => {
       ...installedMapCatalogs,
       playerDisplayNames: { "player-1": "在线昵称" }
     }).players["player-1" as PlayerId]?.displayName).toBe("在线昵称");
-    expect(createMatchFromMapCode(DEFAULT_MAP_CODE, installedMapCatalogs).players["player-1" as PlayerId]?.displayName).toBe("玩家 1");
+    expect(createMatchFromMapCode(TEST_MAP_CODE, installedMapCatalogs).players["player-1" as PlayerId]?.displayName).toBe("玩家 1");
   });
 
   it("round trips custom player colors and rejects incomplete or malformed palettes", () => {
-    const definition = { ...DEFAULT_MAP_DEFINITION, playerColors: ["#12ab34", "#aabbcc"] };
+    const definition = { ...TEST_MAP_DEFINITION, playerColors: ["#12ab34", "#aabbcc"] };
     const code = serializeMapCode(definition, installedMapCatalogs);
     expect(parseMapCode(code, installedMapCatalogs).playerColors).toEqual(["#12AB34", "#AABBCC"]);
     const match = createMatchFromMapCode(code, installedMapCatalogs);
     expect(match.players["player-1" as PlayerId]?.color).toBe("#12AB34");
     expect(match.players["player-2" as PlayerId]?.color).toBe("#AABBCC");
-    expect(() => serializeMapCode({ ...DEFAULT_MAP_DEFINITION, playerColors: ["#123456"] }, installedMapCatalogs)).toThrow(/六位十六进制颜色/);
-    expect(() => serializeMapCode({ ...DEFAULT_MAP_DEFINITION, playerColors: ["red", "#AABBCC"] }, installedMapCatalogs)).toThrow(/六位十六进制颜色/);
+    expect(() => serializeMapCode({ ...TEST_MAP_DEFINITION, playerColors: ["#123456"] }, installedMapCatalogs)).toThrow(/六位十六进制颜色/);
+    expect(() => serializeMapCode({ ...TEST_MAP_DEFINITION, playerColors: ["red", "#AABBCC"] }, installedMapCatalogs)).toThrow(/六位十六进制颜色/);
   });
 
   it("round trips an editor-replaced void tile as its new terrain", () => {
@@ -138,13 +136,13 @@ describe("shared map code", () => {
   });
 
   it("rejects missing, empty, or overlong map seat names", () => {
-    expect(() => serializeMapCode({ ...DEFAULT_MAP_DEFINITION, playerNames: ["赤方"] }, installedMapCatalogs)).toThrow(/每个玩家位填写/);
-    expect(() => serializeMapCode({ ...DEFAULT_MAP_DEFINITION, playerNames: ["", "蓝方"] }, installedMapCatalogs)).toThrow(/每个玩家位填写/);
-    expect(() => serializeMapCode({ ...DEFAULT_MAP_DEFINITION, playerNames: ["甲".repeat(25), "蓝方"] }, installedMapCatalogs)).toThrow(/每个玩家位填写/);
+    expect(() => serializeMapCode({ ...TEST_MAP_DEFINITION, playerNames: ["赤方"] }, installedMapCatalogs)).toThrow(/每个玩家位填写/);
+    expect(() => serializeMapCode({ ...TEST_MAP_DEFINITION, playerNames: ["", "蓝方"] }, installedMapCatalogs)).toThrow(/每个玩家位填写/);
+    expect(() => serializeMapCode({ ...TEST_MAP_DEFINITION, playerNames: ["甲".repeat(25), "蓝方"] }, installedMapCatalogs)).toThrow(/每个玩家位填写/);
   });
 
   it("round trips 昏晓 and keeps every legacy cell and soldier", () => {
-    const map = parseMapCode(DEFAULT_MAP_CODE, installedMapCatalogs);
+    const map = parseMapCode(TEST_MAP_CODE, installedMapCatalogs);
     expect(map.name).toBe("昏晓");
     expect(map.players).toBe(2);
     expect(map.terrain).toBe(legacyDemoMap.terrain);
@@ -153,7 +151,7 @@ describe("shared map code", () => {
     expect(idOnlyCode).not.toContain("requiredTerrainModLocks");
     expect(serializeMapCode(parseMapCode(idOnlyCode, installedMapCatalogs), installedMapCatalogs)).toBe(idOnlyCode);
 
-    const state = createMatchFromMapCode(DEFAULT_MAP_CODE, installedMapCatalogs);
+    const state = createMatchFromMapCode(TEST_MAP_CODE, installedMapCatalogs);
     expect(Object.keys(state.cells)).toHaveLength(legacyDemoMap.terrain.length);
     expect(Object.keys(state.units)).toHaveLength(legacyDemoMap.soldiers.length);
     expect(state.players["player-1" as keyof typeof state.players]?.seat).toBe(1);
@@ -163,7 +161,7 @@ describe("shared map code", () => {
 
   it("loads old maps with the currently installed Mod even when they contain a legacy version lock", () => {
     const code = JSON.stringify({
-      ...DEFAULT_MAP_DEFINITION,
+      ...TEST_MAP_DEFINITION,
       requiredTerrainModLocks: [{ id: oilFieldMod.id, version: "0.0.1", contentHash: `sha256:${"0".repeat(64)}` }]
     });
     const changedMod = {
@@ -191,7 +189,7 @@ describe("shared map code", () => {
       terrains: { ...installedMapCatalogs.terrains, [modWithArt.terrain.id]: modWithArt.terrain },
       mods: { ...installedMapCatalogs.mods, [oilFieldMod.id]: modWithArt }
     };
-    const code = serializeMapCode(DEFAULT_MAP_DEFINITION, catalogs);
+    const code = serializeMapCode(TEST_MAP_DEFINITION, catalogs);
     expect(code).not.toContain("requiredTerrainModLocks");
     expect(parseMapCode(code, catalogs).requiredTerrainModIds).toContain(modWithArt.id);
 
@@ -203,7 +201,7 @@ describe("shared map code", () => {
   });
 
   it("always serializes only Mod IDs, following whichever release the caller provides", () => {
-    const saved = parseMapCode(serializeMapCode(DEFAULT_MAP_DEFINITION, installedMapCatalogs), installedMapCatalogs);
+    const saved = parseMapCode(serializeMapCode(TEST_MAP_DEFINITION, installedMapCatalogs), installedMapCatalogs);
     const revisedMod = { ...oilFieldMod, version: "0.2.0" };
     const revisedCatalogs = { ...installedMapCatalogs, mods: { [oilFieldMod.id]: revisedMod } };
     const revisedCode = serializeMapCode(saved, revisedCatalogs);
@@ -213,7 +211,7 @@ describe("shared map code", () => {
 
   it("compiles arbitrary map-authored point-to-point links into destination lookup lists", () => {
     const map = {
-      ...DEFAULT_MAP_DEFINITION,
+      ...TEST_MAP_DEFINITION,
       cellLinks: [{ trigger: "enter", source: 0, target: 1, relationId: "mod/bridge/paired-gate" }] as const
     };
     const code = serializeMapCode(map, installedMapCatalogs);
@@ -225,7 +223,7 @@ describe("shared map code", () => {
       relationId: "mod/bridge/paired-gate"
     });
     const exitCode = serializeMapCode({
-      ...DEFAULT_MAP_DEFINITION,
+      ...TEST_MAP_DEFINITION,
       cellLinks: [{ trigger: "leave", source: 0, target: 1, relationId: "mod/bridge/exit-gate" }] as const
     }, installedMapCatalogs);
     expect(createMatchFromMapCode(exitCode, installedMapCatalogs).cellTriggers?.["0,0" as CellId]?.leave).toContainEqual({
@@ -236,17 +234,17 @@ describe("shared map code", () => {
 
   it("rejects cell links that point outside the map or omit a relation id", () => {
     expect(() => serializeMapCode({
-      ...DEFAULT_MAP_DEFINITION,
-      cellLinks: [{ trigger: "enter", source: 0, target: DEFAULT_MAP_DEFINITION.terrain.length, relationId: "mod/bridge/gate" }]
+      ...TEST_MAP_DEFINITION,
+      cellLinks: [{ trigger: "enter", source: 0, target: TEST_MAP_DEFINITION.terrain.length, relationId: "mod/bridge/gate" }]
     }, installedMapCatalogs)).toThrow(/源格、目标格和关系 ID/);
     expect(() => serializeMapCode({
-      ...DEFAULT_MAP_DEFINITION,
+      ...TEST_MAP_DEFINITION,
       cellLinks: [{ trigger: "leave", source: 0, target: 1, relationId: "" }]
     }, installedMapCatalogs)).toThrow(/源格、目标格和关系 ID/);
   });
 
   it("starts unoccupied map seats dead; map condition modules decide settlement", () => {
-    const map = { ...DEFAULT_MAP_DEFINITION, matchConditionIds: ["core/lose-all-survival-anchors"] };
+    const map = { ...TEST_MAP_DEFINITION, matchConditionIds: ["core/lose-all-survival-anchors"] };
     const activePlayerIds = ["player-1" as keyof ReturnType<typeof createMatchFromMapCode>["players"]];
     const state = createMatchFromMapCode(serializeMapCode(map, installedMapCatalogs), {
       ...installedMapCatalogs,
@@ -256,33 +254,33 @@ describe("shared map code", () => {
     expect(Object.values(state.units).every((unit) => unit.ownerId === "player-1")).toBe(true);
     expect(state.turn.phase).not.toBe("finished");
 
-    const lastTeamMap = createMatchFromMapCode(DEFAULT_MAP_CODE, { ...installedMapCatalogs, activePlayerIds });
+    const lastTeamMap = createMatchFromMapCode(TEST_MAP_CODE, { ...installedMapCatalogs, activePlayerIds });
     expect(lastTeamMap.turn.phase).toBe("finished");
   });
 
   it("rejects unknown mods, invalid seats, overlapping pieces and blocked cells", () => {
     expect(() => serializeMapCode({
-      ...DEFAULT_MAP_DEFINITION,
-      terrainLegend: { ...DEFAULT_MAP_DEFINITION.terrainLegend, F: "missing/oil" }
+      ...TEST_MAP_DEFINITION,
+      terrainLegend: { ...TEST_MAP_DEFINITION.terrainLegend, F: "missing/oil" }
     }, installedMapCatalogs)).toThrow(/未知的地形或 Mod/);
     expect(() => serializeMapCode({
-      ...DEFAULT_MAP_DEFINITION,
+      ...TEST_MAP_DEFINITION,
       soldiers: [[10, 3, 1]]
     }, installedMapCatalogs)).toThrow(/兵力玩家位/);
     expect(() => serializeMapCode({
-      ...DEFAULT_MAP_DEFINITION,
+      ...TEST_MAP_DEFINITION,
       soldiers: [[10, 1, 1], [10, 2, 1]]
     }, installedMapCatalogs)).toThrow(/两个单位/);
     expect(() => serializeMapCode({
-      ...DEFAULT_MAP_DEFINITION,
+      ...TEST_MAP_DEFINITION,
       soldiers: [[7, 1, 1]]
     }, installedMapCatalogs)).toThrow(/不可驻兵/);
-    expect(() => parseMapCode(DEFAULT_MAP_CODE, { terrains: coreTerrainCatalog })).toThrow(/未知的地形或 Mod/);
+    expect(() => parseMapCode(TEST_MAP_CODE, { terrains: coreTerrainCatalog })).toThrow(/未知的地形或 Mod/);
   });
 
   it("loads neutral blockers without reactions and wild units with terrain-bound reactions", () => {
     const map = {
-      ...DEFAULT_MAP_DEFINITION,
+      ...TEST_MAP_DEFINITION,
       terrain: "M".repeat(81),
       terrainLegend: { M: "core/plain" },
       requiredTerrainModIds: [],
@@ -313,8 +311,8 @@ describe("shared map code", () => {
   });
 
   it("rejects neutral units on blocked terrain and overlapping player units", () => {
-    expect(() => serializeMapCode({ ...DEFAULT_MAP_DEFINITION, specialUnits: [[7, "wild", 1]] }, installedMapCatalogs)).toThrow(/不可驻兵/);
-    expect(() => serializeMapCode({ ...DEFAULT_MAP_DEFINITION, soldiers: [[10, 1, 1]], specialUnits: [[10, "blocker", 1]] }, installedMapCatalogs)).toThrow(/两个单位/);
+    expect(() => serializeMapCode({ ...TEST_MAP_DEFINITION, specialUnits: [[7, "wild", 1]] }, installedMapCatalogs)).toThrow(/不可驻兵/);
+    expect(() => serializeMapCode({ ...TEST_MAP_DEFINITION, soldiers: [[10, 1, 1]], specialUnits: [[10, "blocker", 1]] }, installedMapCatalogs)).toThrow(/两个单位/);
   });
 
   it("upgrades the old row-major map object", () => {
@@ -326,10 +324,10 @@ describe("shared map code", () => {
 
   it("supports extra declared seats and maps that do not install the oil-field Mod", () => {
     const plainOnly = {
-      ...DEFAULT_MAP_DEFINITION,
+      ...TEST_MAP_DEFINITION,
       players: 3,
       teams: [1, 1, 2],
-      terrain: DEFAULT_MAP_DEFINITION.terrain.replaceAll("F", "M"),
+      terrain: TEST_MAP_DEFINITION.terrain.replaceAll("F", "M"),
       requiredTerrainModIds: []
     };
     const code = serializeMapCode(plainOnly, { terrains: coreTerrainCatalog });
@@ -344,7 +342,7 @@ describe("shared map code", () => {
   });
 
   it("uses room participant names in headless match state", () => {
-    const state = createMatchFromMapCode(DEFAULT_MAP_CODE, {
+    const state = createMatchFromMapCode(TEST_MAP_CODE, {
       ...installedMapCatalogs,
       playerDisplayNames: { "player-1": "阿蓝", "player-2": "阿红" }
     });

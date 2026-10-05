@@ -1,12 +1,23 @@
 import { describe, expect, it } from "vitest";
 import { reactive } from "vue";
-import { DEFAULT_MAP_CODE, createMatchFromMapCode } from "@numeral-lord/core-content";
-import { installedMapCatalogs } from "../content/installed-content.js";
+import { coreTerrainCatalog, createMatchFromMapCode, serializeMapCode } from "@numeral-lord/core-content";
+import { TEST_MAP_DEFINITION } from "../../../../packages/core-content/test-fixtures/maps.js";
 import { toNetworkGameState, toNetworkPayload } from "./network-payload.js";
+
+const coreTestTerrainLegend = { ...TEST_MAP_DEFINITION.terrainLegend };
+delete coreTestTerrainLegend.F;
+const coreTestMapCatalogs = { terrains: coreTerrainCatalog };
+const coreTestMapCode = serializeMapCode({
+  ...TEST_MAP_DEFINITION,
+  id: "core-only-network-test",
+  terrain: TEST_MAP_DEFINITION.terrain.replaceAll("F", "M"),
+  terrainLegend: coreTestTerrainLegend,
+  requiredTerrainModIds: []
+}, coreTestMapCatalogs);
 
 describe("Colyseus network payload normalization", () => {
   it("converts null-prototype Mod settings throughout a game snapshot", () => {
-    const game = reactive(createMatchFromMapCode(DEFAULT_MAP_CODE, installedMapCatalogs));
+    const game = reactive(createMatchFromMapCode(coreTestMapCode, coreTestMapCatalogs));
     expect(Object.getPrototypeOf(game.settings.modSettings)).toBeNull();
     expect(() => game.settings.modSettings?.hasOwnProperty("mod/oil-field"))
       .toThrow(/hasOwnProperty is not a function/);
@@ -19,7 +30,7 @@ describe("Colyseus network payload normalization", () => {
   });
 
   it("normalizes snapshot settings without cloning the immutable board", () => {
-    const game = createMatchFromMapCode(DEFAULT_MAP_CODE, installedMapCatalogs);
+    const game = createMatchFromMapCode(coreTestMapCode, coreTestMapCatalogs);
     const payload = toNetworkGameState(game);
 
     expect(payload).not.toBe(game);

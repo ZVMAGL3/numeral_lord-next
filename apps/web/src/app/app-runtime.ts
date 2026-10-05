@@ -28,8 +28,6 @@ import {
   type UnitId
 } from "@numeral-lord/game-core";
 import {
-  DEFAULT_MAP_CODE,
-  DEFAULT_MAP_DEFINITION,
   coreMatchConditionCatalog,
   coreUnitCatalog,
   createMatchFromMapCode,
@@ -242,7 +240,9 @@ export function useAppRuntime() {
   }
 
   const matchStore = useMatchStore();
-  if (!matchStore.game) matchStore.setGame(createMatchFromMapCode(DEFAULT_MAP_CODE, installedMapCatalogs));
+  // The shared app shell also hosts Workshop and Maps routes; don't create an
+  // unrelated demo match here. A real state is installed when a match starts
+  // or the first authoritative snapshot arrives.
   const game = computed(() => matchStore.game!);
   const commandTimeline = createCommandTimeline();
   const isRepairing = ref(false);
@@ -259,16 +259,6 @@ export function useAppRuntime() {
     else if (action === "out") gameBoardRef.value?.zoomOut();
     else gameBoardRef.value?.resetZoom();
   }
-  const builtInMapWork: MapWorkshopEntry = {
-    id: "local:map-1001",
-    mapId: DEFAULT_MAP_DEFINITION.id,
-    name: DEFAULT_MAP_DEFINITION.name,
-    code: DEFAULT_MAP_CODE,
-    description: "内置示例地图，使用油田地块 Mod。地图作品本身只是一段地图码。",
-    players: DEFAULT_MAP_DEFINITION.players,
-    requiredTerrainModIds: DEFAULT_MAP_DEFINITION.requiredTerrainModIds,
-    authorName: "Numeral Lord"
-  };
   const remoteTerrainMods = ref<TerrainModEntry[]>([]);
   const remoteTerrainModReleases = ref<TerrainModEntry[]>([]);
   const remoteMapWorks = ref<MapWorkshopEntry[]>([]);
@@ -291,7 +281,7 @@ export function useAppRuntime() {
     [],
     localInstalledTerrainMods.value
   ));
-  const workshopMapWorks = computed(() => [builtInMapWork, ...remoteMapWorks.value]);
+  const workshopMapWorks = computed(() => remoteMapWorks.value);
   const workshopStatus = ref<WorkshopConnectionStatus>("offline");
   // 客户端可显示发布入口，是否接受写入由当前环境的服务器开关决定。
   const workshopPublishingEnabled = true;
@@ -337,13 +327,12 @@ export function useAppRuntime() {
   let clockTimer: ReturnType<typeof setInterval> | undefined;
   let expiredStepSequence: number | null = null;
   let lastSnapshotSyncAt = 0;
-  const initialMapPlayerCount = DEFAULT_MAP_DEFINITION.players;
   const lobbyState = ref<LobbyRoomState>({
     phase: "lobby",
-    mapPlayerCount: initialMapPlayerCount,
-    mapCode: DEFAULT_MAP_CODE,
-    mapName: DEFAULT_MAP_DEFINITION.name,
-    requiredTerrainModIds: DEFAULT_MAP_DEFINITION.requiredTerrainModIds,
+    mapPlayerCount: 0,
+    mapCode: "",
+    mapName: "",
+    requiredTerrainModIds: [],
     effectiveTerrainModReleases: [],
     modVersionMismatchIds: [],
     roomModSettings: {},
@@ -582,7 +571,7 @@ export function useAppRuntime() {
       if (pendingHostSnapshotCacheTimer !== undefined) window.clearTimeout(pendingHostSnapshotCacheTimer);
       pendingHostSnapshotCacheFrame = 0;
       pendingHostSnapshotCacheTimer = undefined;
-      if (!relayRoom || !relayIsHost.value || lobbyState.value.phase !== "playing") return;
+      if (!relayRoom || !relayIsHost.value || lobbyState.value.phase !== "playing" || !matchStore.game) return;
       const sequence = game.value.sequence;
       const startedAt = performance.now();
       broadcastSnapshot({ cacheOnly: true });
@@ -617,7 +606,7 @@ export function useAppRuntime() {
     readonly reconcile?: boolean;
     readonly cacheOnly?: boolean;
   }): void {
-    if (relayRoom && relayIsHost.value && lobbyState.value.phase === "playing") {
+    if (relayRoom && relayIsHost.value && lobbyState.value.phase === "playing" && matchStore.game) {
       try {
         relayRoom.send("host-snapshot", toNetworkPayload({
           state: toNetworkGameState(game.value),
@@ -1021,7 +1010,7 @@ export function useAppRuntime() {
       room.onMessage("snapshot-rejected", (payload: { reason?: string }) => {
         logConnection("snapshot.rejected-relay", {
           reason: payload.reason,
-          sequence: game.value.sequence,
+          sequence: matchStore.game?.sequence ?? null,
           host: relayIsHost.value
         });
         if (relayIsHost.value) relayRoom?.send("room-sync", {});
@@ -1033,7 +1022,7 @@ export function useAppRuntime() {
       room.onMessage("snapshot-request", (payload?: { commandId?: string; errorMessage?: string }) => {
         logConnection("snapshot.requested", {
           host: relayIsHost.value,
-          sequence: game.value.sequence,
+          sequence: matchStore.game?.sequence ?? null,
           hasCommandId: typeof payload?.commandId === "string"
         });
         if (relayIsHost.value) {
@@ -1048,7 +1037,7 @@ export function useAppRuntime() {
       });
       room.onMessage("command-conflict", (payload: { sequence?: number; commandHeadId?: string | null }) => {
         logConnection("command.conflict-received", {
-          host: relayIsHost.value, localSequence: game.value.sequence,
+          host: relayIsHost.value, localSequence: matchStore.game?.sequence ?? null,
           remoteSequence: payload.sequence, localHeadId: commandTimeline.headId,
           remoteHeadId: payload.commandHeadId ?? null
         });
@@ -1116,10 +1105,11 @@ export function useAppRuntime() {
         handoff?: boolean;
       }) => {
         if (!payload.state || (relayIsHost.value && payload.handoff !== true)) return;
-        if (payload.state.sequence < game.value.sequence) {
+        const currentGame = matchStore.game;
+        if (currentGame && payload.state.sequence < currentGame.sequence) {
           logConnection("snapshot.ignored-stale", {
             sequence: payload.state.sequence,
-            currentSequence: game.value.sequence,
+            currentSequence: currentGame.sequence,
             handoff: payload.handoff === true
           });
           if (relayIsHost.value && payload.handoff) broadcastSnapshot();
@@ -1134,11 +1124,11 @@ export function useAppRuntime() {
           sequence: payload.state.sequence,
           handoff: payload.handoff === true,
           selfIsHost: relayIsHost.value,
-          previousSequence: game.value.sequence
+          previousSequence: currentGame?.sequence ?? null
         });
         // Snapshots are recovery only; routine player actions travel as commands.
         if (!isRepairing.value && hasLiveSnapshot.value && payload.handoff !== true
-          && payload.state.sequence === game.value.sequence) return;
+          && currentGame && payload.state.sequence === currentGame.sequence) return;
         matchStore.setGame(payload.state);
         commandTimeline.reset(payload.commandHeadId ?? null);
         isRepairing.value = false;
@@ -1160,7 +1150,7 @@ export function useAppRuntime() {
         const replacedByAnotherTab = code === 4001;
         logConnection("socket.closed", {
           code, roomId: room.roomId, phase: lobbyState.value.phase,
-          selfIsHost: relayIsHost.value, sequence: game.value.sequence, replacedByAnotherTab,
+          selfIsHost: relayIsHost.value, sequence: matchStore.game?.sequence ?? null, replacedByAnotherTab,
           online: navigator.onLine, visibility: document.visibilityState
         });
         console.warn("PvP room socket closed", { code, roomId: room.roomId });
@@ -1375,7 +1365,6 @@ export function useAppRuntime() {
   }
 
   function selectWorkshopMap(id: string): void {
-    if (id === builtInMapWork.id) return;
     const entry = remoteMapWorks.value.find((candidate) => candidate.id === id);
     if (entry && !entry.code) workshopClient?.requestDetail("map", id);
   }
@@ -1708,10 +1697,10 @@ export function useAppRuntime() {
     notationDialogOpen.value = false;
     lobbyState.value = {
       phase: "lobby",
-      mapPlayerCount: initialMapPlayerCount,
-      mapCode: DEFAULT_MAP_CODE,
-      mapName: DEFAULT_MAP_DEFINITION.name,
-      requiredTerrainModIds: DEFAULT_MAP_DEFINITION.requiredTerrainModIds,
+      mapPlayerCount: 0,
+      mapCode: "",
+      mapName: "",
+      requiredTerrainModIds: [],
       effectiveTerrainModReleases: [],
       modVersionMismatchIds: [],
       roomModSettings: {},
@@ -2264,7 +2253,7 @@ export function useAppRuntime() {
     // with a host handoff or an empty server cache.
     if (relayRoom && lobbyState.value.phase === "playing" && !hasLiveSnapshot.value
       && clockNow.value - lastSnapshotSyncAt >= 2_000) {
-      logConnection("snapshot.sync-request", { roomId: relayRoom.roomId, initial: false, sequence: game.value.sequence });
+      logConnection("snapshot.sync-request", { roomId: relayRoom.roomId, initial: false, sequence: matchStore.game?.sequence ?? null });
       relayRoom.send("room-sync", {});
       lastSnapshotSyncAt = clockNow.value;
     }

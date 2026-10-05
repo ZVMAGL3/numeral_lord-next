@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { coreMatchConditionCatalog } from "../../core-content/src/match-conditions.js";
-import { createMatchFromMapCode, DEFAULT_MAP_CODE } from "../../core-content/src/map-code.js";
+import { createMatchFromMapCode } from "../../core-content/src/map-code.js";
+import { TEST_MAP_CODE } from "../../core-content/test-fixtures/maps.js";
 import { coreTerrainCatalog, coreTerrainMod } from "../../core-content/src/terrains.js";
 import { desertTerrainCatalog, DESERT_TERRAIN_ID } from "../../desert-terrain-mod/src/index.js";
 import { oilFieldMod, oilFieldTerrainCatalog } from "../../oil-field-mod/src/index.js";
@@ -469,7 +470,7 @@ describe("core turn rules", () => {
   });
 
   it("compiles capture exhaustion into the enter triggers of each opted-in terrain", () => {
-    const map = createMatchFromMapCode(DEFAULT_MAP_CODE, {
+    const map = createMatchFromMapCode(TEST_MAP_CODE, {
       terrains: { ...coreTerrainCatalog, ...oilFieldTerrainCatalog },
       terrainModIds: { "mod/oil-field": oilFieldMod.id },
       mods: { [oilFieldMod.id]: oilFieldMod }
@@ -908,7 +909,7 @@ describe("core turn rules", () => {
       effects: [{ type: "grant-points" as const, amount: 1 }]
     };
     const runtimeMod = { ...oilFieldMod, spatialPatterns: [pattern], rules: [rule] };
-    const match = createMatchFromMapCode(DEFAULT_MAP_CODE, {
+    const match = createMatchFromMapCode(TEST_MAP_CODE, {
       terrains: { ...coreTerrainCatalog, ...oilFieldTerrainCatalog },
       terrainModIds: { "mod/oil-field": oilFieldMod.id },
       mods: { [oilFieldMod.id]: runtimeMod }

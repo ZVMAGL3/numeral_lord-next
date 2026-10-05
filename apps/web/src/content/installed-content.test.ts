@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { TerrainModDefinition } from "@numeral-lord/content-schema";
-import { coreTerrainCatalog, DEFAULT_MAP_DEFINITION, createMatchFromMapCode, parseMapCode, serializeMapCode } from "@numeral-lord/core-content";
+import { coreTerrainCatalog, createMatchFromMapCode, parseMapCode, serializeMapCode } from "@numeral-lord/core-content";
+import { TEST_MAP_DEFINITION } from "../../../../packages/core-content/test-fixtures/maps.js";
 import {
   installedTerrainCatalog,
   installedTerrainModIds,
@@ -25,9 +26,9 @@ function mapCodeFor(mod: TerrainModDefinition, id: string): string {
   const terrain = { ...mod.terrain, id: `mod/${mod.id.slice(4)}`, displayName: "" };
   const runtimeMod = { ...mod, terrain, units: [], commandRules: [], victoryConditions: [] };
   const code = serializeMapCode({
-    ...DEFAULT_MAP_DEFINITION,
+    ...TEST_MAP_DEFINITION,
     id,
-    terrainLegend: { ...DEFAULT_MAP_DEFINITION.terrainLegend, F: terrain.id },
+    terrainLegend: { ...TEST_MAP_DEFINITION.terrainLegend, F: terrain.id },
     requiredTerrainModIds: [mod.id]
   }, {
     terrains: { ...coreTerrainCatalog, [terrain.id]: terrain },
@@ -62,22 +63,17 @@ describe("map Mod dependency release resolution", () => {
     expect(terrainVisualAssetsForCatalogs(catalogs)).toEqual({ "mod/oil-field": { "oil-art": assetUrl } });
   });
 
-  it("keeps map 1001's oil-field as an external dependency instead of preinstalling it", () => {
+  it("keeps map Mods as external dependencies instead of preinstalling them", () => {
     const code = JSON.stringify({
       version: 1,
-      id: "1001",
-      name: "昏晓",
-      columns: 9,
-      terrain: "AAAAAAABCBDAEEAEABAEEFAEGACBAEDABEABBAABBAABCBAEBADEABAGEAFEEACBAEAEEADBBAAAAAAAC",
-      terrainLegend: {
-        A: "core/plain", B: "core/mountain", C: "core/void", D: "core/stronghold", E: "core/ocean",
-        F: "mod/decay-terrain", G: "mod/oil-field"
-      },
+      id: "external-mod-map",
+      name: "外部 Mod 地图",
+      columns: 4,
+      terrain: "ABCD",
+      terrainLegend: { A: "core/plain", B: "mod/decay-terrain", C: "mod/oil-field", D: "core/void" },
       requiredTerrainModIds: ["mod-oil-field", "mod-decay-terrain"],
       players: 2,
-      playerNames: ["玩家 1", "玩家 2"],
-      playerColors: ["#BB5F5F", "#7BBB5E"],
-      soldiers: [[10, 1, 2], [11, 1, 1], [30, 2, 1], [50, 1, 1], [69, 2, 1], [70, 2, 2], [79, 2, 1]],
+      soldiers: [],
       teams: [1, 2],
       matchConditionIds: []
     });

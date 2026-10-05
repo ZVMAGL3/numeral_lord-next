@@ -14,17 +14,17 @@
   "dependencies": {
     "@numeral-lord/content-schema": "workspace:*",
     "@numeral-lord/core-content": "workspace:*",
-    "@numeral-lord/decay-terrain-mod": "workspace:*",
-    "@numeral-lord/desert-terrain-mod": "workspace:*",
     "@numeral-lord/game-core": "workspace:*",
     "@numeral-lord/game-sdk": "workspace:*",
-    "@numeral-lord/oil-field-mod": "workspace:*",
     "@xmldom/xmldom": "0.8.15",
     "colyseus": "0.18.7",
     "pg": "8.23.0"
   },
   "devDependencies": {
     "@types/pg": "8.15.5",
+    "@numeral-lord/decay-terrain-mod": "workspace:*",
+    "@numeral-lord/desert-terrain-mod": "workspace:*",
+    "@numeral-lord/oil-field-mod": "workspace:*",
     "tsx": "4.23.15",
     "typescript": "5.9.3",
     "vitest": "5.0.1"

@@ -645,7 +645,7 @@ describe("PvpRelayRoom lobby contract", () => {
 
     room.receive("lobby-map", host, { mapCode: TEST_MAP_CODE });
     const state = lastBroadcast<LobbyRoomState>(room, "room-state");
-    expect(state).toMatchObject({ mapCode: TEST_MAP_CODE, mapName: "昏晓", mapPlayerCount: 2 });
+    expect(state).toMatchObject({ mapCode: TEST_MAP_CODE, mapName: "Mod依赖测试地图", mapPlayerCount: 2 });
     expect(state.members.map((member) => [member.sessionId, member.seat, member.participating])).toEqual([
       ["host", 1, true],
       ["other", 2, true],
@@ -856,7 +856,7 @@ describe("PvpRelayRoom lobby contract", () => {
     const plainCode = serializeMapCode({
       ...TEST_MAP_DEFINITION,
       id: "plain-room-map",
-      terrain: TEST_MAP_DEFINITION.terrain.replaceAll("F", "M"),
+      terrain: TEST_MAP_DEFINITION.terrain.replaceAll("X", "M"),
       requiredTerrainModIds: []
     }, { terrains: coreTerrainCatalog });
     room.receive("lobby-map", host, { mapCode: plainCode });

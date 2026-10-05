@@ -88,16 +88,6 @@ export interface MapMatchOptions extends MapCatalogs {
 
 export const DEFAULT_MAP_TERRAIN_CATALOG: TerrainCatalog = coreTerrainCatalog;
 
-/** Decode glyphs in old unversioned maps; this mapping never installs a Mod. */
-const LEGACY_MAP_TERRAIN_LEGEND: Readonly<Record<string, string>> = {
-  M: "core/plain",
-  P: "core/mountain",
-  S: "core/stronghold",
-  O: "core/ocean",
-  F: "mod/oil-field",
-  V: "core/void"
-};
-
 const DEFAULT_CONDITIONS = ["core/lose-all-survival-anchors", "core/last-team-standing"];
 const MAX_MAP_CODE_LENGTH = 64 * 1024;
 const MAX_CELLS = 4096;
@@ -107,7 +97,8 @@ const DEFAULT_PLAYER_COLOR_IDS = ["legacy-1", "legacy-2", "legacy-3", "legacy-4"
 /**
  * Decode and validate a map before adding it to the local library or room.
  * Unknown terrain/Mod and victory-condition ids fail here, not during play.
- * Legacy unversioned map objects are also accepted and upgraded.
+ * Only explicitly versioned map definitions are accepted; terrain glyphs are
+ * resolved exclusively through the map's own terrainLegend.
  */
 export function parseMapCode(raw: string, catalogs: MapCatalogs = {}): MapDefinition {
   if (typeof raw !== "string" || raw.length === 0 || raw.length > MAX_MAP_CODE_LENGTH) {
@@ -278,7 +269,7 @@ export function createMatchFromMapDefinition(definition: MapDefinition, options:
 
 function validateMapDefinition(input: unknown, catalogs: MapCatalogs): MapDefinition {
   if (!isRecord(input)) throw new Error("地图码必须是对象。");
-  const data = upgradeLegacyMap(input);
+  const data = input;
   if (data.version !== 1) throw new Error("不支持的地图码版本。");
   if (typeof data.id !== "string" || data.id.trim().length === 0 || data.id.length > 80) {
     throw new Error("地图 ID 无效。");
@@ -455,32 +446,9 @@ function validateCellLinks(input: unknown, cellCount: number): MapCellLink[] {
   return links;
 }
 
-function upgradeLegacyMap(input: Record<string, unknown>): Record<string, unknown> {
-  if (input.version !== undefined) return input;
-  if (!Array.isArray(input.soldiers) || typeof input.terrain !== "string") return input;
-  const oldSeats = input.soldiers.map((soldier) => Array.isArray(soldier) ? soldier[1] : undefined);
-  if (oldSeats.some((seat) => !Number.isInteger(seat) || seat < 0)) return input;
-  const players = Math.max(1, ...oldSeats.map((seat) => (seat as number) + 1));
-  return {
-    version: 1,
-    id: String(input.id ?? "legacy-map"),
-    name: typeof input.name === "string" ? input.name : `地图 ${String(input.id ?? "legacy")}`,
-    columns: input.columns,
-    terrain: input.terrain,
-    terrainLegend: LEGACY_MAP_TERRAIN_LEGEND,
-    players,
-    soldiers: input.soldiers.map((soldier) => {
-      if (!Array.isArray(soldier)) return soldier;
-      return [soldier[0], (soldier[1] as number) + 1, soldier[2]];
-    }),
-    teams: Array.from({ length: players }, (_, index) => index + 1),
-    matchConditionIds: DEFAULT_CONDITIONS
-  };
-}
-
 /**
  * A registered provider is authoritative. The `mod/<slug>` convention lets
- * old map codes advertise common dependencies even before a Mod is installed.
+ * a versioned map identify its owning Mod before that Mod is installed.
  */
 function terrainModIdFor(terrainId: string, catalogs: MapCatalogs): string | undefined {
   const registered = catalogs.terrainModIds?.[terrainId];

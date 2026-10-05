@@ -42,7 +42,7 @@ describe("map terrain Mod dependencies", () => {
   it("does not require oil-field when the map uses only core terrain", () => {
     const plainOnly = {
       ...TEST_MAP_DEFINITION,
-      terrain: TEST_MAP_DEFINITION.terrain.replaceAll("F", "M"),
+      terrain: TEST_MAP_DEFINITION.terrain.replaceAll("X", "M"),
       requiredTerrainModIds: []
     };
     const code = serializeMapCode(plainOnly, { terrains: coreTerrainCatalog });

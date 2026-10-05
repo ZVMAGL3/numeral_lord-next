@@ -28,7 +28,7 @@ function mapCodeFor(mod: TerrainModDefinition, id: string): string {
   const code = serializeMapCode({
     ...TEST_MAP_DEFINITION,
     id,
-    terrainLegend: { ...TEST_MAP_DEFINITION.terrainLegend, F: terrain.id },
+    terrainLegend: { ...TEST_MAP_DEFINITION.terrainLegend, X: terrain.id },
     requiredTerrainModIds: [mod.id]
   }, {
     terrains: { ...coreTerrainCatalog, [terrain.id]: terrain },

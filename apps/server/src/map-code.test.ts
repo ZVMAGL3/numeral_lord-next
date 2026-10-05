@@ -6,7 +6,7 @@ import {
   parseMapCode,
   serializeMapCode
 } from "@numeral-lord/core-content";
-import { TEST_MAP_CODE, TEST_MAP_DEFINITION, legacyDemoMap } from "../../../packages/core-content/test-fixtures/maps.js";
+import { TEST_MAP_CODE, TEST_MAP_DEFINITION } from "../../../packages/core-content/test-fixtures/maps.js";
 import { applyCommand, canCounterattack } from "@numeral-lord/game-core";
 import type { CellId, PlayerId, UnitId } from "@numeral-lord/game-core";
 import { oilFieldMod, oilFieldTerrainCatalog } from "@numeral-lord/oil-field-mod";
@@ -141,19 +141,19 @@ describe("shared map code", () => {
     expect(() => serializeMapCode({ ...TEST_MAP_DEFINITION, playerNames: ["甲".repeat(25), "蓝方"] }, installedMapCatalogs)).toThrow(/每个玩家位填写/);
   });
 
-  it("round trips 昏晓 and keeps every legacy cell and soldier", () => {
+  it("round trips a versioned map with an explicit Mod legend and dependency", () => {
     const map = parseMapCode(TEST_MAP_CODE, installedMapCatalogs);
-    expect(map.name).toBe("昏晓");
+    expect(map.name).toBe("Mod依赖测试地图");
     expect(map.players).toBe(2);
-    expect(map.terrain).toBe(legacyDemoMap.terrain);
+    expect(map.terrain).toBe(TEST_MAP_DEFINITION.terrain);
     expect(map.requiredTerrainModIds).toEqual(["mod-oil-field"]);
     const idOnlyCode = serializeMapCode(map, installedMapCatalogs);
     expect(idOnlyCode).not.toContain("requiredTerrainModLocks");
     expect(serializeMapCode(parseMapCode(idOnlyCode, installedMapCatalogs), installedMapCatalogs)).toBe(idOnlyCode);
 
     const state = createMatchFromMapCode(TEST_MAP_CODE, installedMapCatalogs);
-    expect(Object.keys(state.cells)).toHaveLength(legacyDemoMap.terrain.length);
-    expect(Object.keys(state.units)).toHaveLength(legacyDemoMap.soldiers.length);
+    expect(Object.keys(state.cells)).toHaveLength(TEST_MAP_DEFINITION.terrain.length);
+    expect(Object.keys(state.units)).toHaveLength(TEST_MAP_DEFINITION.soldiers.length);
     expect(state.players["player-1" as keyof typeof state.players]?.seat).toBe(1);
     expect(state.settings.modRuleSet?.patterns.some((pattern) => pattern.id === "core-terrain/hostile-stronghold-zone")).toBe(true);
     expect(state.settings.modRuleSet?.rules.some((rule) => rule.id === "core-terrain/hostile-stronghold-exhaustion")).toBe(true);
@@ -261,7 +261,7 @@ describe("shared map code", () => {
   it("rejects unknown mods, invalid seats, overlapping pieces and blocked cells", () => {
     expect(() => serializeMapCode({
       ...TEST_MAP_DEFINITION,
-      terrainLegend: { ...TEST_MAP_DEFINITION.terrainLegend, F: "missing/oil" }
+      terrainLegend: { ...TEST_MAP_DEFINITION.terrainLegend, X: "missing/oil" }
     }, installedMapCatalogs)).toThrow(/未知的地形或 Mod/);
     expect(() => serializeMapCode({
       ...TEST_MAP_DEFINITION,
@@ -315,11 +315,14 @@ describe("shared map code", () => {
     expect(() => serializeMapCode({ ...TEST_MAP_DEFINITION, soldiers: [[10, 1, 1]], specialUnits: [[10, "blocker", 1]] }, installedMapCatalogs)).toThrow(/两个单位/);
   });
 
-  it("upgrades the old row-major map object", () => {
-    const map = parseMapCode(JSON.stringify(legacyDemoMap), installedMapCatalogs);
-    expect(map.players).toBe(2);
-    expect(map.soldiers[0]).toEqual([10, 1, 2]);
-    expect(createMatchFromMapCode(serializeMapCode(map, installedMapCatalogs), installedMapCatalogs).board.columns).toBe(9);
+  it("rejects unversioned map data instead of guessing terrain glyphs or Mod IDs", () => {
+    const oldMap = {
+      id: 1001,
+      columns: TEST_MAP_DEFINITION.columns,
+      terrain: TEST_MAP_DEFINITION.terrain,
+      soldiers: TEST_MAP_DEFINITION.soldiers.map(([index, seat, strength]) => [index, seat - 1, strength])
+    };
+    expect(() => parseMapCode(JSON.stringify(oldMap), installedMapCatalogs)).toThrow(/不支持的地图码版本/);
   });
 
   it("supports extra declared seats and maps that do not install the oil-field Mod", () => {
@@ -327,13 +330,13 @@ describe("shared map code", () => {
       ...TEST_MAP_DEFINITION,
       players: 3,
       teams: [1, 1, 2],
-      terrain: TEST_MAP_DEFINITION.terrain.replaceAll("F", "M"),
+      terrain: TEST_MAP_DEFINITION.terrain.replaceAll("X", "M"),
       requiredTerrainModIds: []
     };
     const code = serializeMapCode(plainOnly, { terrains: coreTerrainCatalog });
     const map = parseMapCode(code, { terrains: coreTerrainCatalog });
     expect(map.players).toBe(3);
-    expect(map.terrainLegend.F).toBeUndefined();
+    expect(map.terrainLegend.X).toBeUndefined();
     const state = createMatchFromMapCode(code, { terrains: coreTerrainCatalog });
     expect(state.players["player-2" as keyof typeof state.players]?.teamId).toBe(
       state.players["player-1" as keyof typeof state.players]?.teamId

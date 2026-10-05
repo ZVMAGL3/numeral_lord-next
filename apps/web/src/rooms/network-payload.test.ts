@@ -10,7 +10,7 @@ const coreTestMapCatalogs = { terrains: coreTerrainCatalog };
 const coreTestMapCode = serializeMapCode({
   ...TEST_MAP_DEFINITION,
   id: "core-only-network-test",
-  terrain: TEST_MAP_DEFINITION.terrain.replaceAll("F", "M"),
+  terrain: TEST_MAP_DEFINITION.terrain.replaceAll("X", "M"),
   terrainLegend: coreTestTerrainLegend,
   requiredTerrainModIds: []
 }, coreTestMapCatalogs);

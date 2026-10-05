@@ -505,14 +505,14 @@ describe("workshop persistence and data-only Mod objects", () => {
   });
 
   it("publishes a JSON map without installing its required terrain Mod", async () => {
-    const published = await store.publishMap({ code: TEST_MAP_CODE, description: "内置地形示例" }, "地图作者");
+    const published = await store.publishMap({ code: TEST_MAP_CODE, description: "Mod 地形示例" }, "地图作者");
     expect(published.kind).toBe("map");
 
     const catalog = await store.list();
     expect(catalog.maps).toMatchObject([{
       id: published.id,
-      mapId: "1001",
-      name: "昏晓",
+      mapId: "test-map-explicit-mod",
+      name: "Mod依赖测试地图",
       players: 2,
       requiredTerrainModIds: ["mod-oil-field"],
       authorName: "地图作者"
@@ -520,20 +520,20 @@ describe("workshop persistence and data-only Mod objects", () => {
     expect("code" in catalog.maps[0]!).toBe(false);
     const detail = await store.get({ kind: "map", id: published.id });
     expect(detail?.kind).toBe("map");
-    if (detail?.kind === "map") expect(JSON.parse(detail.entry.code)).toMatchObject({ name: "昏晓" });
+    if (detail?.kind === "map") expect(JSON.parse(detail.entry.code)).toMatchObject({ name: "Mod依赖测试地图" });
 
     const persisted = new WorkshopStore(dataDirectory);
     expect((await persisted.list()).maps).toEqual(catalog.maps);
     expect(JSON.parse(await readFile(join(dataDirectory, "workshop.json"), "utf8"))).toMatchObject({ version: 1 });
   });
 
-  it("imports the legacy JSON once and persists the same portable records in local SQLite", async () => {
+  it("imports a legacy workshop JSON file once and persists the same portable records in local SQLite", async () => {
     await store.publishMap({ code: TEST_MAP_CODE, description: "旧 JSON 地图" }, "旧作者");
     const sqlitePath = join(dataDirectory, "local.sqlite");
     const sqlite = new SqliteWorkshopStore(sqlitePath, dataDirectory);
     try {
       const firstRead = await sqlite.list();
-      expect(firstRead.maps).toMatchObject([{ mapId: "1001", name: "昏晓", authorName: "旧作者" }]);
+      expect(firstRead.maps).toMatchObject([{ mapId: "test-map-explicit-mod", name: "Mod依赖测试地图", authorName: "旧作者" }]);
       const customCode = JSON.stringify({ ...(JSON.parse(TEST_MAP_CODE) as object), id: "sqlite-custom-map" });
       await sqlite.publishMap({ code: customCode, description: "本地数据库地图" }, "本地玩家");
     } finally {
@@ -542,7 +542,7 @@ describe("workshop persistence and data-only Mod objects", () => {
 
     const reopened = new SqliteWorkshopStore(sqlitePath, dataDirectory);
     try {
-      expect((await reopened.list()).maps.map((map) => map.name)).toEqual(["昏晓", "昏晓"]);
+      expect((await reopened.list()).maps.map((map) => map.name)).toEqual(["Mod依赖测试地图", "Mod依赖测试地图"]);
       await expect(reopened.publishMap({ code: TEST_MAP_CODE, description: "重复" }, "其他作者"))
         .rejects.toThrow(/已经发布/);
     } finally {

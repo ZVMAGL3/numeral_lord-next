@@ -97,4 +97,7 @@ onBeforeUnmount(() => {
 .fullscreen-ball-button:hover, .fullscreen-ball-button:focus-visible { transform: scale(1.04); border-color: rgba(113, 231, 211, .85); background: #143749; outline: none; }
 .fullscreen-ball:not(.revealed) .fullscreen-ball-button > span { transform: translateX(-10px); }
 .fullscreen-ball-message { position: absolute; right: calc(100% + 8px); top: 50%; width: max-content; max-width: min(220px, 65vw); transform: translateY(-50%); padding: 7px 9px; border: 1px solid rgba(111, 165, 186, .35); border-radius: 8px; color: #dcecf5; background: #10283a; box-shadow: 0 6px 20px rgba(0,0,0,.32); font-size: 10px; }
+@media (max-width: 360px) {
+  .fullscreen-ball { right: calc(max(8px, env(safe-area-inset-right)) - 23px); }
+}
 </style>

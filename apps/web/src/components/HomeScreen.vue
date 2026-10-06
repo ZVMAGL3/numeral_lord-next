@@ -53,9 +53,9 @@ const emit = defineEmits<{
 </template>
 
 <style scoped>
-.home-screen { position: relative; display: flex; min-height: 0; align-items: center; overflow: visible; padding: clamp(18px,3vh,32px) 0; }
-.menu-content { position: relative; z-index: 1; width: min(960px,100%); margin: 0 auto; transform: translateY(clamp(10px,1.8vh,20px)); }
-.menu-grid { display: grid; height: clamp(210px,28vh,306px); grid-template-columns: repeat(3,minmax(0,1fr)); gap: clamp(10px,1.2vw,16px); }
+.home-screen { position: relative; display: flex; width: 100%; min-width: 0; min-height: 0; align-items: center; overflow: visible; padding: clamp(18px,3vh,32px) 0; }
+.menu-content { position: relative; z-index: 1; width: min(960px,100%); min-width: 0; margin: 0 auto; transform: translateY(clamp(10px,1.8vh,20px)); }
+.menu-grid { display: grid; width: 100%; min-width: 0; height: clamp(210px,28vh,306px); grid-template-columns: repeat(3,minmax(0,1fr)); gap: clamp(10px,1.2vw,16px); }
 .menu-card { --accent: #7fe4d8; position: relative; display: flex; min-width: 0; min-height: 0; flex-direction: column; justify-content: space-between; gap: 10px; margin: 0; padding: clamp(16px,1.6vw,24px); overflow: hidden; border: 1px solid rgba(129,172,194,.31); border-radius: clamp(16px,1.4vw,22px); background: linear-gradient(148deg,rgba(27,55,73,.9),rgba(14,32,48,.97)); color: #f4f9ff; text-align: left; transition: border-color .18s ease,transform .18s ease,box-shadow .18s ease,background .18s ease; }
 .map-card { --accent: #afc5ee; background: linear-gradient(148deg,rgba(33,50,77,.91),rgba(17,31,50,.97)); }
 .workshop-card { --accent: #f3c77e; background: linear-gradient(148deg,rgba(64,49,44,.9),rgba(27,31,43,.97)); }

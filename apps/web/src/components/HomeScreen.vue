@@ -77,23 +77,23 @@ const emit = defineEmits<{
 @media (max-width:680px) and (orientation:portrait) {
   .home-screen { padding: 10px 0; }
   .menu-content { width: 100%; transform: translateY(clamp(6px,1vh,10px)); }
-  .menu-grid { height: clamp(108px,17vh,136px); gap: clamp(5px,1.5vw,8px); }
-  .menu-card { gap: 3px; padding: 8px clamp(5px,1.5vw,9px); border-radius: 13px; }
+  .menu-grid { height: clamp(148px,18vh,164px); gap: clamp(5px,1.5vw,8px); }
+  .menu-card { gap: 4px; padding: 10px clamp(5px,1.5vw,9px); border-radius: 14px; }
   .card-top { font-size: clamp(8px,1.9vw,9px); letter-spacing: .025em; }
-  .card-art svg { width: min(80%,64px); height: clamp(34px,6vh,48px); }
-  .card-bottom { align-items: center; gap: 5px; padding-top: 5px; }
-  .card-bottom strong { font-size: clamp(11px,3.2vw,13px); white-space: nowrap; }
+  .card-art svg { width: min(82%,76px); height: clamp(42px,7vh,58px); }
+  .card-bottom { align-items: center; gap: 5px; padding-top: 7px; }
+  .card-bottom strong { font-size: clamp(12px,3.4vw,14px); white-space: nowrap; }
   .card-bottom small { display: none; }
   .card-enter { font-size: 18px; }
 }
 @media (orientation:landscape) and (min-width:520px) and (max-width:900px) and (max-height:850px) {
   .home-screen { padding-block: 8px; }
   .menu-content { transform: translateY(clamp(8px,1.5vh,14px)); }
-  .menu-grid { height: clamp(112px,24vh,177px); gap: clamp(8px,1.2vw,15px); }
+  .menu-grid { height: clamp(146px,43vh,190px); gap: clamp(8px,1.2vw,15px); }
   .menu-card { gap: 5px; padding: clamp(9px,1.2vw,14px); border-radius: 14px; }
   .card-top { font-size: 9px; }
-  .card-art svg { width: min(100%,150px); height: clamp(36px,9vh,74px); }
-  .card-bottom { padding-top: 7px; }
+  .card-art svg { width: min(100%,150px); height: clamp(48px,14vh,68px); }
+  .card-bottom { padding-top: 8px; }
   .card-bottom strong { font-size: clamp(13px,1.8vh,16px); }
   .card-bottom small { margin-top: 5px; font-size: 10px; }
   .card-enter { font-size: 24px; }
@@ -101,10 +101,10 @@ const emit = defineEmits<{
 @media (orientation:landscape) and (min-width:520px) and (max-width:900px) and (max-height:480px) {
   .home-screen { padding-block: 4px; }
   .menu-content { transform: translateY(4px); }
-  .menu-grid { height: clamp(106px,34vh,114px); gap: 7px; }
+  .menu-grid { height: clamp(126px,42vh,162px); gap: 7px; }
   .menu-card { gap: 3px; padding: 7px; border-radius: 11px; }
   .card-top { font-size: 8px; }
-  .card-art svg { width: min(88%,88px); height: clamp(32px,10vh,38px); }
+  .card-art svg { width: min(88%,88px); height: clamp(40px,14vh,54px); }
   .card-bottom { padding-top: 4px; }
   .card-bottom strong { font-size: 11px; }
   .card-bottom small { display: none; }
@@ -119,10 +119,10 @@ const emit = defineEmits<{
   .card-bottom { padding-top: 7px; }
 }
 @media (max-width:360px) and (orientation:portrait) {
-  .menu-grid { height: clamp(104px,17vh,118px); }
+  .menu-grid { height: clamp(130px,24vh,146px); }
   .menu-card { padding: 7px 4px; }
   .card-top { font-size: 8px; }
-  .card-art svg { width: min(80%,54px); height: clamp(30px,6vh,36px); }
+  .card-art svg { width: min(80%,58px); height: clamp(38px,7vh,46px); }
   .card-bottom { gap: 2px; padding-top: 4px; }
   .card-bottom strong { font-size: 11px; }
   .card-enter { font-size: 15px; }

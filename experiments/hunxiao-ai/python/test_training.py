@@ -1,10 +1,13 @@
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 import torch
 from model import PolicyValueNet, position_batch, load_checkpoint
 from train import game_sample_weight, losses, read_samples, seat_balance_weights
+from train_v2 import stratified_probe
 
 
 def sample(count=3, value=None, source="unlabelled", seat=1, game_weight=1.0):
@@ -56,6 +59,52 @@ class TrainingContracts(unittest.TestCase):
         self.assertGreater(medium_game, long_game)
         self.assertGreaterEqual(game_sample_weight(1000, True), 0.35)
         self.assertLessEqual(game_sample_weight(1, True), 1.5)
+
+    def test_validation_probe_covers_each_game_and_both_seats_at_multiple_stages(self):
+        samples = []
+        for game_id in range(3):
+            for seat in (1, 2):
+                for ply in range(10):
+                    item = sample(seat=seat)
+                    item["gameId"] = game_id
+                    item["ply"] = ply
+                    samples.append(item)
+        probe = stratified_probe(samples)
+        groups = {(item["gameId"], item["seat"]) for item in probe}
+        self.assertEqual(len(groups), 6)
+        for game_id in range(3):
+            for seat in (1, 2):
+                selected = [item["ply"] for item in probe if item["gameId"] == game_id and item["seat"] == seat]
+                self.assertGreaterEqual(len(selected), 3)
+                self.assertLessEqual(min(selected), 1)
+                self.assertGreaterEqual(max(selected), 8)
+        self.assertLessEqual(len(stratified_probe(samples, maximum=5)), 5)
+
+    def test_v2_trainer_saves_the_best_held_out_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata = root / "metadata.json"
+            data = root / "samples.jsonl"
+            metadata.write_text(json.dumps({"fingerprint": "rules"}), encoding="utf-8")
+            rows = []
+            for game_id in range(2):
+                for ply in range(6):
+                    item = sample(seat=ply % 2 + 1)
+                    item["gameId"] = game_id
+                    item["ply"] = ply
+                    rows.append(item)
+            data.write_text("\n".join(json.dumps(item) for item in rows), encoding="utf-8")
+            checkpoint = root / "model.pt"
+            trainer = Path(__file__).with_name("train_v2.py")
+            result = subprocess.run([sys.executable, str(trainer), "--data", str(data), "--metadata", str(metadata),
+                                     "--output", str(checkpoint), "--device", "cpu", "--steps", "2",
+                                     "--batch-size", "4", "--eval-interval", "1", "--patience", "2", "--seed", "42"],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            report = json.loads(checkpoint.with_suffix(".metrics.json").read_text(encoding="utf-8"))
+            self.assertTrue(checkpoint.exists())
+            self.assertEqual(report["trainerVersion"], 2)
+            self.assertLessEqual(report["finalProbeLoss"][0], report["initialProbeLoss"][0] + 1e-7)
 
     def test_policy_loss_uses_game_weights(self):
         model = PolicyValueNet()

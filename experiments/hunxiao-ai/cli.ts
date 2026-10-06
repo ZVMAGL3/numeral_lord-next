@@ -78,7 +78,7 @@ function consecutivePromotionFailures(name: string): number {
 
 function metadata() {
   const files = ["environment.ts", "search.ts", "worker.ts", "training-policy.ts", "protocol.ts", "runtime.ts", "cli.ts", "tsconfig.json", "launch.mjs", "worker-bootstrap.mjs",
-    "python/model.py", "python/train.py", "python/serve.py", "python/requirements-xpu.txt"];
+    "python/model.py", "python/train.py", "python/train_v2.py", "python/serve.py", "python/requirements-xpu.txt"];
   const implementationHashes = Object.fromEntries(files.map((path) => ["experiments/hunxiao-ai/" + path,
     createHash("sha256").update(readFileSync(join(experimentRoot, path))).digest("hex")]));
   return { schemaVersion: 1, fingerprint: env.fingerprint, featureSchema: env.featureSchema,
@@ -299,7 +299,10 @@ async function runGames(settings: RunSettings) {
 }
 
 async function train(data: string, metadataPath: string, output: string, resume?: string): Promise<void> {
-  const args = [fileURLToPath(new URL("./python/train.py", import.meta.url)), "--data", data, "--metadata", metadataPath,
+  const runName = basename(dirname(data));
+  const iterationMatch = runName.match(/^hunxiao-selfplay-1000-iteration-(\d+)-\d{8}$/);
+  const trainer = iterationMatch && Number(iterationMatch[1]) >= 16 ? "train_v2.py" : "train.py";
+  const args = [fileURLToPath(new URL(`./python/${trainer}`, import.meta.url)), "--data", data, "--metadata", metadataPath,
     "--output", output, "--device", flags.device!, "--steps", flags.steps!, "--batch-size", flags["batch-size"]!, "--seed", flags.seed!];
   if (resume) args.push("--resume", resume);
   await new Promise<void>((resolveRun, rejectRun) => {

@@ -146,8 +146,8 @@ function saveEditorDraft(definition: MapDefinition): void {
   const mapId = typeof route.params.mapId === "string" ? route.params.mapId : "";
   if (!mapId) return;
   pendingEditorDraft = { mapId, definition };
-  if (editorDraftFlushTimer !== undefined) return;
-  editorDraftFlushTimer = window.setTimeout(flushEditorDraft, 400);
+  if (editorDraftFlushTimer !== undefined) clearTimeout(editorDraftFlushTimer);
+  editorDraftFlushTimer = window.setTimeout(flushEditorDraft, 1_000);
 }
 function flushEditorDraft(): void {
   if (editorDraftFlushTimer !== undefined) clearTimeout(editorDraftFlushTimer);

@@ -27,4 +27,30 @@ describe("board pointer hit testing", () => {
     expect(findBoardCellAtPoint(layouts, terrain, { x: 0, y: 15 })).toBeUndefined();
     expect(findBoardCellAtPoint(layouts, terrain, { x: 0, y: 15 }, true)).toBe("void");
   });
+
+  it("uses nearby grid candidates without changing hit results", () => {
+    const radius = 10;
+    const columns = 8;
+    const rows = 7;
+    const gridLayouts = new Map<string, { x: number; y: number; radius: number }>();
+    const gridTerrain = new Map<string, string>();
+    for (let row = 0; row < rows; row += 1) {
+      for (let column = 0; column < columns; column += 1) {
+        const id = `${column},${row}`;
+        gridLayouts.set(id, {
+          x: Math.sqrt(3) * radius * (column + ((row + 1) % 2) * 0.5),
+          y: 1.5 * radius * row,
+          radius
+        });
+        gridTerrain.set(id, "core/plain");
+      }
+    }
+    const geometry = { columns, rows, originX: 0, originY: 0, radius };
+    for (let y = -radius; y <= 1.5 * radius * rows; y += 2.5) {
+      for (let x = -radius; x <= Math.sqrt(3) * radius * (columns + 1); x += 2.5) {
+        expect(findBoardCellAtPoint(gridLayouts, gridTerrain, { x, y }, true, geometry))
+          .toBe(findBoardCellAtPoint(gridLayouts, gridTerrain, { x, y }, true));
+      }
+    }
+  });
 });

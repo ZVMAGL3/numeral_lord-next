@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import type { MapDefinition } from "@numeral-lord/core-content";
-import { getPoweredUnitIds, fromCellId, PLAYER_COLOR_OPTIONS, type CellId } from "@numeral-lord/game-core";
+import { getPoweredUnitIds, fromCellId, toCellId, PLAYER_COLOR_OPTIONS, type CellId, type GameState, type PlayerId, type UnitId } from "@numeral-lord/game-core";
 import { createMatchFromMapDefinition } from "@numeral-lord/core-content";
 import HexBoard from "./HexBoard.vue";
 import MapEditorToolbar from "./MapEditorToolbar.vue";
@@ -60,6 +60,11 @@ const playerNames = ref<string[]>([]), playerColors = ref<string[]>([]);
 const playersInput = ref(String(players.value));
 const terrain = ref<string[]>([]), soldiers = ref<Array<{ index: number; seat: number; strength: number }>>([]);
 const specialUnits = ref<Array<{ index: number; kind: "wild" | "blocker"; strength: number }>>([]), teams = ref<number[]>([]);
+// Painting is performed one cell at a time on potentially 3,000+ cell maps.
+// Keep O(1) index lookups instead of filtering/scanning the full unit arrays
+// for every pointer event; array positions are updated on swap-removal.
+const soldierPositions = new Map<number, number>();
+const specialUnitPositions = new Map<number, number>();
 const selectedTerrain = ref("core/plain"), placementMode = ref<"terrain" | "unit" | "erase">("terrain");
 const unitKind = ref<"player" | "wild" | "blocker">("player"), selectedSeat = ref(1), strength = ref(1);
 const fillRadius = ref(0);
@@ -85,7 +90,7 @@ const editorPointers = new Map<number, { x: number; y: number }>();
 let editorDrag: { x: number; y: number; panX: number; panY: number } | undefined;
 let editorPinch: { distance: number; zoom: number; x: number; y: number; panX: number; panY: number } | undefined;
 let editorDraggingAt = 0;
-let editorAltPainting = false;
+const editorAltPainting = ref(false);
 let lastAltPaintIndex = -1;
 let workspaceResizeObserver: ResizeObserver | undefined;
 let editorViewportMetrics: {
@@ -155,6 +160,12 @@ onMounted(() => {
 onBeforeUnmount(() => {
   if (previewStateFrame !== undefined) cancelAnimationFrame(previewStateFrame);
   previewStateFrame = undefined;
+  if (previewPowerTimer !== undefined) clearTimeout(previewPowerTimer);
+  previewPowerTimer = undefined;
+  if (draftEmissionTimer !== undefined) {
+    clearTimeout(draftEmissionTimer);
+    draftEmissionTimer = undefined;
+  }
   workspaceResizeObserver?.disconnect();
   editorViewportMetrics = undefined;
 });
@@ -178,8 +189,8 @@ function resetFromDefinition(definition?: MapDefinition | null): void {
     const id = definition.terrainLegend[definition.terrain[i]!] ?? "core/plain";
     return terrainLookup.value.has(id) ? id : "core/plain";
   });
-  soldiers.value = (definition?.soldiers ?? []).map(([index, seat, value]) => ({ index, seat, strength: value }));
-  specialUnits.value = (definition?.specialUnits ?? []).map(([index, kind, value]) => ({ index, kind, strength: value }));
+  setSoldiers((definition?.soldiers ?? []).map(([index, seat, value]) => ({ index, seat, strength: value })));
+  setSpecialUnits((definition?.specialUnits ?? []).map(([index, kind, value]) => ({ index, kind, strength: value })));
   teams.value = Array.from({ length: players.value }, (_, i) => definition?.teams[i] ?? i + 1);
   selectedSeat.value = Math.min(selectedSeat.value, players.value);
 }
@@ -187,14 +198,15 @@ watch(() => props.initial, (value) => resetFromDefinition(value), { immediate: t
 watch([width, height], () => {
   const count = Math.max(1, Math.min(4096, width.value * height.value));
   terrain.value = Array.from({ length: count }, (_, i) => terrain.value[i] ?? "core/plain");
-  soldiers.value = soldiers.value.filter((u) => u.index < count); specialUnits.value = specialUnits.value.filter((u) => u.index < count);
+  setSoldiers(soldiers.value.filter((u) => u.index < count));
+  setSpecialUnits(specialUnits.value.filter((u) => u.index < count));
 });
 watch(players, (value) => {
   selectedSeat.value = Math.min(selectedSeat.value, value);
   playerNames.value = Array.from({ length: value }, (_, i) => playerNames.value[i]?.trim() || `玩家 ${i + 1}`);
   playerColors.value = Array.from({ length: value }, (_, i) => playerColors.value[i] ?? PLAYER_COLOR_OPTIONS[i % PLAYER_COLOR_OPTIONS.length]!.value);
   teams.value = Array.from({ length: value }, (_, i) => teams.value[i] ?? i + 1);
-  soldiers.value = soldiers.value.filter((u) => u.seat <= value);
+  setSoldiers(soldiers.value.filter((u) => u.seat <= value));
 }, { flush: "sync" });
 function applyBoardSize(): void {
   const nextWidth = Math.max(1, Math.min(64, Math.trunc(Number(widthInput.value) || 1)));
@@ -284,21 +296,22 @@ const editorCatalogs = computed(() => {
 });
 const editorTerrainVisualAssets = computed(() => terrainVisualAssetsForCatalogs(editorCatalogs.value));
 const previewState = shallowRef(createMatchFromMapDefinition(previewDefinition.value, editorCatalogs.value));
+const previewChangedCellIds = shallowRef<readonly CellId[]>([]);
+const previewPoweredUnitIds = shallowRef([...getPoweredUnitIds(previewState.value, editorCatalogs.value.terrains ?? runtimeMapCatalogs.terrains)]);
 let previewStateFrame: number | undefined;
-watch([previewDefinition, editorCatalogs], () => {
-  if (previewStateFrame !== undefined) cancelAnimationFrame(previewStateFrame);
-  previewStateFrame = requestAnimationFrame(() => {
-    previewStateFrame = undefined;
-    previewState.value = createMatchFromMapDefinition(previewDefinition.value, editorCatalogs.value);
-  });
-}, { flush: "post" });
+let previewPowerTimer: number | undefined;
+let draftEmissionTimer: number | undefined;
+watch([width, height, players, playerNames, playerColors, teams, selectedTerrainModIds], schedulePreviewStateRebuild,
+  { deep: true, flush: "post" });
+watch(editorCatalogs, schedulePreviewStateRebuild, { flush: "post" });
+watch([name, width, height, players, playerNames, playerColors, teams, selectedTerrainModIds], scheduleDraftEmission,
+  { deep: true });
 const playerOptions = computed(() => Array.from({ length: players.value }, (_, index) => ({
   seat: index + 1,
   name: playerNames.value[index]?.trim() || `玩家 ${index + 1}`,
   color: playerColors.value[index] ?? "#668fb8"
 })));
-const previewPoweredUnitIds = computed(() => [...getPoweredUnitIds(previewState.value, editorCatalogs.value.terrains ?? runtimeMapCatalogs.terrains)]);
-watch(previewDefinition, (definition) => emit("draft", definition), { immediate: true });
+emit("draft", previewDefinition.value);
 
 function paintCellId(cellId: CellId): void {
   const { column, row } = fromCellId(cellId);
@@ -306,40 +319,159 @@ function paintCellId(cellId: CellId): void {
   if (index >= 0 && index < terrain.value.length) paintCell(index);
 }
 function paintCell(index: number): void {
-  if (!editorAltPainting && performance.now() - editorDraggingAt < 220) return;
-  for (const target of indexesInRange(index, fillRadius.value)) paintOneCell(target);
+  if (!editorAltPainting.value && performance.now() - editorDraggingAt < 220) return;
+  const targets = indexesInRange(index, fillRadius.value);
+  for (const target of targets) paintOneCell(target);
+  syncPreviewCells(targets);
+  scheduleDraftEmission();
 }
 function paintOneCell(index: number): void {
   if (placementMode.value === "terrain") {
     terrain.value[index] = selectedTerrain.value;
     if (terrainLookup.value.get(selectedTerrain.value)?.blocked) {
-      soldiers.value = soldiers.value.filter((u) => u.index !== index);
-      specialUnits.value = specialUnits.value.filter((u) => u.index !== index);
+      removeSoldierAt(index);
+      removeSpecialUnitAt(index);
     }
     return;
   }
   if (placementMode.value === "erase") {
-    soldiers.value = soldiers.value.filter((u) => u.index !== index);
-    specialUnits.value = specialUnits.value.filter((u) => u.index !== index);
+    removeSoldierAt(index);
+    removeSpecialUnitAt(index);
     return;
   }
   if (terrainLookup.value.get(terrain.value[index]!)?.blocked) return;
   if (unitKind.value === "player") {
-    specialUnits.value = specialUnits.value.filter((u) => u.index !== index);
-    const current = soldiers.value.find((u) => u.index === index);
+    removeSpecialUnitAt(index);
+    const currentPosition = soldierPositions.get(index);
+    const current = currentPosition === undefined ? undefined : soldiers.value[currentPosition];
     if (current) Object.assign(current, { seat: selectedSeat.value, strength: strength.value });
-    else soldiers.value.push({ index, seat: selectedSeat.value, strength: strength.value });
+    else {
+      soldierPositions.set(index, soldiers.value.length);
+      soldiers.value.push({ index, seat: selectedSeat.value, strength: strength.value });
+    }
   } else {
-    soldiers.value = soldiers.value.filter((u) => u.index !== index);
-    specialUnits.value = specialUnits.value.filter((u) => u.index !== index);
+    removeSoldierAt(index);
+    removeSpecialUnitAt(index);
+    specialUnitPositions.set(index, specialUnits.value.length);
     specialUnits.value.push({ index, kind: unitKind.value, strength: strength.value });
   }
 }
+
+function setSoldiers(value: Array<{ index: number; seat: number; strength: number }>): void {
+  soldiers.value = value;
+  soldierPositions.clear();
+  value.forEach((soldier, position) => soldierPositions.set(soldier.index, position));
+}
+
+function setSpecialUnits(value: Array<{ index: number; kind: "wild" | "blocker"; strength: number }>): void {
+  specialUnits.value = value;
+  specialUnitPositions.clear();
+  value.forEach((unit, position) => specialUnitPositions.set(unit.index, position));
+}
+
+function removeSoldierAt(index: number): void {
+  const position = soldierPositions.get(index);
+  if (position === undefined) return;
+  const lastPosition = soldiers.value.length - 1;
+  const last = soldiers.value[lastPosition];
+  if (position !== lastPosition && last) {
+    soldiers.value[position] = last;
+    soldierPositions.set(last.index, position);
+  }
+  soldiers.value.pop();
+  soldierPositions.delete(index);
+}
+
+function removeSpecialUnitAt(index: number): void {
+  const position = specialUnitPositions.get(index);
+  if (position === undefined) return;
+  const lastPosition = specialUnits.value.length - 1;
+  const last = specialUnits.value[lastPosition];
+  if (position !== lastPosition && last) {
+    specialUnits.value[position] = last;
+    specialUnitPositions.set(last.index, position);
+  }
+  specialUnits.value.pop();
+  specialUnitPositions.delete(index);
+}
+
 function indexesInRange(centerIndex: number, radius: number): number[] {
   return getMapCellRangeIndices(centerIndex, width.value, terrain.value.length, radius);
 }
+
+function syncPreviewCells(indexes: readonly number[]): void {
+  const state = previewState.value;
+  const cells = state.cells as Record<CellId, GameState["cells"][CellId]>;
+  const units = state.units as Record<UnitId, GameState["units"][UnitId]>;
+  const changed: CellId[] = [];
+  let powerTopologyChanged = false;
+  for (const index of indexes) {
+    const cellId = toCellId({ row: Math.floor(index / width.value), column: index % width.value });
+    const cell = cells[cellId];
+    if (!cell) continue;
+    const terrainId = terrain.value[index] ?? cell.terrainId;
+    const soldierPosition = soldierPositions.get(index);
+    const specialPosition = specialUnitPositions.get(index);
+    const soldier = soldierPosition === undefined ? undefined : soldiers.value[soldierPosition];
+    const special = specialPosition === undefined ? undefined : specialUnits.value[specialPosition];
+    let nextUnit: GameState["units"][UnitId] | undefined;
+    if (soldier) {
+      const unitId = `seat-${soldier.seat}-cell-${index}` as UnitId;
+      nextUnit = { id: unitId, definitionId: "core/roamer", ownerId: `player-${soldier.seat}` as PlayerId,
+        cellId, strength: soldier.strength };
+    } else if (special) {
+      const unitId = `${special.kind}-cell-${index}` as UnitId;
+      nextUnit = { id: unitId, definitionId: `core/${special.kind}`,
+        ownerId: (special.kind === "wild" ? "__neutral_wild__" : "__neutral_blocker__") as PlayerId,
+        cellId, strength: special.strength };
+    }
+    const previousUnit = cell.unitId ? units[cell.unitId] : undefined;
+    const unchanged = cell.terrainId === terrainId
+      && previousUnit?.id === nextUnit?.id
+      && previousUnit?.definitionId === nextUnit?.definitionId
+      && previousUnit?.ownerId === nextUnit?.ownerId
+      && previousUnit?.strength === nextUnit?.strength;
+    if (unchanged) continue;
+    if (cell.terrainId !== terrainId || previousUnit?.ownerId !== nextUnit?.ownerId) powerTopologyChanged = true;
+    if (cell.unitId && cell.unitId !== nextUnit?.id) delete units[cell.unitId];
+    if (nextUnit) units[nextUnit.id] = nextUnit;
+    cells[cellId] = { id: cell.id, coordinate: cell.coordinate, terrainId, ...(nextUnit ? { unitId: nextUnit.id } : {}) };
+    changed.push(cellId);
+  }
+  if (!changed.length) return;
+  previewChangedCellIds.value = changed;
+  previewState.value = { ...state, sequence: state.sequence + 1, cells, units };
+  if (powerTopologyChanged) schedulePreviewPowerRefresh();
+}
+
+function schedulePreviewStateRebuild(): void {
+  if (previewStateFrame !== undefined) cancelAnimationFrame(previewStateFrame);
+  previewStateFrame = requestAnimationFrame(() => {
+    previewStateFrame = undefined;
+    previewChangedCellIds.value = [];
+    previewState.value = createMatchFromMapDefinition(previewDefinition.value, editorCatalogs.value);
+    schedulePreviewPowerRefresh();
+  });
+}
+
+function schedulePreviewPowerRefresh(): void {
+  if (previewPowerTimer !== undefined) clearTimeout(previewPowerTimer);
+  previewPowerTimer = window.setTimeout(() => {
+    previewPowerTimer = undefined;
+    previewPoweredUnitIds.value = [...getPoweredUnitIds(previewState.value,
+      editorCatalogs.value.terrains ?? runtimeMapCatalogs.terrains)];
+  }, 350);
+}
+
+function scheduleDraftEmission(): void {
+  if (draftEmissionTimer !== undefined) clearTimeout(draftEmissionTimer);
+  draftEmissionTimer = window.setTimeout(() => {
+    draftEmissionTimer = undefined;
+    emit("draft", previewDefinition.value);
+  }, 200);
+}
+
 function onCellPressStart(cellId: CellId): void {
-  if (!editorAltPainting) return;
   const { column, row } = fromCellId(cellId);
   const index = row * width.value + column;
   if (index < 0 || index >= terrain.value.length) return;
@@ -347,7 +479,7 @@ function onCellPressStart(cellId: CellId): void {
   paintCell(index);
 }
 function onCellPointerEnter(cellId: CellId): void {
-  if (!editorAltPainting) return;
+  if (!editorAltPainting.value) return;
   const { column, row } = fromCellId(cellId);
   const index = row * width.value + column;
   if (index < 0 || index >= terrain.value.length || index === lastAltPaintIndex) return;
@@ -357,7 +489,7 @@ function onCellPointerEnter(cellId: CellId): void {
 }
 function onEditorPointerDown(event: PointerEvent): void {
   if (event.altKey) {
-    editorAltPainting = true;
+    editorAltPainting.value = true;
     lastAltPaintIndex = -1;
     editorDraggingAt = performance.now();
     // Keep pointer events targeted at the Pixi canvas so its hex hit-testing
@@ -380,7 +512,7 @@ function onEditorPointerDown(event: PointerEvent): void {
   }
 }
 function onEditorPointerMove(event: PointerEvent): void {
-  if (editorAltPainting) {
+  if (editorAltPainting.value) {
     editorDraggingAt = performance.now();
     return;
   }
@@ -418,8 +550,8 @@ function onEditorPointerMove(event: PointerEvent): void {
 function onEditorPointerUp(event: PointerEvent): void {
   window.removeEventListener("pointerup", onEditorPointerUp);
   window.removeEventListener("pointercancel", onEditorPointerUp);
-  if (editorAltPainting) {
-    editorAltPainting = false;
+  if (editorAltPainting.value) {
+    editorAltPainting.value = false;
     lastAltPaintIndex = -1;
     return;
   }
@@ -470,7 +602,7 @@ function createId(): string { return typeof crypto.randomUUID === "function" ? c
     <div class="editor-layout">
       <div ref="boardWorkspace" class="board-workspace" @pointerdown="onEditorPointerDown" @pointermove="onEditorPointerMove" @pointerup="onEditorPointerUp" @pointercancel="onEditorPointerUp" @wheel.prevent="onEditorWheel">
         <div ref="editorBoard" class="editor-board">
-          <HexBoard preview editable :view-zoom="editorZoom" :view-pan="editorPan" :state="previewState" :selected-unit-id="null" :legal-action-cell-ids="[]" :actionable-unit-ids="[]" :powered-unit-ids="previewPoweredUnitIds" :terrain-catalog="editorCatalogs.terrains" :terrain-visual-assets="editorTerrainVisualAssets" @cell-click="paintCellId" @cell-pointer-enter="onCellPointerEnter" @cell-press-start="onCellPressStart" />
+          <HexBoard preview editable :view-zoom="editorZoom" :view-pan="editorPan" :state="previewState" :changed-cell-ids="previewChangedCellIds" :paint-drag-active="editorAltPainting" :selected-unit-id="null" :legal-action-cell-ids="[]" :actionable-unit-ids="[]" :powered-unit-ids="previewPoweredUnitIds" :terrain-catalog="editorCatalogs.terrains" :terrain-visual-assets="editorTerrainVisualAssets" @cell-click="paintCellId" @cell-pointer-enter="onCellPointerEnter" @cell-press-start="onCellPressStart" />
         </div>
         <div class="board-caption">{{ width }} × {{ height }} 格 <span>·</span> {{ soldiers.length + specialUnits.length }} 个初始单位 <span>·</span> 点击绘制，按住 Alt 拖动批量绘制</div>
       </div>

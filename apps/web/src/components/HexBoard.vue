@@ -3,8 +3,7 @@ import { Application, Assets, BitmapFont, BitmapText, Container, Graphics, Recta
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { CellId, GameState, PlayerId, TerrainCatalog, TerrainVisualSpec, UnitId } from "@numeral-lord/game-core";
 import { getBoardWheelZoomFactor, MAX_BOARD_ZOOM, MIN_BOARD_ZOOM, zoomBoardCameraAtPoint } from "../board/board-camera.js";
-import { shouldCreateCellHitTarget } from "../board/board-cell-hit-target.js";
-import { findBoardCellAtPoint } from "../board/board-hit-test.js";
+import { findBoardCellAtPoint, type BoardHitTestGeometry } from "../board/board-hit-test.js";
 import { getMovementHintCellIds } from "../board/board-interaction.js";
 import { boardLayoutChanged, GAME_BOARD_HEX_RADIUS, getBoardHexRadius, type BoardLayoutSnapshot } from "../board/board-layout.js";
 import { BOARD_RENDER_Z_INDEX } from "../board/board-render-order.js";
@@ -30,6 +29,10 @@ const props = withDefaults(defineProps<{
   preview?: boolean;
   /** 地图编辑器复用实际渲染器，并接收格子点击。 */
   editable?: boolean;
+  /** 编辑器只绘制这些发生变化的格子；其余场景仍走完整同步。 */
+  changedCellIds?: readonly CellId[];
+  /** Alt 拖动绘制时才逐事件做一次手动格子命中测试。 */
+  paintDragActive?: boolean;
   /** 紧凑地图卡片隐藏兵力数字，但保留棋子图像。 */
   showUnitLabels?: boolean;
   /** 地图编辑器提供的相机参数；与 CSS 变换不同，不会改变布局测量值。 */
@@ -105,6 +108,13 @@ let terrainVisualRevisionCache: string | undefined;
 let terrainVisualCatalogCache: TerrainCatalog | undefined;
 let terrainVisualAssetsCache: Readonly<Record<string, Readonly<Record<string, string>>>> | undefined;
 let terrainVisualTextureRevisionCache = -1;
+let lastDrawnState: GameState | undefined;
+let lastDrawnCells: GameState["cells"] | undefined;
+let lastDrawnUnits: GameState["units"] | undefined;
+let lastDrawnPlayers: GameState["players"] | undefined;
+let lastDrawnBoard: GameState["board"] | undefined;
+let lastDrawnPoweredUnitIds: readonly UnitId[] | undefined;
+let lastEditorPointerCellId: CellId | undefined;
 const emptyCellIds: readonly CellId[] = [];
 const pointers = new Map<number, { x: number; y: number }>();
 const pressedCellIds = new Map<number, CellId>();
@@ -115,6 +125,7 @@ let dragOrigin: { x: number; y: number; panX: number; panY: number } | undefined
 let pinchOrigin: { distance: number; zoom: number; x: number; y: number; panX: number; panY: number } | undefined;
 let cameraMovedAt = 0;
 const cellLayouts = new Map<CellId, { x: number; y: number; radius: number }>();
+let cellHitTestGeometry: BoardHitTestGeometry | undefined;
 const powered = computed(() => new Set(props.poweredUnitIds));
 const actionableUnits = computed(() => new Set(props.actionableUnitIds));
 const UNIT_STRENGTH_BITMAP_FONT = "NumeralLordUnitStrength";
@@ -229,7 +240,8 @@ onMounted(async () => {
   terrainLayer = new Container();
   terrainLayer.label = "terrain-and-hit-targets";
   terrainLayer.zIndex = BOARD_RENDER_Z_INDEX.terrainBase;
-  terrainLayer.eventMode = props.editable ? "passive" : "none";
+  terrainLayer.eventMode = "none";
+  terrainLayer.interactiveChildren = false;
   // 同一格的前后关系统一由 board-render-order.ts 管理，不按创建先后碰运气。
   unitLayer = new Container();
   unitLayer.label = "units-and-terrain-effects";
@@ -259,7 +271,14 @@ onMounted(async () => {
   cameraLayer.addChild(terrainLayer, unitLayer, terrainOverlayLayer, unitStrengthLayer,
     unitHoverLayer, actionPulseLayer);
   instance.stage.addChild(cameraLayer);
-  if (!props.preview) {
+  if (props.preview && props.editable) {
+    instance.stage.on("pointertap", onBoardBackgroundTap);
+    instance.stage.on("pointerdown", onEditorBoardCellPressStart);
+    instance.stage.on("pointermove", onEditorBoardPointerMove);
+    instance.stage.on("pointerup", onEditorBoardPointerUp);
+    instance.stage.on("pointerupoutside", onEditorBoardPointerUp);
+    instance.stage.on("pointercancel", onEditorBoardPointerUp);
+  } else if (!props.preview) {
     instance.stage.on("pointertap", onBoardBackgroundTap);
     instance.stage.on("pointerdown", onCameraPointerDown);
     instance.stage.on("pointerdown", onBoardCellPressStart);
@@ -337,6 +356,11 @@ onBeforeUnmount(() => {
   instance.stage.off("pointercancel", onCameraPointerUp);
   instance.stage.off("pointercancel", onBoardCellPressEnd);
   instance.stage.off("pointerout", onBoardPointerOut);
+  instance.stage.off("pointerdown", onEditorBoardCellPressStart);
+  instance.stage.off("pointermove", onEditorBoardPointerMove);
+  instance.stage.off("pointerup", onEditorBoardPointerUp);
+  instance.stage.off("pointerupoutside", onEditorBoardPointerUp);
+  instance.stage.off("pointercancel", onEditorBoardPointerUp);
   pointers.clear();
   pressedCellIds.clear();
   actionPulses.clear();
@@ -356,12 +380,20 @@ onBeforeUnmount(() => {
   layoutRows = 0;
   layoutWidth = 0;
   layoutHeight = 0;
+  cellHitTestGeometry = undefined;
   layoutRevision = 0;
   terrainVisualRevision = "";
   cellCoordinates.clear();
   terrainByCell.clear();
   occupiedByCell.clear();
   lastInteractionOverlayDraw = undefined;
+  lastDrawnState = undefined;
+  lastDrawnCells = undefined;
+  lastDrawnUnits = undefined;
+  lastDrawnPlayers = undefined;
+  lastDrawnBoard = undefined;
+  lastDrawnPoweredUnitIds = undefined;
+  lastEditorPointerCellId = undefined;
   cellLayouts.clear();
   for (const waiters of terrainTextureWaiters.values()) waiters.delete(draw);
   try {
@@ -389,11 +421,12 @@ function draw(): void {
   const topTerrainLayer = terrainOverlayLayer;
   const drawStartedAt = performance.now();
   const { width, height } = canvasHost.value.getBoundingClientRect();
-    // 切换标签页或热更新时尺寸可能短暂变成 0；没有有效绘制尺寸前保留上一帧。
+  // 切换标签页或热更新时尺寸可能短暂变成 0；没有有效绘制尺寸前保留上一帧。
   if (width < 1 || height < 1) return;
   const { columns, rows } = props.state.board;
-  const cells = Object.values(props.state.cells);
   const nextTerrainVisualRevision = getTerrainVisualRevision();
+  if (tryDrawIncrementalEditorChanges(width, height, nextTerrainVisualRevision)) return;
+  const cells = Object.values(props.state.cells);
   const terrainVisualsChanged = nextTerrainVisualRevision !== terrainVisualRevision;
   const layoutStartedAt = performance.now();
   const layoutChanged = boardLayoutChanged({
@@ -439,6 +472,7 @@ function draw(): void {
   const boardHeight = 2 * radius + 1.5 * radius * (rows - 1);
   const offsetX = (width - boardWidth) / 2 + horizontalUnit * radius / 2;
   const offsetY = (height - boardHeight) / 2 + radius;
+  cellHitTestGeometry = { columns, rows, originX: offsetX, originY: offsetY, radius };
 
   if (layoutChanged) {
     for (const cell of cells) {
@@ -611,7 +645,63 @@ function draw(): void {
     unitCellsReused,
     pulsesRebuilt
   });
+  lastDrawnState = props.state;
+  lastDrawnCells = props.state.cells;
+  lastDrawnUnits = props.state.units;
+  lastDrawnPlayers = props.state.players;
+  lastDrawnBoard = props.state.board;
+  lastDrawnPoweredUnitIds = props.poweredUnitIds;
   requestPreviewRender();
+}
+
+function tryDrawIncrementalEditorChanges(width: number, height: number, nextTerrainVisualRevision: string): boolean {
+  const changedCellIds = props.changedCellIds;
+  if (!props.preview || !props.editable || !changedCellIds?.length || !lastDrawnState
+    || props.state === lastDrawnState || props.state.cells !== lastDrawnCells
+    || props.state.units !== lastDrawnUnits || props.state.players !== lastDrawnPlayers
+    || props.state.board !== lastDrawnBoard || props.poweredUnitIds !== lastDrawnPoweredUnitIds
+    || layoutColumns !== props.state.board.columns || layoutRows !== props.state.board.rows
+    || layoutWidth !== width || layoutHeight !== height || nextTerrainVisualRevision !== terrainVisualRevision) return false;
+
+  const startedAt = performance.now();
+  for (const cellId of changedCellIds) {
+    const cell = props.state.cells[cellId];
+    if (!cell) continue;
+    const wasOccupied = occupiedByCell.get(cellId) ?? false;
+    const occupied = Boolean(cell.unitId && props.state.units[cell.unitId]);
+    const terrainChanged = terrainByCell.get(cellId) !== cell.terrainId;
+    const occupiedOverlayChanged = wasOccupied !== occupied
+      && props.terrainCatalog?.[cell.terrainId]?.visuals?.overlay?.whenOccupied;
+    if (terrainChanged || occupiedOverlayChanged) {
+      clearRenderedTerrainCell(cellId);
+      drawTerrainCell(cell, terrainLayer!, terrainOverlayLayer!);
+      terrainByCell.set(cellId, cell.terrainId);
+    }
+    occupiedByCell.set(cellId, occupied);
+    drawEditorUnitCell(cell);
+    updateUnitStrengthLabel(cell, actionableUnits.value, powered.value);
+  }
+  lastDrawnState = props.state;
+  lastDrawnCells = props.state.cells;
+  lastDrawnUnits = props.state.units;
+  lastDrawnPlayers = props.state.players;
+  lastDrawnBoard = props.state.board;
+  lastDrawnPoweredUnitIds = props.poweredUnitIds;
+  emit("boardDrawMeasured", {
+    sequence: props.state.sequence,
+    durationMs: performance.now() - startedAt,
+    layoutMs: 0,
+    terrainDrawMs: 0,
+    unitDrawMs: performance.now() - startedAt,
+    labelDrawMs: 0,
+    cellCount: cellLayouts.size,
+    unitCount: renderedUnitCells.size,
+    unitCellsRebuilt: changedCellIds.length,
+    unitCellsReused: 0,
+    pulsesRebuilt: 0
+  });
+  requestPreviewRender();
+  return true;
 }
 
 function clearRenderedTerrainCell(cellId: CellId): void {
@@ -646,20 +736,50 @@ function drawTerrainCell(cell: GameState["cells"][CellId], baseLayer: Container,
       props.terrainCatalog?.[cell.terrainId]?.visuals, props.terrainVisualAssets?.[cell.terrainId] ?? {},
       Boolean(cell.unitId && props.state.units[cell.unitId]));
   }
-  // 地形点击区域与画面同步绘制，但不参与可见绘制；复用既有命中测试语义。
-  if (shouldCreateCellHitTarget(cell.terrainId, props.editable ?? false)) {
-    const tile = new Graphics().poly(getTerrainHexCoordinates(x, y, radius * TERRAIN_ART_FOOTPRINT_SCALE))
-      .fill({ color: 0xffffff, alpha: 0.001 });
-    if (props.preview && !props.editable) tile.eventMode = "none";
-    else if (props.editable) {
-      tile.eventMode = "static";
-      tile.cursor = "pointer";
-      tile.on("pointertap", () => emit("cellClick", cell.id));
-      tile.on("pointerover", () => emit("cellPointerEnter", cell.id));
-      tile.on("pointerdown", () => emit("cellPressStart", cell.id));
-    } else tile.eventMode = "none";
-    rendered.base.addChild(tile);
+}
+
+function drawEditorUnitCell(cell: GameState["cells"][CellId]): void {
+  const previous = renderedUnitCells.get(cell.id);
+  const unit = cell.unitId ? props.state.units[cell.unitId] : undefined;
+  const layout = cellLayouts.get(cell.id);
+  if (!unit || !layout) {
+    if (previous) {
+      removeRenderedCellVisual(previous);
+      renderedUnitCells.delete(cell.id);
+    }
+    return;
   }
+  const player = props.state.players[unit.ownerId];
+  const isPowered = powered.value.has(unit.id);
+  const isHighlighted = Boolean(props.highlightedPlayerId === unit.ownerId);
+  const visualKey = [cell.terrainId, unit.id, unit.ownerId, unit.definitionId, unit.strength,
+    player?.color, isPowered, isHighlighted].join("\u0000");
+  if (previous?.key === visualKey) return;
+  if (previous) removeRenderedCellVisual(previous);
+
+  const layers: Array<{ layer: Container; container: Container }> = [];
+  const cellArt = new Container();
+  cellArt.label = `unit-body-${cell.id}`;
+  cellArt.eventMode = "none";
+  cellArt.interactiveChildren = false;
+  const neutralColor = unit.definitionId === "core/wild" ? 0xc28a4c : 0x8491a4;
+  const unitPlacement = getTerrainArtPlacement(layout.x, layout.y, layout.radius, getUnitRenderScale(isPowered));
+  addCellSprite(cellArt, createLegacySprite(legacyTextureUrls.plainHexMask), unitPlacement,
+    UNIT_BODY_ALPHA, player ? colorNumber(player.color) : neutralColor);
+  addCellSprite(cellArt, createLegacySprite(legacyTextureUrls.plainHex), unitPlacement, UNIT_DETAIL_ALPHA, 0xffffff);
+  unitArtLayer?.addChild(cellArt);
+  layers.push({ layer: unitArtLayer!, container: cellArt });
+  if (isHighlighted) {
+    const hoverArt = new Container();
+    hoverArt.label = `team-hover-${cell.id}`;
+    hoverArt.eventMode = "none";
+    hoverArt.interactiveChildren = false;
+    hoverArt.addChild(new Graphics().poly(getTerrainHexCoordinates(layout.x, layout.y, layout.radius * 0.82))
+      .stroke({ color: 0xffdc75, width: Math.max(2, layout.radius * 0.075), alpha: 0.96 }));
+    unitHoverLayer?.addChild(hoverArt);
+    layers.push({ layer: unitHoverLayer!, container: hoverArt });
+  }
+  renderedUnitCells.set(cell.id, { key: visualKey, layers });
 }
 
 function getTerrainVisualRevision(): string {
@@ -763,13 +883,15 @@ function getCellIdAtPoint(event: { readonly global: Readonly<{ x: number; y: num
   const stage = app?.stage;
   if (!stage) return undefined;
   const point = cameraLayer?.toLocal(event.global) ?? stage.toLocal(event.global);
-  return findBoardCellAtPoint(cellLayouts, terrainByCell, point, props.editable ?? false);
+  return findBoardCellAtPoint(cellLayouts, terrainByCell, point, props.editable ?? false, cellHitTestGeometry);
 }
 
 /** 直接把屏幕坐标换算为棋盘格，不让 Pixi 逐个测试所有六边形图形。 */
 function onBoardBackgroundTap(event: FederatedPointerEvent): void {
   if (props.editable) {
-    if (event.target === app?.stage) emit("backgroundClick");
+    const cellId = getCellIdAtPoint(event);
+    if (cellId) emit("cellClick", cellId);
+    else if (event.target === app?.stage) emit("backgroundClick");
     return;
   }
   if (performance.now() - cameraMovedAt < 250) return;
@@ -778,6 +900,29 @@ function onBoardBackgroundTap(event: FederatedPointerEvent): void {
   const hitTestMs = performance.now() - hitTestStartedAt;
   if (cellId) emit("cellClick", cellId, hitTestMs);
   else if (event.target === app?.stage) emit("backgroundClick");
+}
+
+/** 编辑器只在 Alt 绘制期间命中一次棋盘坐标，不为每格保留 Pixi 交互图形。 */
+function onEditorBoardCellPressStart(event: FederatedPointerEvent): void {
+  const nativeEvent = event.nativeEvent as PointerEvent;
+  if (!props.editable || !(props.paintDragActive || nativeEvent.altKey)) return;
+  const cellId = getCellIdAtPoint(event);
+  if (cellId) {
+    lastEditorPointerCellId = cellId;
+    emit("cellPressStart", cellId);
+  }
+}
+
+function onEditorBoardPointerMove(event: FederatedPointerEvent): void {
+  if (!props.editable || !props.paintDragActive) return;
+  const cellId = getCellIdAtPoint(event);
+  if (cellId === lastEditorPointerCellId) return;
+  lastEditorPointerCellId = cellId;
+  if (cellId) emit("cellPointerEnter", cellId);
+}
+
+function onEditorBoardPointerUp(): void {
+  lastEditorPointerCellId = undefined;
 }
 
 function onBoardCellPressStart(event: FederatedPointerEvent): void {
@@ -860,59 +1005,65 @@ function requestPreviewRender(): void {
 /** 兵力数字独立成层，始终显示在地形与棋子图像上方。 */
 function drawUnitStrengthLabels(): void {
   if (!unitStrengthLayer) return;
-  if (props.showUnitLabels === false) {
-    for (const { text } of renderedUnitLabels.values()) {
-      unitStrengthLayer.removeChild(text);
-      text.destroy();
-    }
-    renderedUnitLabels.clear();
-    return;
-  }
   const highlightedIds = props.highlightedUnitIds === undefined
     ? actionableUnits.value
     : new Set(props.highlightedUnitIds);
   const poweredUnitIds = powered.value;
-  const visibleLabels = new Set<CellId>();
   for (const cell of Object.values(props.state.cells)) {
-    const unit = cell.unitId ? props.state.units[cell.unitId] : undefined;
-    const layout = cellLayouts.get(cell.id);
-    if (!unit || !layout) continue;
-    const highlighted = props.preview || props.editable || highlightedIds.has(unit.id);
-    const isPowered = poweredUnitIds.has(unit.id);
-    const fontSize = getUnitStrengthFontSize(layout.radius, isPowered, props.preview && !props.editable);
-    const key = [unit.id, unit.strength, isPowered, highlighted, fontSize, layout.x, layout.y, layout.radius].join("\u0000");
-    visibleLabels.add(cell.id);
-    const previous = renderedUnitLabels.get(cell.id);
-    if (previous?.key === key) continue;
-    if (previous) {
-      unitStrengthLayer.removeChild(previous.text);
-      previous.text.destroy();
-    }
-    const text = new BitmapText({
-      text: String(unit.strength),
-      style: {
-        fontFamily: UNIT_STRENGTH_BITMAP_FONT,
-        fontWeight: "900",
-        // Keep labels at a stable world size. The shared 128px bitmap atlas is
-        // large enough for camera scaling, so zooming never rebuilds label objects.
-        fontSize,
-        fill: "#ffffff",
-        align: "center"
-      }
-    });
-    text.alpha = highlighted ? 1 : 0.46;
-    text.anchor.set(0.5);
-    text.position.set(layout.x, layout.y + layout.radius * 0.02);
-    text.eventMode = "none";
-    unitStrengthLayer.addChild(text);
-    renderedUnitLabels.set(cell.id, { key, text });
+    updateUnitStrengthLabel(cell, highlightedIds, poweredUnitIds);
   }
   for (const [cellId, label] of renderedUnitLabels) {
-    if (visibleLabels.has(cellId)) continue;
+    if (props.state.cells[cellId]) continue;
     unitStrengthLayer.removeChild(label.text);
     label.text.destroy();
     renderedUnitLabels.delete(cellId);
   }
+}
+
+function updateUnitStrengthLabel(
+  cell: GameState["cells"][CellId],
+  highlightedIds: ReadonlySet<UnitId>,
+  poweredUnitIds: ReadonlySet<UnitId>
+): void {
+  if (!unitStrengthLayer) return;
+  const previous = renderedUnitLabels.get(cell.id);
+  const unit = cell.unitId ? props.state.units[cell.unitId] : undefined;
+  const layout = cellLayouts.get(cell.id);
+  if (props.showUnitLabels === false || !unit || !layout) {
+    if (previous) {
+      unitStrengthLayer.removeChild(previous.text);
+      previous.text.destroy();
+      renderedUnitLabels.delete(cell.id);
+    }
+    return;
+  }
+  const highlighted = props.preview || props.editable || highlightedIds.has(unit.id);
+  const isPowered = poweredUnitIds.has(unit.id);
+  const fontSize = getUnitStrengthFontSize(layout.radius, isPowered, props.preview && !props.editable);
+  const key = [unit.id, unit.strength, isPowered, highlighted, fontSize, layout.x, layout.y, layout.radius].join("\u0000");
+  if (previous?.key === key) return;
+  if (previous) {
+    unitStrengthLayer.removeChild(previous.text);
+    previous.text.destroy();
+  }
+  const text = new BitmapText({
+    text: String(unit.strength),
+    style: {
+      fontFamily: UNIT_STRENGTH_BITMAP_FONT,
+      fontWeight: "900",
+      // Keep labels at a stable world size. The shared 128px bitmap atlas is
+      // large enough for camera scaling, so zooming never rebuilds label objects.
+      fontSize,
+      fill: "#ffffff",
+      align: "center"
+    }
+  });
+  text.alpha = highlighted ? 1 : 0.46;
+  text.anchor.set(0.5);
+  text.position.set(layout.x, layout.y + layout.radius * 0.02);
+  text.eventMode = "none";
+  unitStrengthLayer.addChild(text);
+  renderedUnitLabels.set(cell.id, { key, text });
 }
 
 function onCameraPointerDown(event: { pointerId: number; global: { x: number; y: number } }): void {

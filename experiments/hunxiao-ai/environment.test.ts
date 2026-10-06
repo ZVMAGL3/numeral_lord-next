@@ -63,9 +63,9 @@ test("连续训练第6轮起忽略已运行循环传入的旧回合限制", () =
   assert.equal(effectiveLearningRoundLimit("manual-selfplay-test", 30), 30);
 });
 
-test("连续训练从第12轮起将并行对局限制为8", () => {
+test("连续训练从第12轮起将并行对局限制为12", () => {
   assert.equal(effectiveWorkerCount("hunxiao-selfplay-1000-iteration-11-20261006", 16), 16);
-  assert.equal(effectiveWorkerCount("hunxiao-selfplay-1000-iteration-12-20261006", 16), 8);
+  assert.equal(effectiveWorkerCount("hunxiao-selfplay-1000-iteration-12-20261006", 16), 12);
   assert.equal(effectiveWorkerCount("manual-selfplay-test", 16), 16);
 });
 

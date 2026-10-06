@@ -11,12 +11,12 @@ export function effectiveLearningRoundLimit(runName: string, requestedLimit: num
   return continuousIteration && Number(continuousIteration[1]) >= 6 ? 0 : requestedLimit;
 }
 
-/** Leave headroom for the desktop, inference services, and local development servers. */
+/** Keep extra headroom after the local demo is closed, without returning to full 16-worker load. */
 export function effectiveWorkerCount(runName: string, requestedWorkers: number): number {
   if (!Number.isSafeInteger(requestedWorkers) || requestedWorkers < 1) throw new RangeError("requestedWorkers must be a positive integer");
   const continuousIteration = runName.match(/^hunxiao-selfplay-1000-iteration-(\d+)-\d{8}$/);
   return continuousIteration && Number(continuousIteration[1]) >= 12
-    ? Math.min(requestedWorkers, 8)
+    ? Math.min(requestedWorkers, 12)
     : requestedWorkers;
 }
 

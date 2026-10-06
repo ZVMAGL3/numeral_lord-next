@@ -604,7 +604,6 @@ function createId(): string { return typeof crypto.randomUUID === "function" ? c
         <div ref="editorBoard" class="editor-board">
           <HexBoard preview editable :view-zoom="editorZoom" :view-pan="editorPan" :state="previewState" :changed-cell-ids="previewChangedCellIds" :paint-drag-active="editorAltPainting" :selected-unit-id="null" :legal-action-cell-ids="[]" :actionable-unit-ids="[]" :powered-unit-ids="previewPoweredUnitIds" :terrain-catalog="editorCatalogs.terrains" :terrain-visual-assets="editorTerrainVisualAssets" @cell-click="paintCellId" @cell-pointer-enter="onCellPointerEnter" @cell-press-start="onCellPressStart" />
         </div>
-        <div class="board-caption">{{ width }} × {{ height }} 格 <span>·</span> {{ soldiers.length + specialUnits.length }} 个初始单位 <span>·</span> 点击绘制，按住 Alt 拖动批量绘制</div>
       </div>
       <MapEditorToolbar v-model:mode="placementMode" v-model:selected-terrain="selectedTerrain" v-model:unit-preset="unitPreset" v-model:strength="strength" v-model:fill-radius="fillRadius" :terrain-options="terrainOptions" :player-options="playerOptions" />
       <aside v-if="settingsOpen" class="editor-settings" role="dialog" aria-label="地图设置">

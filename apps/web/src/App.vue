@@ -21,7 +21,7 @@ const {
 </script>
 
 <template>
-<main class="app-shell" :class="{ 'game-shell': showGame }" @click="gameActionsOpen = false; gameOptionsOpen = false">
+<main class="app-shell" :class="{ 'home-shell': showHome, 'game-shell': showGame }" @click="gameActionsOpen = false; gameOptionsOpen = false">
     <header class="topbar" :class="{ 'game-topbar': showGame, 'battle-hall-topbar': showRoomEntry, 'lobby-topbar': showLobby }" :style="showGame ? { '--team-color': hoveredTeamColor ?? (currentPlayer ? teamColors.get(currentPlayer.teamId) : undefined) } : undefined">
       <div class="brand-block">
         <button v-if="showGame" class="game-options-trigger game-pause-trigger" type="button" aria-label="对局菜单（不会暂停其他玩家）" title="对局菜单" aria-haspopup="menu" :aria-expanded="gameOptionsOpen" @click.stop="gameOptionsOpen = !gameOptionsOpen; gameActionsOpen = false"><span class="pause-glyph" aria-hidden="true"><i></i><i></i></span></button>

@@ -109,5 +109,34 @@ const emit = defineEmits<{
 .menu-card:hover .card-enter { transform: translateX(4px); }
 @media (max-width:800px) { .menu-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }.home-screen { min-height: 0; }.menu-heading { align-items: stretch; flex-direction: column; }.player-name { width: 100%; }.menu-card { min-height: 280px; }.card-art { min-height: 138px; }.card-art svg { height: 130px; } }
 @media (max-width:560px) { .home-screen { padding: 21px 15px; border-radius: 20px; }.menu-grid { grid-template-columns: 1fr; }.menu-heading { gap: 17px; margin-bottom: 20px; }.menu-card { min-height: 207px; padding: 17px 19px; }.card-art { position: absolute; top: 32px; right: -30px; width: 52%; min-height: 0; opacity: .45; }.card-art svg { height: 126px; }.card-bottom { margin-top: 110px; }.card-bottom strong { font-size: 22px; } }
+@media (orientation: landscape) and (min-width: 520px) and (max-height: 850px) {
+  .home-screen { min-height: 0; padding: clamp(10px,2.5vh,22px) clamp(12px,2vw,26px); border-radius: 18px; }
+  .menu-content { display: grid; width: min(1100px,100%); height: 100%; max-height: 100%; grid-template-rows: auto minmax(0,1fr); align-content: center; gap: clamp(6px,1.4vh,12px); }
+  .menu-heading { align-items: center; justify-content: flex-end; gap: 0; margin: 0; }
+  .menu-heading > div { display: none; }
+  .player-name { width: min(270px,45%); gap: 5px; font-size: 10px; }
+  .player-name input { height: clamp(34px,5.5vh,42px); font-size: 13px; }
+  .menu-grid { width: 100%; height: clamp(165px,44dvh,320px); max-height: 100%; align-self: center; grid-template-columns: repeat(3,minmax(0,1fr)); gap: clamp(8px,1.5vw,16px); }
+  .menu-card { min-height: 0; padding: clamp(10px,1.7vw,20px); border-radius: 15px; }
+  .card-top,.card-bottom { gap: 8px; }
+  .card-mark { width: 26px; height: 26px; }
+  .card-art { position: relative; top: auto; right: auto; width: auto; min-height: 0; flex: 1; opacity: 1; }
+  .card-art svg { height: min(17dvh,112px); max-height: 100%; }
+  .card-bottom { margin-top: 0; padding-top: clamp(8px,1.5vh,14px); }
+  .card-bottom strong { font-size: clamp(15px,2vw,24px); }
+  .card-bottom small { margin-top: 4px; font-size: 10px; }
+}
+@media (orientation: landscape) and (min-width: 520px) and (max-height: 480px) {
+  .menu-grid { height: clamp(156px,45dvh,220px); }
+  .menu-card { padding: 9px 11px; }
+  .card-art svg { height: min(14dvh,76px); }
+  .card-bottom small { display: none; }
+}
+@media (orientation: landscape) and (min-width: 520px) and (max-width: 620px) and (max-height: 850px) {
+  .menu-card { padding: 9px; }
+  .card-art { display: none; }
+  .card-bottom strong { font-size: 14px; }
+  .card-enter { font-size: 22px; }
+}
 @media (prefers-reduced-motion:reduce) { .menu-card,.card-enter { transition: none; }.menu-card:hover,.menu-card:hover .card-enter { transform: none; } }
 </style>

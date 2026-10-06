@@ -120,7 +120,8 @@ async function run(job: JobOptions): Promise<GameOutput> {
     actions += 1;
   }
   const finished = state.turn.phase === "finished";
-  const trainingFilteredAfterRound = maxRoundPlayed > job.maxLearningRounds || state.turn.round > job.maxLearningRounds;
+  const trainingFilteredAfterRound = job.maxLearningRounds > 0
+    && (maxRoundPlayed > job.maxLearningRounds || state.turn.round > job.maxLearningRounds);
   const orderedSamples = ([1, 2] as const).flatMap((seat) => samplesBySeat[seat].map((sample, index) => ({
     sample, team: sampleTeamsBySeat[seat][index]!
   }))).sort((a, b) => a.sample.ply - b.sample.ply);

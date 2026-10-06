@@ -6,9 +6,9 @@
 
 不启用任何十回合结算、兵力比例判胜、占地判胜或强制快速结束规则。自然对局继续到核心规则判胜；运行器的 `--max-actions` 只是计算预算，耗尽时只记录为截断局，不把它伪装成胜、负或平局。
 
-默认 `--max-learning-rounds 30` 是训练数据筛选条件：第 31 回合及之后的局面不采集训练样本，对局仍按正常规则继续并保存结果/棋谱。第 1 至 30 回合保留的样本会在整盘自然结束后使用真实胜负标签；若在 30 回合内被动作预算截断，价值标签按所选 bootstrap 策略处理。长局的前 30 回合仍然能教会模型如何从早期局面走向之后的真实胜负。`--max-actions` 默认提高到 10,000，只作为防止异常漫长对局耗尽机器时间的安全停止；达到它仍是无胜负的截断局。
+默认 `--max-learning-rounds 0` 表示不设回合过滤，整盘自然对局的局面都可参与训练；正整数仍可用于单独实验的采样窗口。每盘最多保留 256 个局面，并对双方席位分别蓄水池抽样。训练时以 10 回合为参照，对局越长样本权重越低，最低降到 0.35；10 回合内获胜的样本再按对局短的程度增加权重，最高总权重为 1.5。例如 5 回合获胜样本权重为 1.5、同盘败方为 1.25，20 回合双方样本约为 0.71。该权重只改变训练损失，不改变胜负规则或结束时间。对局仍按正常规则继续并保存结果/棋谱；整盘自然结束后使用真实胜负标签，动作预算截断的样本则按所选 bootstrap 策略处理。`--max-actions` 默认提高到 10,000，只作为防止异常漫长对局耗尽机器时间的安全停止；达到它仍是无胜负的截断局。
 
-每局都有可检查的 `learningEligible` 和 `trainingFilteredAfterRound` 字段。回合过滤会显示在训练对局列表中；被过滤的后段棋谱仍可用于复盘。规则/特征更改会改变 fingerprint，因此临时规则产生的旧样本和旧模型不会与当前训练混用。
+每局都有可检查的 `learningEligible` 和 `trainingFilteredAfterRound` 字段。新训练默认不再过滤回合；旧记录中的过滤标记仍会保留，供复盘区分。规则/特征更改会改变 fingerprint，因此临时规则产生的旧样本和旧模型不会与当前训练混用。
 
 ## 运行
 
@@ -23,7 +23,7 @@ pnpm ai:typecheck
 验证一轮训练闭环：
 
 ```powershell
-pnpm ai pilot --name b580-normal-smoke --iterations 1 --games 2 --workers 2 --simulations 8 --max-actions 800 --max-learning-rounds 30 --max-samples 128 --steps 100 --batch-size 64 --device xpu --replay
+pnpm ai pilot --name b580-normal-smoke --iterations 1 --games 2 --workers 2 --simulations 8 --max-actions 800 --max-learning-rounds 0 --max-samples 128 --steps 100 --batch-size 64 --device xpu --replay
 ```
 
 `pilot` 顺序执行搜索老师示范、PyTorch/XPU 训练、网络自博弈、继续训练和固定对手评测。所有棋局在 Node worker 无界面运行。`--replay` 会保存精确动作，可在本地试玩页中逐步前进/后退、自动播放、暂停或拖动进度条。
@@ -64,7 +64,7 @@ experiments/hunxiao-ai/.venv/Scripts/python.exe experiments/hunxiao-ai/python/en
 
 训练样本按先后手分别做蓄水池抽样，训练损失也会平衡两边的样本权重。终局价值按棋谱终局胜者和样本席位重新核对，避免先前按动作顺序排序样本时把价值视角错配给另一边。席位仍作为输入特征之一，让同一模型能根据自己当前的行动顺序调整策略。
 
-生成长局数据时建议显式设置 `--think-ms 50`：它把每次搜索限制在约 50 毫秒，单盘 800 至 3,300 步的评测耗时约 41 至 196 秒；这是软时限，单次网络评估仍可能超时。达到 `--max-actions` 仍只算截断，不产生胜负。学习窗口继续只采集前 30 回合局面，对局按核心规则自然继续。
+生成长局数据时建议显式设置 `--think-ms 50`：它把每次搜索限制在约 50 毫秒，单盘 800 至 3,300 步的评测耗时约 41 至 196 秒；这是软时限，单次网络评估仍可能超时。达到 `--max-actions` 仍只算截断，不产生胜负。默认采集对局所有回合的局面，对局按核心规则自然继续。
 
 运行数据保存在 `experiments/hunxiao-ai/runs/`，该目录为本机数据，模型、日志和虚拟环境不作为源码提交。旧临时规则 run 保留作历史复盘；其 checkpoint/fingerprint 不属于当前正常规则模型。
 

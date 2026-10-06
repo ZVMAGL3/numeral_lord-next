@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { calculateReinforcementIncome, hasTerrainCapability, selectSpatialPatternCells, type GameState } from "../../packages/game-core/src/index.js";
 import { coreTerrainCatalog } from "../../packages/core-content/src/index.js";
 import { CANDIDATE_SIZE, DEFAULT_MATCH_CONDITION_IDS, EXPERIMENT_MATCH_CONDITION_IDS, GLOBAL_SIZE, OBSERVATION_SIZE, SEARCH_HEURISTIC_WEIGHTS, TRAINING_WIN_SPEED_DISCOUNT, createEnvironment } from "./environment.js";
-import { isWithinLearningRoundWindow } from "./training-policy.js";
+import { effectiveLearningRoundLimit, isWithinLearningRoundWindow } from "./training-policy.js";
 import { occupiedCellsByTeam, totalStrengthByTeam } from "./temporary-rules.js";
 
 const env = createEnvironment(undefined, { includeTemporaryRoundLimit: true });
@@ -44,14 +44,23 @@ test("默认环境只用核心自然胜负规则，不启用临时十回合条�
   assert.notEqual(normalEnv.step(roundTen, { type: "end-reinforcement-phase" }).turn.phase, "finished");
 });
 
-test("第31回合以后的局面不采样，但不会结束自然对局", () => {
+test("学习回合上限为0时长局全程采样且自然结束", () => {
   assert.equal(isWithinLearningRoundWindow(30, 30), true);
   assert.equal(isWithinLearningRoundWindow(31, 30), false);
   assert.equal(isWithinLearningRoundWindow(100, 30), false);
-  assert.throws(() => isWithinLearningRoundWindow(0, 30), /positive integer/);
+  assert.equal(isWithinLearningRoundWindow(31, 0), true);
+  assert.equal(isWithinLearningRoundWindow(1000, 0), true);
+  assert.throws(() => isWithinLearningRoundWindow(0, 0), /positive integer/);
   assert.throws(() => isWithinLearningRoundWindow(31.5, 30), /positive integer/);
+  assert.throws(() => isWithinLearningRoundWindow(31, -1), /non-negative integer/);
   const state = { ...normalEnv.initialState(), turn: { ...normalEnv.initialState().turn, round: 31 } };
   assert.notEqual(normalEnv.step(state, { type: "end-action-phase" }).turn.phase, "finished");
+});
+
+test("连续训练第6轮起忽略已运行循环传入的旧回合限制", () => {
+  assert.equal(effectiveLearningRoundLimit("hunxiao-selfplay-1000-iteration-5-20261006", 30), 30);
+  assert.equal(effectiveLearningRoundLimit("hunxiao-selfplay-1000-iteration-6-20261006", 30), 0);
+  assert.equal(effectiveLearningRoundLimit("manual-selfplay-test", 30), 30);
 });
 
 test("全体合法动作可用共享引擎执行且输入状态保持不可变", () => {

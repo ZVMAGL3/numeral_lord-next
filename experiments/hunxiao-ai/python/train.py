@@ -2,11 +2,26 @@
 from __future__ import annotations
 import argparse
 import json
+import math
 import random
 import time
 from pathlib import Path
 import torch
 from model import PolicyValueNet, SCHEMA_VERSION, atomic_json, load_checkpoint, position_batch, select_device
+
+TARGET_GAME_ROUNDS = 10
+MIN_GAME_WEIGHT = 0.35
+SHORT_WIN_BONUS = 0.5
+
+
+def game_sample_weight(rounds: int, winner: bool) -> float:
+    """Softly downweight long matches and favor the winner of a quick decisive game."""
+    if not isinstance(rounds, int) or rounds < 1:
+        rounds = TARGET_GAME_ROUNDS
+    length_weight = max(MIN_GAME_WEIGHT, min(1.25, math.sqrt(TARGET_GAME_ROUNDS / rounds)))
+    quickness = max(0.0, (TARGET_GAME_ROUNDS - rounds) / TARGET_GAME_ROUNDS)
+    winner_weight = 1.0 + SHORT_WIN_BONUS * quickness if winner else 1.0
+    return min(1.5, length_weight * winner_weight)
 
 
 def read_samples(path: Path, fingerprint: str):
@@ -42,11 +57,18 @@ def read_samples(path: Path, fingerprint: str):
                 else:
                     reports[game_id] = None
             report = reports[game_id]
+            winning_seat = None
             if report and report.get("finished"):
                 winners = report.get("winningTeamIds", [])
+                if len(winners) == 1 and winners[0] in {"team-1", "team-2"}:
+                    winning_seat = int(winners[0].split("-")[1])
                 sample["value"] = (0.0 if not winners else
                                    1.0 if f"team-{sample['seat']}" in winners else -1.0)
                 sample["valueSource"] = "terminal"
+            sample["gameWeight"] = game_sample_weight(
+                report.get("rounds", TARGET_GAME_ROUNDS) if report else TARGET_GAME_ROUNDS,
+                winning_seat == sample["seat"],
+            )
             samples.append(sample)
     if not samples:
         raise ValueError("no training samples")
@@ -66,15 +88,17 @@ def losses(model, batch, device, bootstrap_weight: float):
     target = torch.zeros_like(logits)
     values, weights = [], []
     seat_weights = seat_balance_weights(batch, device)
+    game_weights = torch.tensor([sample.get("gameWeight", 1.0) for sample in batch], dtype=torch.float32, device=device)
+    sample_weights = seat_weights * game_weights
     per_sample_policy = []
     for i, sample in enumerate(batch):
         target[i, :len(sample["policy"])] = torch.tensor(sample["policy"], device=device)
         values.append(sample["value"] if sample["value"] is not None else 0.0)
         weights.append(1.0 if sample["valueSource"] == "terminal" else bootstrap_weight if sample["value"] is not None else 0.0)
     per_sample_policy = -(target * torch.log_softmax(logits, dim=-1)).sum(dim=-1)
-    policy_loss = (per_sample_policy * seat_weights).sum() / seat_weights.sum().clamp_min(1)
+    policy_loss = (per_sample_policy * sample_weights).sum() / sample_weights.sum().clamp_min(1)
     target_value = torch.tensor(values, dtype=torch.float32, device=device)
-    value_weight = torch.tensor(weights, dtype=torch.float32, device=device) * seat_weights
+    value_weight = torch.tensor(weights, dtype=torch.float32, device=device) * sample_weights
     value_loss = ((predicted_value - target_value).square() * value_weight).sum() / value_weight.sum().clamp_min(1)
     return policy_loss + value_loss, policy_loss, value_loss
 
@@ -149,6 +173,9 @@ def main():
     report = {"device": str(device), "torch": torch.__version__, "parameters": sum(p.numel() for p in model.parameters()),
               "samples": len(samples), "trainingSamples": len(training), "validationSamples": len(validation),
               "samplesBySeat": {str(seat): sum(sample["seat"] == seat for sample in samples) for seat in (1, 2)},
+              "gameWeighting": {"targetRounds": TARGET_GAME_ROUNDS, "minimumLongGameWeight": MIN_GAME_WEIGHT,
+                                "maximumShortWinBonus": SHORT_WIN_BONUS,
+                                "meanSampleWeight": sum(s["gameWeight"] for s in samples) / len(samples)},
               "validationGames": sorted(validation_ids), "valueSources": sources, "steps": args.steps,
               "batchSize": args.batch_size, "elapsedSeconds": elapsed, "initialProbeLoss": initial,
               "finalProbeLoss": final, "probeIsHeldOut": bool(validation), "checkpoint": str(output),

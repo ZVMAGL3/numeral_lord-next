@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createEnvironment, OBSERVATION_SIZE, GLOBAL_SIZE, CANDIDATE_SIZE } from "./environment.js";
 import { InferenceService, pythonExecutable, type NetworkResult } from "./runtime.js";
+import { effectiveLearningRoundLimit } from "./training-policy.js";
 import type { GameOutput, GameReport, JobOptions, PolicyKind, PositionPayload } from "./protocol.js";
 
 const experimentRoot = fileURLToPath(new URL(".", import.meta.url));
@@ -17,7 +18,7 @@ const { values: flags, positionals } = parseArgs({ allowPositionals: true, optio
   games: { type: "string", default: "4" }, workers: { type: "string", default: "4" },
   simulations: { type: "string", default: "32" }, "max-actions": { type: "string", default: "10000" },
   "max-samples": { type: "string", default: "256" }, seed: { type: "string", default: "20261005" },
-  "max-learning-rounds": { type: "string", default: "30" },
+  "max-learning-rounds": { type: "string", default: "0" },
   policy: { type: "string", default: "search" }, opponent: { type: "string", default: "search" },
   checkpoint: { type: "string" }, "opponent-checkpoint": { type: "string" },
   "opponent-pool": { type: "string" }, "league-ratio": { type: "string", default: "auto" },
@@ -47,14 +48,21 @@ function runName(prefix: string): string {
   return name;
 }
 
+function learningRoundLimit(name = flags.name): number {
+  // The already-running iterations 4 and 5 captured their old 30-round setting.
+  // Iteration 6 onward ignores that stale argument from the long-lived PowerShell loop.
+  const requested = integer(flags["max-learning-rounds"], "max-learning-rounds", 0, 1000);
+  return effectiveLearningRoundLimit(name ?? "", requested);
+}
+
 function metadata() {
   const files = ["environment.ts", "search.ts", "worker.ts", "training-policy.ts", "protocol.ts", "runtime.ts", "cli.ts", "tsconfig.json", "launch.mjs", "worker-bootstrap.mjs",
     "python/model.py", "python/train.py", "python/serve.py", "python/requirements-xpu.txt"];
   const implementationHashes = Object.fromEntries(files.map((path) => ["experiments/hunxiao-ai/" + path,
     createHash("sha256").update(readFileSync(join(experimentRoot, path))).digest("hex")]));
   return { schemaVersion: 1, fingerprint: env.fingerprint, featureSchema: env.featureSchema,
-    learningWindow: { maxRounds: integer(flags["max-learning-rounds"], "max-learning-rounds", 1, 1000),
-      beyondWindow: "positions after this round are omitted; retained positions use the eventual natural match result when available" },
+    learningWindow: { maxRounds: learningRoundLimit(),
+      beyondWindow: learningRoundLimit() === 0 ? "all natural game rounds are eligible" : "positions after this round are omitted" },
     dimensions: { observation: OBSERVATION_SIZE, global: GLOBAL_SIZE, candidate: CANDIDATE_SIZE },
     ruleSnapshot: env.ruleSnapshot, implementationHashes, timestampUtc: new Date().toISOString(), kernel: "local shared TS source" };
 }
@@ -304,7 +312,7 @@ async function selectContinuousChampion(output: string, resume: string): Promise
       const secondModel = models[second]!;
       const arena: RunSettings = {
         name: `${nodeName}-promotion-pair-${first + 1}-vs-${second + 1}`,
-        games: 24, workers: 16, simulations: 4, maxActions: 10000, maxLearningRounds: 30, maxSamples: 0,
+        games: 24, workers: 16, simulations: 4, maxActions: 10000, maxLearningRounds: 0, maxSamples: 0,
         seed: (integer(flags.seed, "seed", 0, 0xffffffff) + 80000 + pair * 1000) >>> 0,
         policy: "network", opponent: "network", collect: false, bootstrap: "none", exploratory: false, thinkMs: 10,
         checkpoint: firstModel.path, opponentCheckpoint: secondModel.path, opponentPool: [], leagueRatio: 0, recordReplay: true
@@ -354,7 +362,7 @@ function settings(name: string, collect: boolean): RunSettings {
   if (!Number.isFinite(parsedRatio) || parsedRatio < 0 || parsedRatio > 1) throw new Error("league-ratio must be auto or a number in [0, 1]");
   return { name, games: integer(flags.games, "games", 1, 10000), workers: integer(flags.workers, "workers", 1, 20),
     simulations: integer(flags.simulations, "simulations", 1, 4096), maxActions: integer(flags["max-actions"], "max-actions", 1, 100000),
-    maxLearningRounds: integer(flags["max-learning-rounds"], "max-learning-rounds", 1, 1000),
+    maxLearningRounds: learningRoundLimit(name),
     maxSamples: integer(flags["max-samples"], "max-samples", 0, 10000), seed: integer(flags.seed, "seed", 0, 0xffffffff),
     policy: policy(flags.policy), opponent: policy(flags.opponent), collect, bootstrap, exploratory: collect,
     thinkMs: integer(flags["think-ms"], "think-ms", 0, 60000), recordReplay: flags.replay!,
@@ -377,7 +385,7 @@ async function main() {
   pnpm ai pilot --seed-data <samples.jsonl> --seed-metadata <metadata.json> (reuse a completed teacher-data run)
   pnpm ai play --checkpoint <model.pt> --device cpu
   pnpm ai:test
-Options: --device auto/cpu/xpu --max-actions 10000 --max-learning-rounds 30 --max-samples 256 --seed 20261005 --replay
+Options: --device auto/cpu/xpu --max-actions 10000 --max-learning-rounds 0 (unlimited) --max-samples 256 --seed 20261005 --replay
 Self-play leagues accept --opponent-pool <checkpoint1|checkpoint2> and --league-ratio auto/0..1; continuous iterations use a 40% historical-opponent mix once snapshots are available.
 Truncation defaults to no value label. Bootstrap labels are explicitly marked, never claimed as wins.`);
   } else if (command === "inspect") {

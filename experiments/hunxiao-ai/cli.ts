@@ -7,7 +7,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createEnvironment, OBSERVATION_SIZE, GLOBAL_SIZE, CANDIDATE_SIZE } from "./environment.js";
 import { InferenceService, pythonExecutable, type NetworkResult } from "./runtime.js";
-import { effectiveLearningRoundLimit } from "./training-policy.js";
+import { effectiveLearningRoundLimit, effectiveWorkerCount } from "./training-policy.js";
 import type { GameOutput, GameReport, JobOptions, PolicyKind, PositionPayload } from "./protocol.js";
 
 const experimentRoot = fileURLToPath(new URL(".", import.meta.url));
@@ -132,7 +132,7 @@ async function runGames(settings: RunSettings) {
   mkdirSync(directory, { recursive: true });
   const metadataPath = join(directory, "metadata.json");
   const dataPath = join(directory, "samples.jsonl");
-  const runMetadata = metadata();
+  const runMetadata = { ...metadata(), workerCount: settings.workers };
   writeFileSync(metadataPath, JSON.stringify(runMetadata, null, 2));
   // Isolated reproducibility archive; it is not a product Mod history.
   for (const path of [...Object.keys(env.ruleSnapshot.sourceHashes), ...Object.keys(runMetadata.implementationHashes)]) {
@@ -360,7 +360,8 @@ function settings(name: string, collect: boolean): RunSettings {
   const parsedRatio = ratioText === "auto" ? (opponentPool.length ? 0.4 : 0)
     : Number(ratioText);
   if (!Number.isFinite(parsedRatio) || parsedRatio < 0 || parsedRatio > 1) throw new Error("league-ratio must be auto or a number in [0, 1]");
-  return { name, games: integer(flags.games, "games", 1, 10000), workers: integer(flags.workers, "workers", 1, 20),
+  return { name, games: integer(flags.games, "games", 1, 10000),
+    workers: effectiveWorkerCount(name, integer(flags.workers, "workers", 1, 20)),
     simulations: integer(flags.simulations, "simulations", 1, 4096), maxActions: integer(flags["max-actions"], "max-actions", 1, 100000),
     maxLearningRounds: learningRoundLimit(name),
     maxSamples: integer(flags["max-samples"], "max-samples", 0, 10000), seed: integer(flags.seed, "seed", 0, 0xffffffff),

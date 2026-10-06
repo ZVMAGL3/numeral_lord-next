@@ -27,7 +27,7 @@ while ($true) {
 
   Write-Host "=== Iteration ${iteration}: 1,000 self-play games from $currentCheckpoint ==="
   & pnpm ai selfplay --name $runName --checkpoint $currentCheckpoint --bootstrap network `
-    --games 1000 --workers 16 --simulations 4 --think-ms 10 --max-actions 10000 `
+    --games 1000 --workers 8 --simulations 4 --think-ms 10 --max-actions 10000 `
     --max-learning-rounds 0 --max-samples 256 --device xpu --seed $seed --league-ratio auto --replay
   if ($LASTEXITCODE -ne 0) { throw "Self-play failed at iteration $iteration (exit $LASTEXITCODE)." }
 

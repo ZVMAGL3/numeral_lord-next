@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { calculateReinforcementIncome, hasTerrainCapability, selectSpatialPatternCells, type GameState } from "../../packages/game-core/src/index.js";
 import { coreTerrainCatalog } from "../../packages/core-content/src/index.js";
 import { CANDIDATE_SIZE, DEFAULT_MATCH_CONDITION_IDS, EXPERIMENT_MATCH_CONDITION_IDS, GLOBAL_SIZE, OBSERVATION_SIZE, SEARCH_HEURISTIC_WEIGHTS, TRAINING_WIN_SPEED_DISCOUNT, createEnvironment } from "./environment.js";
-import { effectiveLearningRoundLimit, isWithinLearningRoundWindow } from "./training-policy.js";
+import { effectiveLearningRoundLimit, effectiveWorkerCount, isWithinLearningRoundWindow } from "./training-policy.js";
 import { occupiedCellsByTeam, totalStrengthByTeam } from "./temporary-rules.js";
 
 const env = createEnvironment(undefined, { includeTemporaryRoundLimit: true });
@@ -61,6 +61,12 @@ test("连续训练第6轮起忽略已运行循环传入的旧回合限制", () =
   assert.equal(effectiveLearningRoundLimit("hunxiao-selfplay-1000-iteration-5-20261006", 30), 30);
   assert.equal(effectiveLearningRoundLimit("hunxiao-selfplay-1000-iteration-6-20261006", 30), 0);
   assert.equal(effectiveLearningRoundLimit("manual-selfplay-test", 30), 30);
+});
+
+test("连续训练从第12轮起将并行对局限制为8", () => {
+  assert.equal(effectiveWorkerCount("hunxiao-selfplay-1000-iteration-11-20261006", 16), 16);
+  assert.equal(effectiveWorkerCount("hunxiao-selfplay-1000-iteration-12-20261006", 16), 8);
+  assert.equal(effectiveWorkerCount("manual-selfplay-test", 16), 16);
 });
 
 test("全体合法动作可用共享引擎执行且输入状态保持不可变", () => {

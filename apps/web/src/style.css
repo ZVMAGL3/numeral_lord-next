@@ -481,14 +481,14 @@ code { color: #9adffc; }
 }
 
 /* The entry page is a viewport-sized layout at every orientation. */
-.app-shell.home-shell { display: flex; height: 100dvh; min-height: 0; flex-direction: column; overflow: hidden; padding-block: clamp(10px,1.6vh,18px); }
+.app-shell.home-shell { display: flex; height: 100dvh; min-height: 0; flex-direction: column; overflow: hidden; padding-block: clamp(10px,1.6vh,18px); padding-top: clamp(18px,2.4vh,26px); }
 .app-shell.home-shell > .topbar { flex: none; gap: 16px; margin-bottom: clamp(8px,1.4vh,14px); }
 .app-shell.home-shell .topbar-meta { display: flex; width: min(270px,30vw); flex: none; align-items: flex-end; }
 .app-shell.home-shell .topbar-home-name { width: 100%; }
 .app-shell.home-shell > .home-screen { min-height: 0; flex: 1 1 auto; }
 .app-shell.home-shell > footer { display: none; }
 @media (max-width:680px) {
-  .app-shell.home-shell { padding: 8px clamp(8px,2.4vw,14px); }
+  .app-shell.home-shell { padding: 8px clamp(8px,2.4vw,14px); padding-top: 12px; }
   .app-shell.home-shell > .topbar { flex-direction: row; align-items: center; gap: 8px; margin-bottom: 8px; }
   .app-shell.home-shell > .topbar .brand-block { min-width: 0; flex: 1 1 auto; }
   .app-shell.home-shell > .topbar .eyebrow { font-size: 8px; letter-spacing: .1em; }
@@ -505,7 +505,7 @@ code { color: #9adffc; }
   .app-shell.home-shell .topbar-home-name input { height: 34px; padding: 0 7px; font-size: 11px; }
 }
 @media (orientation:landscape) and (min-width:520px) and (max-height:850px) {
-  .app-shell.home-shell { padding-block: clamp(8px,1.5vh,14px); }
+  .app-shell.home-shell { padding-block: clamp(8px,1.5vh,14px); padding-top: clamp(12px,2.5vh,18px); }
   .app-shell.home-shell > .topbar { flex-direction: row; align-items: center; gap: 10px; margin-bottom: clamp(6px,1vh,10px); }
   .app-shell.home-shell .topbar-meta { width: min(250px,34vw); align-items: flex-end; }
   .app-shell.home-shell .topbar-home-name { gap: 4px; font-size: 10px; }

@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "types": ["node"],
+    "typeRoots": ["../../node_modules/.pnpm/node_modules/@types"],
+    "baseUrl": "../..",
+    "paths": {
+      "@numeral-lord/game-core": ["packages/game-core/src/index.ts"],
+      "@numeral-lord/core-content": ["packages/core-content/src/index.ts"],
+      "@numeral-lord/game-sdk": ["packages/game-sdk/src/index.ts"]
+    }
+  },
+  "include": ["./*.ts"]
+}

@@ -1,5 +1,7 @@
 # Numeral Lord：AI 对战与训练方案评估
 
+> 2026-10-05 更新：用户已确认使用 i5-14600KF + Intel Arc B580，以“昏晓”及默认据点淘汰/最后存活队判胜为第一阶段双人两队的训练和主评测范围，目标匹敌本图顶级棋手。最新推荐改为小型策略/价值网络 + MCTS / Expert Iteration，详见 [昏晓单 GPU 竞技 AI 推荐路线](C:/app/numeral-lord-next/docs/ai-competitive-single-gpu-plan.md)。下文保留为 2026-10-04 的调研记录；其默认地图、Mod 版本锁和源码行号已不代表当前产品流程，以新文档与当前项目备忘录为准。
+
 调研日期：2026-10-04（北京时间）。
 
 审计对象：`C:/app/numeral-lord-next` 当前磁盘源码；另对照 `C:/app/numeral-lord-next-staging-20260930` 导出目录。主目录有未提交修改，因此本报告以实际文件为准，不以旧 Git HEAD 代表当前实现。结论适用于本地代码；线上部署版本是否一致未在本次验证。

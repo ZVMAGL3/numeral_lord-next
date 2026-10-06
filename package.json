@@ -12,7 +12,10 @@
     "dev:server": "pnpm --filter @numeral-lord/server dev",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
-    "test": "pnpm -r test"
+    "test": "pnpm -r test",
+    "ai": "node experiments/hunxiao-ai/launch.mjs",
+    "ai:test": "node experiments/hunxiao-ai/launch.mjs --test",
+    "ai:typecheck": "tsc -p experiments/hunxiao-ai/tsconfig.json --noEmit"
   },
   "devDependencies": {
     "typescript": "5.9.3"

@@ -519,37 +519,74 @@ code { color: #9adffc; }
   .app-shell.home-shell > .home-screen { padding-inline: clamp(6px,1.5vw,14px); }
 }
 
-/* The battle hall keeps its frame fixed in landscape; only the room list/pane scroll. */
+/* Keep the landscape battle hall quiet and compact; scroll only a populated room list. */
 @media (orientation: landscape) and (min-width: 520px) and (max-height: 850px) {
   .app-shell:has(.room-hub) {
     height: 100dvh;
     min-height: 0;
-    gap: 8px;
+    gap: 6px;
     overflow: hidden;
-    padding: clamp(8px, 1.6vh, 14px) clamp(20px, 5vw, 72px);
+    padding: clamp(8px, 1.5vh, 13px) clamp(28px, 7vw, 92px);
   }
 
-  .app-shell:has(.room-hub) > .topbar { min-height: clamp(36px, 7vh, 44px); }
+  .app-shell:has(.room-hub) > .topbar { min-height: 36px; }
+  .app-shell:has(.room-hub) > footer { display: none; }
   .app-shell:has(.room-hub) > .room-hub {
+    justify-content: flex-start;
     min-height: 0;
     flex: 1 1 0;
-    gap: clamp(8px, 1.5vh, 12px);
-    padding: clamp(12px, 2.4vh, 18px) clamp(14px, 2.7vw, 34px);
-    border-radius: 16px;
+    gap: clamp(12px, 2.4vh, 18px);
+    padding: clamp(22px, 5vh, 34px) 0 clamp(10px, 2vh, 16px);
+    border: 0;
+    border-radius: 0;
+    background: none;
+    box-shadow: none;
+    backdrop-filter: none;
   }
 
   .room-hub-heading { gap: 14px; }
-  .room-hub-heading h2 { font-size: clamp(24px, 5vh, 34px); }
-  .room-hub-heading > div:first-child > p:last-child { max-width: 52ch; font-size: 11px; }
-  .battle-online-status { padding: 7px 11px; }
+  .room-hub-heading .entry-kicker,
+  .room-hub-heading > div:first-child > p:last-child,
+  .battle-online-status { display: none; }
+  .room-hub-heading h2 { margin: 0; font-size: clamp(24px, 5vh, 32px); }
   .battle-lobby-grid {
     min-height: 0;
-    grid-template-columns: minmax(0, 1.6fr) minmax(250px, .85fr);
-    gap: clamp(8px, 1.2vw, 14px);
+    flex: 1 1 0;
+    max-height: none;
+    grid-template-columns: minmax(0, 1.7fr) minmax(250px, .85fr);
+    gap: clamp(16px, 2.2vw, 28px);
   }
-  .public-room-pane { padding: clamp(9px, 1.4vw, 15px); }
-  .battle-pane-heading { margin-bottom: 7px; }
-  .battle-room-list { overscroll-behavior: contain; }
+  .room-hub:has(.battle-list-hint) { justify-content: center; }
+  .battle-lobby-grid:has(.battle-list-hint) {
+    flex: 0 1 auto;
+    max-height: none;
+  }
+  .public-room-pane:has(.battle-list-hint) {
+    padding: 0;
+    border: 0;
+    background: none;
+  }
+  .public-room-pane {
+    padding: clamp(10px, 1.5vw, 16px);
+    border: 1px solid rgba(169, 196, 220, .14);
+    border-radius: 12px;
+    background: rgba(3, 9, 17, .13);
+  }
+  .battle-pane-heading { margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid rgba(169, 196, 220, .12); }
+  .battle-pane-heading .battle-section-index { display: none; }
+  .battle-pane-heading h3 { margin: 0; font-size: 16px; }
+  .battle-refresh { min-height: 30px; padding: 4px 7px; font-size: 13px; }
+  .battle-refresh span { display: none; }
+  .battle-list-hint {
+    min-height: 48px;
+    flex: 0 1 auto;
+    padding: 8px 0;
+    color: rgba(198, 214, 228, .56);
+    font-size: 10px;
+    text-align: left;
+  }
+  .battle-list-hint-detail { display: none; }
+  .battle-room-list { overscroll-behavior: contain; scrollbar-gutter: stable; }
   .battle-room-card { grid-template-columns: 30px minmax(0, 1fr) auto; gap: 7px; padding: 7px 8px; }
   .battle-room-avatar { width: 28px; height: 33px; font-size: 12px; }
   .battle-room-meta { gap: 4px; font-size: 8px; }
@@ -558,31 +595,34 @@ code { color: #9adffc; }
   .battle-match-pane {
     display: grid;
     grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
-    align-content: center;
-    gap: 4px 7px;
-    overflow: auto;
-    overscroll-behavior: contain;
-    padding: 10px;
+    align-content: start;
+    gap: 8px;
+    overflow: visible;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: none;
   }
+  .battle-match-art,
   .battle-match-pane > .battle-section-index,
   .battle-match-pane > h3,
-  .battle-match-pane > p,
-  .battle-match-pane > .battle-room-code { grid-column: 1 / -1; }
-  .battle-match-pane h3 { margin: 0; font-size: clamp(18px, 4vh, 25px); }
-  .battle-match-pane > p { max-width: none; margin: 2px 0 3px; font-size: 10px; line-height: 1.4; }
-  .battle-quick-match { min-height: 38px; padding-inline: 10px; font-size: 11px; }
-  .battle-create-room { min-height: 36px; margin: 0; padding: 5px; font-size: 9px; }
+  .battle-match-pane > p { display: none; }
+  .battle-quick-match,
+  .battle-create-room { min-height: 40px; margin: 0; padding: 6px 9px; font-size: 10px; }
   .battle-room-code {
     display: grid;
-    grid-template-columns: max-content minmax(0, 1fr);
-    align-items: center;
-    gap: 7px;
-    margin-top: 3px;
-    padding-top: 7px;
+    grid-column: 1 / -1;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+    margin: 0;
+    padding: 0;
+    border: 0;
   }
-  .battle-room-code > label { font-size: 9px; white-space: nowrap; }
+  .battle-room-code > label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
   .battle-room-code .join-row { grid-template-columns: minmax(0, 1fr) 48px; gap: 4px; margin: 0; }
   .battle-room-code .join-row input,
-  .battle-room-code .join-row button { min-height: 34px; padding: 5px 7px; }
-  .room-hub-foot { gap: 8px 14px; font-size: 8px; }
+  .battle-room-code .join-row button { min-height: 36px; padding: 5px 7px; }
+  .room-hub-foot { gap: 8px 14px; margin: 0; font-size: 9px; }
+  .room-hub-foot > span:first-child { gap: 7px; }
+  .room-hub-foot > span:nth-child(2) { display: none; }
 }

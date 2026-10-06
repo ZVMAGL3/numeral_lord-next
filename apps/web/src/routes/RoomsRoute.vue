@@ -36,7 +36,7 @@ onBeforeUnmount(() => page.registerGameBoard(null));
         </div>
         <p v-if="page.battleLobbyStatus === 'connecting' && page.publicBattleRooms.length === 0" class="battle-list-hint">正在寻找开放房间…</p>
         <p v-else-if="page.battleLobbyStatus === 'error' && page.publicBattleRooms.length === 0" class="battle-list-hint battle-list-error">{{ page.battleLobbyError || '暂时无法连接大厅。' }} <button type="button" @click="page.refreshBattleLobby">重新连接</button></p>
-        <p v-else-if="page.publicBattleRooms.length === 0" class="battle-list-hint">暂时没有公开战局，快速匹配会为你创建新房间。</p>
+        <p v-else-if="page.publicBattleRooms.length === 0" class="battle-list-hint"><span>暂时没有公开战局。</span><span class="battle-list-hint-detail">快速匹配会为你创建新房间。</span></p>
         <div v-else class="battle-room-list">
           <article v-for="room in page.sortedPublicBattleRooms" :key="room.roomId" class="battle-room-card">
             <div class="battle-room-avatar" aria-hidden="true">{{ String(room.metadata.hostName || '领').slice(0, 1) }}</div>
@@ -63,7 +63,7 @@ onBeforeUnmount(() => page.registerGameBoard(null));
         </div>
       </aside>
     </div>
-    <div class="room-hub-foot"><span><i class="battle-profile-dot" />以 <strong>{{ page.playerName }}</strong> 的身份进入</span><span>{{ page.configuredMaps.length }} 张本机地图可供房主选择</span></div>
+    <div class="room-hub-foot"><span :aria-label="`当前玩家：${page.playerName}`"><i class="battle-profile-dot" /><strong>{{ page.playerName }}</strong></span><span>{{ page.configuredMaps.length }} 张本机地图可供房主选择</span></div>
     <p v-if="page.relayStatus === '连接失败' || page.relayStatus === '连接已断开'" class="entry-error" role="alert">{{ page.notice }} <button v-if="page.roomIdInput" @click="page.joinRoom">重试加入</button></p>
   </section>
 

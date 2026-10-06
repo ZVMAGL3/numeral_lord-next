@@ -54,8 +54,8 @@ const emit = defineEmits<{
 
 <style scoped>
 .home-screen { position: relative; display: flex; min-height: 0; align-items: center; overflow: hidden; padding: clamp(18px,3vh,32px) 0; }
-.menu-content { position: relative; z-index: 1; width: min(1440px,100%); margin: 0 auto; transform: translateY(clamp(10px,1.8vh,20px)); }
-.menu-grid { display: grid; height: clamp(300px,42vh,460px); grid-template-columns: repeat(3,minmax(0,1fr)); gap: clamp(12px,1.5vw,20px); }
+.menu-content { position: relative; z-index: 1; width: min(960px,100%); margin: 0 auto; transform: translateY(clamp(10px,1.8vh,20px)); }
+.menu-grid { display: grid; height: clamp(210px,28vh,306px); grid-template-columns: repeat(3,minmax(0,1fr)); gap: clamp(10px,1.2vw,16px); }
 .menu-card { --accent: #7fe4d8; position: relative; display: flex; min-width: 0; min-height: 0; flex-direction: column; justify-content: space-between; gap: 10px; margin: 0; padding: clamp(16px,1.6vw,24px); overflow: hidden; border: 1px solid rgba(129,172,194,.31); border-radius: clamp(16px,1.4vw,22px); background: linear-gradient(148deg,rgba(27,55,73,.9),rgba(14,32,48,.97)); color: #f4f9ff; text-align: left; transition: border-color .18s ease,transform .18s ease,box-shadow .18s ease,background .18s ease; }
 .map-card { --accent: #afc5ee; background: linear-gradient(148deg,rgba(33,50,77,.91),rgba(17,31,50,.97)); }
 .workshop-card { --accent: #f3c77e; background: linear-gradient(148deg,rgba(64,49,44,.9),rgba(27,31,43,.97)); }
@@ -65,7 +65,7 @@ const emit = defineEmits<{
 .card-top,.card-bottom { position: relative; z-index: 1; display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 10px; width: 100%; }
 .card-top { color: var(--accent); font: 800 10px/1.3 ui-monospace,Consolas,monospace; letter-spacing: .13em; }
 .card-art { position: relative; z-index: 1; display: grid; min-width: 0; min-height: 0; flex: 1; place-items: center; color: var(--accent); }
-.card-art svg { width: min(100%,240px); height: clamp(110px,16vh,172px); opacity: .9; filter: drop-shadow(0 0 22px rgba(110,222,217,.17)); stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.card-art svg { width: min(100%,190px); height: clamp(64px,10vh,110px); opacity: .9; filter: drop-shadow(0 0 22px rgba(110,222,217,.17)); stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
 .map-card .card-art svg { filter: drop-shadow(0 0 22px rgba(153,183,235,.18)); }
 .workshop-card .card-art svg { filter: drop-shadow(0 0 22px rgba(243,199,126,.18)); }
 .card-bottom { flex: none; align-items: end; border-top: 1px solid rgba(166,194,216,.2); padding-top: clamp(12px,2vh,20px); }
@@ -77,11 +77,11 @@ const emit = defineEmits<{
 @media (max-width:680px) and (orientation:portrait) {
   .home-screen { padding: 10px 0; }
   .menu-content { width: 100%; transform: translateY(clamp(6px,1vh,10px)); }
-  .menu-grid { height: clamp(148px,23vh,194px); gap: clamp(5px,1.5vw,8px); }
-  .menu-card { gap: 4px; padding: 10px clamp(5px,1.5vw,9px); border-radius: 14px; }
+  .menu-grid { height: clamp(108px,17vh,136px); gap: clamp(5px,1.5vw,8px); }
+  .menu-card { gap: 3px; padding: 8px clamp(5px,1.5vw,9px); border-radius: 13px; }
   .card-top { font-size: clamp(8px,1.9vw,9px); letter-spacing: .025em; }
-  .card-art svg { width: min(82%,72px); height: clamp(44px,9vh,68px); }
-  .card-bottom { align-items: center; gap: 5px; padding-top: 7px; }
+  .card-art svg { width: min(80%,64px); height: clamp(34px,6vh,48px); }
+  .card-bottom { align-items: center; gap: 5px; padding-top: 5px; }
   .card-bottom strong { font-size: clamp(11px,3.2vw,13px); white-space: nowrap; }
   .card-bottom small { display: none; }
   .card-enter { font-size: 18px; }
@@ -89,41 +89,41 @@ const emit = defineEmits<{
 @media (orientation:landscape) and (min-width:520px) and (max-width:900px) and (max-height:850px) {
   .home-screen { padding-block: 8px; }
   .menu-content { transform: translateY(clamp(8px,1.5vh,14px)); }
-  .menu-grid { height: clamp(150px,34vh,265px); gap: clamp(8px,1.2vw,15px); }
-  .menu-card { gap: 7px; padding: clamp(12px,1.7vw,20px); border-radius: 16px; }
+  .menu-grid { height: clamp(112px,24vh,177px); gap: clamp(8px,1.2vw,15px); }
+  .menu-card { gap: 5px; padding: clamp(9px,1.2vw,14px); border-radius: 14px; }
   .card-top { font-size: 9px; }
-  .card-art svg { width: min(100%,172px); height: clamp(56px,12vh,92px); }
-  .card-bottom { padding-top: 10px; }
-  .card-bottom strong { font-size: clamp(14px,2.1vh,18px); }
+  .card-art svg { width: min(100%,150px); height: clamp(36px,9vh,74px); }
+  .card-bottom { padding-top: 7px; }
+  .card-bottom strong { font-size: clamp(13px,1.8vh,16px); }
   .card-bottom small { margin-top: 5px; font-size: 10px; }
   .card-enter { font-size: 24px; }
 }
 @media (orientation:landscape) and (min-width:520px) and (max-width:900px) and (max-height:480px) {
   .home-screen { padding-block: 4px; }
   .menu-content { transform: translateY(4px); }
-  .menu-grid { height: clamp(142px,44vh,152px); gap: 7px; }
-  .menu-card { gap: 4px; padding: 9px; border-radius: 12px; }
+  .menu-grid { height: clamp(106px,34vh,114px); gap: 7px; }
+  .menu-card { gap: 3px; padding: 7px; border-radius: 11px; }
   .card-top { font-size: 8px; }
-  .card-art svg { width: min(88%,108px); height: clamp(48px,16vh,58px); }
-  .card-bottom { padding-top: 6px; }
-  .card-bottom strong { font-size: 12px; }
+  .card-art svg { width: min(88%,88px); height: clamp(32px,10vh,38px); }
+  .card-bottom { padding-top: 4px; }
+  .card-bottom strong { font-size: 11px; }
   .card-bottom small { display: none; }
   .card-enter { font-size: 19px; }
 }
 @media (orientation:landscape) and (min-width:901px) and (max-height:620px) {
   .home-screen { padding-block: 4px; }
   .menu-content { transform: translateY(10px); }
-  .menu-grid { height: clamp(210px,44vh,260px); gap: clamp(12px,1.5vw,18px); }
-  .menu-card { gap: 8px; padding: 16px; }
-  .card-art svg { width: min(100%,200px); height: clamp(80px,19vh,114px); }
-  .card-bottom { padding-top: 10px; }
+  .menu-grid { height: clamp(140px,29vh,174px); gap: clamp(10px,1.2vw,15px); }
+  .menu-card { gap: 5px; padding: 12px; }
+  .card-art svg { width: min(100%,150px); height: clamp(44px,11vh,66px); }
+  .card-bottom { padding-top: 7px; }
 }
 @media (max-width:360px) and (orientation:portrait) {
-  .menu-grid { height: clamp(142px,25vh,162px); }
-  .menu-card { padding: 8px 4px; }
+  .menu-grid { height: clamp(104px,17vh,118px); }
+  .menu-card { padding: 7px 4px; }
   .card-top { font-size: 8px; }
-  .card-art svg { width: min(80%,60px); height: 42px; }
-  .card-bottom { gap: 2px; padding-top: 5px; }
+  .card-art svg { width: min(80%,54px); height: clamp(30px,6vh,36px); }
+  .card-bottom { gap: 2px; padding-top: 4px; }
   .card-bottom strong { font-size: 11px; }
   .card-enter { font-size: 15px; }
 }

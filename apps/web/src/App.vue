@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { provide } from "vue";
+import { provide, proxyRefs } from "vue";
 import { useAppRuntime } from "./app/app-runtime";
 import { appRuntimeKey } from "./app/app-runtime-key";
 import FullscreenControl from "./components/FullscreenControl.vue";
 
 const runtime = useAppRuntime();
 provide(appRuntimeKey, runtime);
+const home = proxyRefs(runtime.home);
 const {
   showHome, showMaps, showWorkshop, showRoomEntry, showLobby, showGame, showGameLoading,
   hoveredTeamColor, currentPlayer, teamColors, relayStatus, relayRoomId, relayIsHost,
@@ -42,7 +43,19 @@ const {
       </div>
       <div v-if="showRoomEntry" class="battle-hall-online" :class="{ disconnected: battleLobbyStatus === 'error' }"><span class="battle-online-dot" /><strong>{{ battleLobbyStatus === 'error' ? '离线' : '在线' }}</strong></div>
       <div v-if="!showRoomEntry" class="topbar-meta">
-        <div v-if="showHome" class="turn-pill"><span class="turn-dot" />选择入口，开启对局</div>
+        <label v-if="showHome" class="topbar-home-name">
+          <span>玩家名字</span>
+          <input
+            :value="home.playerName"
+            type="text"
+            maxlength="24"
+            autocomplete="nickname"
+            placeholder="输入你的名字"
+            aria-label="玩家名字"
+            @input="home.updatePlayerName(($event.target as HTMLInputElement).value)"
+            @keydown.enter.prevent="home.startFromHome"
+          />
+        </label>
         <div v-else-if="showMaps" class="turn-pill"><span class="turn-dot" />地图配置 · {{ configuredMaps.length }} 张可用</div>
         <div v-else-if="showWorkshop" class="turn-pill"><span class="turn-dot" />创意工坊 · {{ workshopStatus === 'connected' ? '已连接' : workshopStatus === 'connecting' ? '连接中' : '离线预览' }}</div>
         <div v-else-if="showRoomEntry" class="turn-pill"><span class="turn-dot" />战斗大厅 · {{ publicBattleRooms.length }} 个公开房间</div>

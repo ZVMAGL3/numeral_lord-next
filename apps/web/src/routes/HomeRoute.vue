@@ -10,8 +10,6 @@ const page = proxyRefs(runtime.home);
 
 <template>
   <HomeScreen
-    :name="page.playerName"
-    @update:name="page.updatePlayerName"
     @start="page.startFromHome"
     @maps="page.openMapLibrary"
     @workshop="page.openWorkshop"

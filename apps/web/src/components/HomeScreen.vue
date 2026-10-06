@@ -1,10 +1,5 @@
 <script setup lang="ts">
-defineProps<{
-  name: string;
-}>();
-
 const emit = defineEmits<{
-  "update:name": [name: string];
   start: [];
   maps: [];
   workshop: [];
@@ -19,19 +14,6 @@ const emit = defineEmits<{
           <span class="menu-eyebrow">NUMERAL LORD / MAIN MENU</span>
           <h2>选择入口</h2>
         </div>
-        <label class="player-name">
-          <span>玩家名字</span>
-          <input
-            :value="name"
-            type="text"
-            maxlength="24"
-            autocomplete="nickname"
-            placeholder="输入你的名字"
-            aria-label="玩家名字"
-            @input="emit('update:name', ($event.target as HTMLInputElement).value)"
-            @keydown.enter.prevent="emit('start')"
-          />
-        </label>
       </header>
 
       <div class="menu-grid">
@@ -84,9 +66,6 @@ const emit = defineEmits<{
 .menu-heading { display: flex; align-items: end; justify-content: space-between; gap: 22px; margin-bottom: clamp(22px,3.5vw,36px); }
 .menu-eyebrow { color: #7db6ca; font: 800 10px/1.3 ui-monospace,Consolas,monospace; letter-spacing: .15em; }
 .menu-heading h2 { margin: 8px 0 0; color: #f4f8ff; font-size: clamp(31px,4vw,43px); letter-spacing: -.04em; line-height: 1.15; }
-.player-name { display: grid; width: min(252px,100%); gap: 7px; color: #aac0d0; font-size: 11px; font-weight: 750; }
-.player-name input { width: 100%; height: 45px; padding: 0 13px; border: 1px solid rgba(135,176,202,.38); border-radius: 10px; outline: none; background: rgba(7,21,33,.8); color: #f5faff; font-size: 14px; }
-.player-name input:focus-visible { border-color: #83e9d8; box-shadow: 0 0 0 3px rgba(131,233,216,.14); }
 .menu-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: clamp(13px,2vw,22px); }
 .menu-card { --accent: #7fe4d8; position: relative; display: flex; min-width: 0; min-height: 315px; flex-direction: column; justify-content: space-between; margin: 0; padding: clamp(18px,2.5vw,28px); overflow: hidden; border: 1px solid rgba(129,172,194,.28); border-radius: 20px; background: linear-gradient(155deg,rgba(27,55,73,.88),rgba(14,32,48,.96)); color: #f4f9ff; text-align: left; transition: border-color .18s ease,transform .18s ease,box-shadow .18s ease; }
 .map-card { --accent: #afc5ee; background: linear-gradient(155deg,rgba(33,50,77,.89),rgba(17,31,50,.96)); }
@@ -107,15 +86,13 @@ const emit = defineEmits<{
 .card-bottom small { margin-top: 7px; color: #9db5c8; font-size: 11px; font-weight: 500; }
 .card-enter { color: var(--accent); font-size: 29px; font-weight: 300; line-height: 1; transition: transform .18s ease; }
 .menu-card:hover .card-enter { transform: translateX(4px); }
-@media (max-width:800px) { .menu-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }.home-screen { min-height: 0; }.menu-heading { align-items: stretch; flex-direction: column; }.player-name { width: 100%; }.menu-card { min-height: 280px; }.card-art { min-height: 138px; }.card-art svg { height: 130px; } }
+@media (max-width:800px) { .menu-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }.home-screen { min-height: 0; }.menu-heading { align-items: stretch; flex-direction: column; }.menu-card { min-height: 280px; }.card-art { min-height: 138px; }.card-art svg { height: 130px; } }
 @media (max-width:560px) { .home-screen { padding: 21px 15px; border-radius: 20px; }.menu-grid { grid-template-columns: 1fr; }.menu-heading { gap: 17px; margin-bottom: 20px; }.menu-card { min-height: 207px; padding: 17px 19px; }.card-art { position: absolute; top: 32px; right: -30px; width: 52%; min-height: 0; opacity: .45; }.card-art svg { height: 126px; }.card-bottom { margin-top: 110px; }.card-bottom strong { font-size: 22px; } }
 @media (orientation: landscape) and (min-width: 520px) and (max-height: 850px) {
   .home-screen { min-height: 0; padding: clamp(10px,2.5vh,22px) clamp(12px,2vw,26px); border-radius: 18px; }
   .menu-content { display: grid; width: min(1100px,100%); height: 100%; max-height: 100%; grid-template-rows: auto minmax(0,1fr); align-content: center; gap: clamp(6px,1.4vh,12px); }
   .menu-heading { align-items: center; justify-content: flex-end; gap: 0; margin: 0; }
   .menu-heading > div { display: none; }
-  .player-name { width: min(270px,45%); gap: 5px; font-size: 10px; }
-  .player-name input { height: clamp(34px,5.5vh,42px); font-size: 13px; }
   .menu-grid { width: 100%; height: clamp(165px,44dvh,320px); max-height: 100%; align-self: center; grid-template-columns: repeat(3,minmax(0,1fr)); gap: clamp(8px,1.5vw,16px); }
   .menu-card { min-height: 0; padding: clamp(10px,1.7vw,20px); border-radius: 15px; }
   .card-top,.card-bottom { gap: 8px; }

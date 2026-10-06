@@ -24,6 +24,8 @@ export type Evaluator = (positions: EncodedPosition[]) => Promise<Evaluation[]>;
 
 export interface SearchOptions {
   simulations: number;
+  /** Minimum amount of useful tree expansion before a soft time budget can stop search. */
+  minimumSimulations?: number;
   cpuct?: number;
   seed?: number;
   temperature?: number;
@@ -259,8 +261,11 @@ export async function search(
   evaluate: Evaluator,
   options: SearchOptions
 ): Promise<SearchResult> {
-  const { simulations, cpuct = 1.5, seed = 0, temperature = 1, rootNoise = 0, maxDepth = 128, timeLimitMs } = options;
+  const { simulations, minimumSimulations = 1, cpuct = 1.5, seed = 0, temperature = 1, rootNoise = 0, maxDepth = 128, timeLimitMs } = options;
   if (!Number.isSafeInteger(simulations) || simulations < 1) throw new Error("simulations must be a positive integer.");
+  if (!Number.isSafeInteger(minimumSimulations) || minimumSimulations < 1 || minimumSimulations > simulations) {
+    throw new Error("minimumSimulations must be a positive integer no greater than simulations.");
+  }
   if (!Number.isFinite(cpuct) || cpuct <= 0) throw new Error("cpuct must be finite and positive.");
   if (!Number.isSafeInteger(seed)) throw new Error("seed must be a safe integer.");
   if (!Number.isFinite(temperature) || temperature < 0) throw new Error("temperature must be finite and nonnegative.");
@@ -300,7 +305,7 @@ export async function search(
   let rootValueSum = 0;
   let completed = 0;
   for (let simulation = 0; simulation < simulations; simulation++) {
-    if (completed > 0 && timeLimitMs !== undefined && performance.now() - started >= timeLimitMs) break;
+    if (completed >= minimumSimulations && timeLimitMs !== undefined && performance.now() - started >= timeLimitMs) break;
     let node = root;
     let depth = 0;
     const path: Array<{ parent: Node; edge: number; child: Node }> = [];
@@ -329,7 +334,7 @@ export async function search(
     rootValueSum += value;
     completed++;
     // A single awaited evaluator call can exceed the budget; this is not a hard deadline.
-    if (timeLimitMs !== undefined && performance.now() - started >= timeLimitMs) break;
+    if (completed >= minimumSimulations && timeLimitMs !== undefined && performance.now() - started >= timeLimitMs) break;
   }
   const policy = policyFromVisits(root.edgeVisits, root.priors, 1);
   const selectionPolicy = policyFromVisits(root.edgeVisits, root.priors, temperature);

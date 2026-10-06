@@ -4,6 +4,7 @@ export interface JobOptions {
   id: number;
   seed: number;
   simulations: number;
+  minimumSimulations: number;
   maxActions: number;
   maxLearningRounds: number;
   policies: [PolicyKind, PolicyKind];

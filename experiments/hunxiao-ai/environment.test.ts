@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { calculateReinforcementIncome, hasTerrainCapability, selectSpatialPatternCells, type GameState } from "../../packages/game-core/src/index.js";
 import { coreTerrainCatalog } from "../../packages/core-content/src/index.js";
 import { CANDIDATE_SIZE, DEFAULT_MATCH_CONDITION_IDS, EXPERIMENT_MATCH_CONDITION_IDS, GLOBAL_SIZE, OBSERVATION_SIZE, SEARCH_HEURISTIC_WEIGHTS, TRAINING_WIN_SPEED_DISCOUNT, createEnvironment } from "./environment.js";
-import { effectiveLearningRoundLimit, effectiveWorkerCount, isWithinLearningRoundWindow } from "./training-policy.js";
+import { effectiveLearningRoundLimit, effectiveSearchBudget, effectiveWorkerCount, isWithinLearningRoundWindow } from "./training-policy.js";
 import { occupiedCellsByTeam, totalStrengthByTeam } from "./temporary-rules.js";
 
 const env = createEnvironment(undefined, { includeTemporaryRoundLimit: true });
@@ -67,6 +67,20 @@ test("连续训练从第12轮起将并行对局限制为8", () => {
   assert.equal(effectiveWorkerCount("hunxiao-selfplay-1000-iteration-11-20261006", 16), 16);
   assert.equal(effectiveWorkerCount("hunxiao-selfplay-1000-iteration-12-20261006", 16), 8);
   assert.equal(effectiveWorkerCount("manual-selfplay-test", 16), 16);
+});
+
+test("连续训练从第12轮起提高每步搜索预算", () => {
+  const requested = { simulations: 16, minimumSimulations: 4, thinkMs: 50 };
+  assert.deepEqual(effectiveSearchBudget("hunxiao-selfplay-1000-iteration-11-20261006", requested),
+    { ...requested, multiplier: 1 });
+  assert.deepEqual(effectiveSearchBudget("hunxiao-selfplay-1000-iteration-12-20261006", requested, 0),
+    { ...requested, multiplier: 1 });
+  assert.deepEqual(effectiveSearchBudget("hunxiao-selfplay-1000-iteration-13-20261006", requested, 1),
+    { simulations: 20, minimumSimulations: 5, thinkMs: 63, multiplier: 1.25 });
+  assert.deepEqual(effectiveSearchBudget("hunxiao-selfplay-1000-iteration-14-20261006", requested, 8),
+    { simulations: 24, minimumSimulations: 6, thinkMs: 75, multiplier: 1.5 });
+  assert.deepEqual(effectiveSearchBudget("manual-selfplay-test", requested, 2),
+    { ...requested, multiplier: 1 });
 });
 
 test("全体合法动作可用共享引擎执行且输入状态保持不可变", () => {

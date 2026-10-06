@@ -70,7 +70,8 @@ async function run(job: JobOptions): Promise<GameOutput> {
         ? network(job.networkOpponent && seat !== job.candidateSeat ? job.opponentSlot ?? "opponent" : "candidate") : teacher;
       // Diversify openings, then let the learned policy finish the game without perpetual noise.
       const openingExploration = job.exploratory && actions < 80;
-      const result = await search(env, state, evaluator, { simulations: job.simulations, seed: Math.floor(random() * 0xffffffff),
+      const result = await search(env, state, evaluator, { simulations: job.simulations, minimumSimulations: job.minimumSimulations,
+        seed: Math.floor(random() * 0xffffffff),
         // Vary self-play openings, then let the learned policy finish without perpetual noise.
         // Evaluation games set exploratory=false and remain deterministic for comparison.
         temperature: job.exploratory ? (actions < 80 ? 1 : 0.2) : 0, rootNoise: openingExploration ? 0.12 : 0, maxDepth: 96,

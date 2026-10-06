@@ -7,7 +7,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createEnvironment, OBSERVATION_SIZE, GLOBAL_SIZE, CANDIDATE_SIZE } from "./environment.js";
 import { InferenceService, pythonExecutable, type NetworkResult } from "./runtime.js";
-import { effectiveLearningRoundLimit, effectiveWorkerCount } from "./training-policy.js";
+import { effectiveLearningRoundLimit, effectiveSearchBudget, effectiveWorkerCount } from "./training-policy.js";
 import type { GameOutput, GameReport, JobOptions, PolicyKind, PositionPayload } from "./protocol.js";
 
 const experimentRoot = fileURLToPath(new URL(".", import.meta.url));
@@ -16,7 +16,8 @@ const env = createEnvironment(undefined, { includeTemporaryRoundLimit: false });
 const policyKinds = ["random", "teacher", "search", "network"];
 const { values: flags, positionals } = parseArgs({ allowPositionals: true, options: {
   games: { type: "string", default: "4" }, workers: { type: "string", default: "4" },
-  simulations: { type: "string", default: "32" }, "max-actions": { type: "string", default: "10000" },
+  simulations: { type: "string", default: "32" }, "min-simulations": { type: "string", default: "1" },
+  "max-actions": { type: "string", default: "10000" },
   "max-samples": { type: "string", default: "256" }, seed: { type: "string", default: "20261005" },
   "max-learning-rounds": { type: "string", default: "0" },
   policy: { type: "string", default: "search" }, opponent: { type: "string", default: "search" },
@@ -55,6 +56,26 @@ function learningRoundLimit(name = flags.name): number {
   return effectiveLearningRoundLimit(name ?? "", requested);
 }
 
+function consecutivePromotionFailures(name: string): number {
+  const match = name.match(/^hunxiao-selfplay-1000-iteration-(\d+)-\d{8}$/);
+  if (!match) return 0;
+  let failures = 0;
+  const currentIteration = Number(match[1]);
+  const runsRoot = join(experimentRoot, "runs");
+  for (let iteration = currentIteration - 1; iteration >= 4 && failures < 2; iteration -= 1) {
+    const exactRunName = new RegExp(`^hunxiao-selfplay-1000-iteration-${iteration}-\\d{8}$`);
+    const previousRun = readdirSync(runsRoot, { withFileTypes: true })
+      .find((entry) => entry.isDirectory() && exactRunName.test(entry.name));
+    if (!previousRun) break;
+    const promotionPath = join(runsRoot, previousRun.name, "promotion.json");
+    if (!existsSync(promotionPath)) break;
+    const promotion = JSON.parse(readFileSync(promotionPath, "utf8")) as { newCheckpointPromoted?: boolean };
+    if (promotion.newCheckpointPromoted) break;
+    failures += 1;
+  }
+  return failures;
+}
+
 function metadata() {
   const files = ["environment.ts", "search.ts", "worker.ts", "training-policy.ts", "protocol.ts", "runtime.ts", "cli.ts", "tsconfig.json", "launch.mjs", "worker-bootstrap.mjs",
     "python/model.py", "python/train.py", "python/serve.py", "python/requirements-xpu.txt"];
@@ -72,6 +93,9 @@ interface RunSettings {
   games: number;
   workers: number;
   simulations: number;
+  minimumSimulations: number;
+  searchMultiplier: number;
+  consecutiveNonPromotions: number;
   maxActions: number;
   maxLearningRounds: number;
   maxSamples: number;
@@ -132,7 +156,10 @@ async function runGames(settings: RunSettings) {
   mkdirSync(directory, { recursive: true });
   const metadataPath = join(directory, "metadata.json");
   const dataPath = join(directory, "samples.jsonl");
-  const runMetadata = { ...metadata(), workerCount: settings.workers };
+  const runMetadata = { ...metadata(), workerCount: settings.workers,
+    search: { simulations: settings.simulations, minimumSimulations: settings.minimumSimulations,
+      thinkMs: settings.thinkMs, adaptiveMultiplier: settings.searchMultiplier,
+      consecutiveNonPromotions: settings.consecutiveNonPromotions } };
   writeFileSync(metadataPath, JSON.stringify(runMetadata, null, 2));
   // Isolated reproducibility archive; it is not a product Mod history.
   for (const path of [...Object.keys(env.ruleSnapshot.sourceHashes), ...Object.keys(runMetadata.implementationHashes)]) {
@@ -180,7 +207,8 @@ async function runGames(settings: RunSettings) {
         const opponentPath = settings.opponentCheckpoint ?? (opponentIndex >= 0 ? settings.opponentPool[opponentIndex] : undefined);
         const policies: [PolicyKind, PolicyKind] = candidateSeat === 1
           ? [settings.policy, settings.opponent] : [settings.opponent, settings.policy];
-        const job: JobOptions = { id, seed: settings.seed + id, simulations: settings.simulations, maxActions: settings.maxActions,
+        const job: JobOptions = { id, seed: settings.seed + id, simulations: settings.simulations,
+          minimumSimulations: settings.minimumSimulations, maxActions: settings.maxActions,
           maxLearningRounds: settings.maxLearningRounds,
           policies, collect: settings.collect, bootstrap: settings.bootstrap, exploratory: settings.exploratory,
           maxSamples: settings.maxSamples, recordReplay: settings.recordReplay, candidateSeat,
@@ -312,9 +340,11 @@ async function selectContinuousChampion(output: string, resume: string): Promise
       const secondModel = models[second]!;
       const arena: RunSettings = {
         name: `${nodeName}-promotion-pair-${first + 1}-vs-${second + 1}`,
-        games: 24, workers: 16, simulations: 4, maxActions: 10000, maxLearningRounds: 0, maxSamples: 0,
+        games: 24, workers: 8, simulations: 16, minimumSimulations: 4,
+        searchMultiplier: 1, consecutiveNonPromotions: 0,
+        maxActions: 10000, maxLearningRounds: 0, maxSamples: 0,
         seed: (integer(flags.seed, "seed", 0, 0xffffffff) + 80000 + pair * 1000) >>> 0,
-        policy: "network", opponent: "network", collect: false, bootstrap: "none", exploratory: false, thinkMs: 10,
+        policy: "network", opponent: "network", collect: false, bootstrap: "none", exploratory: false, thinkMs: 50,
         checkpoint: firstModel.path, opponentCheckpoint: secondModel.path, opponentPool: [], leagueRatio: 0, recordReplay: true
       };
       const result = await runGames(arena);
@@ -331,15 +361,30 @@ async function selectContinuousChampion(output: string, resume: string): Promise
     }
   }
 
-  const selected = [...models].sort((a, b) => {
+  const byScore = [...models].sort((a, b) => {
     const scoreDifference = b.points / Math.max(1, b.games) - a.points / Math.max(1, a.games);
     return Math.abs(scoreDifference) > 1e-12 ? scoreDifference : Number(b.incumbent) - Number(a.incumbent);
-  })[0]!;
+  });
   const candidateHash = createHash("sha256").update(readFileSync(resolvedOutput)).digest("hex");
+  const candidate = byScore.find((model) => model.hash === candidateHash);
+  const incumbent = byScore.find((model) => model.hash === resumeHash);
+  const bestLegacy = byScore.find((model) => model.hash !== candidateHash);
+  const minimumClearImprovement = 0.05;
+  const scoreRate = (model: typeof byScore[number] | undefined) => model ? model.points / Math.max(1, model.games) : 0;
+  const candidateVsIncumbent = scoreRate(candidate) - scoreRate(incumbent);
+  const candidateClearsPromotionGate = !!candidate && !!incumbent && !!bestLegacy
+    && candidateVsIncumbent >= minimumClearImprovement
+    && scoreRate(candidate) - scoreRate(bestLegacy) >= minimumClearImprovement;
+  const incumbentSafeFallback = incumbent && (!bestLegacy || scoreRate(bestLegacy) < scoreRate(incumbent) + minimumClearImprovement)
+    ? incumbent : undefined;
+  const selected = candidateClearsPromotionGate ? candidate! : incumbentSafeFallback ?? bestLegacy ?? byScore[0]!;
   if (selected.path !== resolvedOutput) copyFileSync(selected.path, resolvedOutput);
   const report = {
     method: "balanced pairwise checkpoint tournament",
     gamesPerPair: 24,
+    minimumClearImprovement,
+    candidateVsIncumbentScoreRate: candidateVsIncumbent,
+    candidateClearsPromotionGate,
     modelCount: models.length,
     selected: selected.label,
     newCheckpointPromoted: selected.hash === candidateHash && candidateHash !== resumeHash,
@@ -360,13 +405,21 @@ function settings(name: string, collect: boolean): RunSettings {
   const parsedRatio = ratioText === "auto" ? (opponentPool.length ? 0.4 : 0)
     : Number(ratioText);
   if (!Number.isFinite(parsedRatio) || parsedRatio < 0 || parsedRatio > 1) throw new Error("league-ratio must be auto or a number in [0, 1]");
+  const consecutiveNonPromotions = consecutivePromotionFailures(name);
+  const searchBudget = effectiveSearchBudget(name, {
+    simulations: integer(flags.simulations, "simulations", 1, 4096),
+    minimumSimulations: integer(flags["min-simulations"], "min-simulations", 1, 4096),
+    thinkMs: integer(flags["think-ms"], "think-ms", 0, 60000)
+  }, consecutiveNonPromotions);
   return { name, games: integer(flags.games, "games", 1, 10000),
     workers: effectiveWorkerCount(name, integer(flags.workers, "workers", 1, 20)),
-    simulations: integer(flags.simulations, "simulations", 1, 4096), maxActions: integer(flags["max-actions"], "max-actions", 1, 100000),
+    simulations: searchBudget.simulations, minimumSimulations: searchBudget.minimumSimulations,
+    searchMultiplier: searchBudget.multiplier, consecutiveNonPromotions,
+    maxActions: integer(flags["max-actions"], "max-actions", 1, 100000),
     maxLearningRounds: learningRoundLimit(name),
     maxSamples: integer(flags["max-samples"], "max-samples", 0, 10000), seed: integer(flags.seed, "seed", 0, 0xffffffff),
     policy: policy(flags.policy), opponent: policy(flags.opponent), collect, bootstrap, exploratory: collect,
-    thinkMs: integer(flags["think-ms"], "think-ms", 0, 60000), recordReplay: flags.replay!,
+    thinkMs: searchBudget.thinkMs, recordReplay: flags.replay!,
     opponentPool, leagueRatio: parsedRatio,
     ...(flags.checkpoint ? { checkpoint: flags.checkpoint } : {}),
     ...(flags["opponent-checkpoint"] ? { opponentCheckpoint: flags["opponent-checkpoint"] } : {}) };
@@ -377,7 +430,7 @@ async function main() {
   if (flags.help || command === "help") {
     console.log(`昏晓 AI 实验（本地共享规则；不会操作线上房间）
   pnpm ai inspect
-  pnpm ai arena --policy search --opponent random --games 4 --simulations 32
+  pnpm ai arena --policy search --opponent random --games 4 --simulations 32 --min-simulations 1
   pnpm ai sample --bootstrap teacher --games 4 --workers 4 --name teacher-seed
   pnpm ai train --data <samples.jsonl> --metadata <metadata.json> --output <model.pt>
   pnpm ai selfplay --checkpoint <model.pt> --bootstrap network

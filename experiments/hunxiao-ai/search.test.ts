@@ -235,6 +235,7 @@ test("terminal roots and invalid search limits are rejected", async () => {
   await assert.rejects(search(terminal, terminal.initial, uniform, { simulations: 1 }), /terminal position/);
   const env = graphEnvironment([{ team: "A", children: [1] }, { team: "A", terminalA: 1 }]);
   await assert.rejects(search(env, env.initial, uniform, { simulations: 0 }), /positive integer/);
+  await assert.rejects(search(env, env.initial, uniform, { simulations: 1, minimumSimulations: 2 }), /no greater than simulations/);
   await assert.rejects(search(env, env.initial, uniform, { simulations: 1, maxDepth: -1 }), /nonnegative integer/);
   await assert.rejects(search(env, env.initial, uniform, { simulations: 1, timeLimitMs: 0 }), /finite and positive/);
 });
@@ -252,6 +253,20 @@ test("soft time budget guarantees one simulation and reports actual work", async
   assert.deepEqual(result.visits, [1]);
   assert.equal(result.value, 1);
   assert.ok(result.stats.elapsedMs >= 1, "in-flight evaluator is allowed to exceed a soft budget");
+});
+
+test("soft time budget still completes configured minimum search simulations", async () => {
+  const env = graphEnvironment([
+    { team: "A", children: [1, 2, 3, 4] },
+    { team: "A", terminalA: 1 }, { team: "A", terminalA: 0 }, { team: "A", terminalA: -1 }, { team: "A", terminalA: 0 }
+  ]);
+  const slow: Evaluator = async (positions) => {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    return uniform(positions);
+  };
+  const result = await search(env, env.initial, slow, { simulations: 12, minimumSimulations: 4, timeLimitMs: 1, seed: 2 });
+  assert.equal(result.stats.simulations, 4);
+  assert.equal(result.visits.reduce((sum, count) => sum + count, 0), 4);
 });
 
 test("action temperature does not discard root-visit training targets", async () => {

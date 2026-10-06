@@ -97,7 +97,7 @@ onBeforeUnmount(() => page.registerGameBoard(null));
     @update-mod="page.updateRoomModVersion"
   />
 
-  <section v-if="page.showGameLoading" class="sync-panel" role="status"><span v-if="page.missingLocalModIds.length === 0" class="sync-spinner" /><h2>{{ page.missingLocalModIds.length ? '当前设备缺少地块 Mod' : '正在同步棋盘' }}</h2><p>{{ page.missingLocalModIds.length ? `此地图需要 ${page.missingLocalModIds.join('、')}。安装后才能进入对局。` : '正在从房间获取当前地图和最新对局状态；若房主刚断线，系统会自动重试。' }}</p></section>
+  <section v-if="page.showGameLoading" class="sync-panel" role="status"><span v-if="page.missingLoadedModIds.length === 0" class="sync-spinner" /><h2>{{ page.missingLoadedModIds.length ? '正在读取地图地块' : '正在同步棋盘' }}</h2><p>{{ page.missingLoadedModIds.length ? `正在从服务器加载本局需要的地块：${page.missingLoadedModIds.join('、')}。` : '正在从房间获取当前地图和最新对局状态；若房主刚断线，系统会自动重试。' }}</p></section>
 
   <Teleport to="body">
     <div v-if="page.showGame && page.isMatchFinished" class="result-backdrop">

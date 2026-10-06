@@ -43,7 +43,7 @@ export interface MapDefinition {
   readonly columns: number;
   readonly terrain: string;
   readonly terrainLegend: Readonly<Record<string, string>>;
-  /** IDs of separately installed terrain Mods used by this map. */
+  /** IDs of server-managed terrain Mods used by this map. */
   readonly requiredTerrainModIds: readonly string[];
   /** Optional map-author defaults. A room host may override declared values. */
   readonly modSettings?: ModSettings;
@@ -62,13 +62,13 @@ export interface MapDefinition {
 }
 
 export interface MapCatalogs {
-  /** Pass the same installed terrain/Mod catalog to map loading and the engine. */
+  /** Pass the current loaded terrain/Mod catalog to map loading and the engine. */
   readonly terrains?: TerrainCatalog;
   /** Resolve a registered terrain ID to its owning Mod ID. Core terrains need no entry. */
   readonly terrainModIds?: Readonly<Record<string, string>>;
-  /** Installed Mod schemas used to validate configurable map/room values. */
+  /** Current Mod schemas used to validate configurable map/room values. */
   readonly mods?: ModCatalog;
-  /** Inspect/store a map before optional terrain Mods are installed. Never use for play. */
+  /** Inspect/store a map before optional server Mods are loaded. Never use for play. */
   readonly allowUnknownTerrainMods?: boolean;
   readonly units?: UnitCatalog;
   readonly matchConditions?: MatchConditionCatalog;
@@ -82,7 +82,7 @@ export interface MapMatchOptions extends MapCatalogs {
   /** Selected legacy palette colors keyed by stable map player ID. */
   readonly playerColors?: Readonly<Record<string, string>>;
   readonly friendlyFire?: boolean;
-  /** Host overrides, validated against the installed Mod's setting schema. */
+  /** Host overrides, validated against the current Mod's setting schema. */
   readonly roomModSettings?: ModSettings;
 }
 

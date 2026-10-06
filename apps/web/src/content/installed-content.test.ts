@@ -1,16 +1,17 @@
 import { describe, expect, it } from "vitest";
+import { computed } from "vue";
 import type { TerrainModDefinition } from "@numeral-lord/content-schema";
 import { coreTerrainCatalog, createMatchFromMapCode, parseMapCode, serializeMapCode } from "@numeral-lord/core-content";
 import { TEST_MAP_DEFINITION } from "../../../../packages/core-content/test-fixtures/maps.js";
 import {
-  installedTerrainCatalog,
-  installedTerrainModIds,
-  installedTerrainMods,
-  registerInstalledTerrainModObject,
+  loadedTerrainCatalog,
+  loadedTerrainModIds,
+  loadedTerrainMods,
+  loadedTerrainCatalogRevision,
+  registerServerTerrainModDefinition,
   resolveMapCatalogs,
   terrainVisualAssetsForCatalogs
 } from "./installed-content.js";
-import { terrainModContentHash } from "./mod-installation.js";
 
 function terrainMod(id: string, version: string, displayName: string): TerrainModDefinition {
   const slug = id.slice(4);
@@ -40,10 +41,10 @@ function mapCodeFor(mod: TerrainModDefinition, id: string): string {
 
 describe("map Mod dependency release resolution", () => {
   it("starts with only core terrain and no bundled Mods", () => {
-    expect(installedTerrainMods).toEqual([]);
-    expect(Object.keys(installedTerrainModIds)).toEqual([]);
-    expect(installedTerrainCatalog["mod/oil-field"]).toBeUndefined();
-    expect(installedTerrainCatalog["core/plain"]).toEqual(coreTerrainCatalog["core/plain"]);
+    expect(loadedTerrainMods).toEqual([]);
+    expect(Object.keys(loadedTerrainModIds)).toEqual([]);
+    expect(loadedTerrainCatalog["mod/oil-field"]).toBeUndefined();
+    expect(loadedTerrainCatalog["core/plain"]).toEqual(coreTerrainCatalog["core/plain"]);
   });
 
   it("passes artwork from a Mod explicitly present in the resolved catalog", () => {
@@ -61,6 +62,19 @@ describe("map Mod dependency release resolution", () => {
       }
     } as unknown as Parameters<typeof terrainVisualAssetsForCatalogs>[0];
     expect(terrainVisualAssetsForCatalogs(catalogs)).toEqual({ "mod/oil-field": { "oil-art": assetUrl } });
+  });
+
+  it("invalidates map preview catalogs after an asynchronously fetched Mod registers", () => {
+    const mod = terrainMod("mod-reactive-preview", "1.0.0", "异步地块");
+    const code = mapCodeFor(mod, "map-reactive-preview");
+    const previewMod = computed(() => {
+      void loadedTerrainCatalogRevision.value;
+      return resolveMapCatalogs(code)?.mods?.[mod.id];
+    });
+
+    expect(previewMod.value).toBeUndefined();
+    registerServerTerrainModDefinition(mod, "异步地块");
+    expect(previewMod.value?.version).toBe(mod.version);
   });
 
   it("keeps map Mods as external dependencies instead of preinstalling them", () => {
@@ -83,45 +97,34 @@ describe("map Mod dependency release resolution", () => {
     expect(parseMapCode(code, catalogs!).requiredTerrainModIds).toEqual(["mod-oil-field", "mod-decay-terrain"]);
   });
 
-  it("follows the active release locally and the host-selected cached release in a room", () => {
+  it("uses the currently loaded server definition regardless of an old room release hint", () => {
     const oldRelease = terrainMod("mod-map-pin-history", "1.0.0", "旧版地块");
     const currentRelease = terrainMod("mod-map-pin-history", "2.0.0", "新版地块");
     const code = mapCodeFor(oldRelease, "map-pinned-old-release");
-    registerInstalledTerrainModObject(oldRelease, "旧版地块");
-    registerInstalledTerrainModObject(currentRelease, "新版地块");
+    registerServerTerrainModDefinition(oldRelease, "旧版地块");
+    registerServerTerrainModDefinition(currentRelease, "新版地块");
 
     const catalogs = resolveMapCatalogs(code);
     expect(catalogs?.mods?.[oldRelease.id]?.version).toBe("2.0.0");
-    const hostRelease = {
-      id: oldRelease.id,
-      version: oldRelease.version,
-      contentHash: terrainModContentHash(oldRelease)
-    };
-    const roomCatalogs = resolveMapCatalogs(code, [hostRelease]);
-    expect(roomCatalogs?.mods?.[oldRelease.id]?.version).toBe("1.0.0");
-    expect(createMatchFromMapCode(code, roomCatalogs!).cells).toBeDefined();
+    expect(createMatchFromMapCode(code, catalogs!).cells).toBeDefined();
   });
 
-  it("does not substitute a different local release when the host's selected release is missing", () => {
+  it("does not gate a map on a legacy release pin when the current server definition is loaded", () => {
     const hostRelease = terrainMod("mod-map-pin-missing", "1.0.0", "房主版本");
     const currentRelease = terrainMod("mod-map-pin-missing", "2.0.0", "本机版本");
     const code = mapCodeFor(hostRelease, "map-host-release-missing");
-    registerInstalledTerrainModObject(currentRelease, "本机版本");
+    registerServerTerrainModDefinition(currentRelease, "服务器当前地块");
 
-    const catalogs = resolveMapCatalogs(code, [{
-      id: hostRelease.id,
-      version: hostRelease.version,
-      contentHash: terrainModContentHash(hostRelease)
-    }]);
-    expect(catalogs?.mods?.[hostRelease.id]).toBeUndefined();
-    expect(() => createMatchFromMapCode(code, catalogs!)).toThrow(/未知的地形或 Mod/);
+    const catalogs = resolveMapCatalogs(code);
+    expect(catalogs?.mods?.[hostRelease.id]?.version).toBe("2.0.0");
+    expect(createMatchFromMapCode(code, catalogs!).cells).toBeDefined();
   });
 
   it("ignores legacy map locks and still infers the Mod ID when older maps omitted the dependency list", () => {
     const mod = terrainMod("mod-map-pin-legacy", "1.0.0", "旧地图地块");
     const nextRelease = terrainMod("mod-map-pin-legacy", "2.0.0", "更新地块");
-    registerInstalledTerrainModObject(mod, "旧地图地块");
-    registerInstalledTerrainModObject(nextRelease, "更新地块");
+    registerServerTerrainModDefinition(mod, "旧地图地块");
+    registerServerTerrainModDefinition(nextRelease, "更新地块");
     const oldCode = JSON.parse(mapCodeFor(mod, "map-with-inferred-mod")) as Record<string, unknown>;
     delete oldCode.requiredTerrainModIds;
     oldCode.requiredTerrainModLocks = [{ id: mod.id, version: mod.version, contentHash: `sha256:${"0".repeat(64)}` }];
@@ -133,7 +136,7 @@ describe("map Mod dependency release resolution", () => {
 
   it("keeps legacy maps without explicit dependency lists working through terrain inference", () => {
     const mod = terrainMod("mod-map-pin-inferred-legacy", "1.0.0", "旧地图地块");
-    registerInstalledTerrainModObject(mod, "旧地图地块");
+    registerServerTerrainModDefinition(mod, "旧地图地块");
     const oldCode = JSON.parse(mapCodeFor(mod, "map-with-inferred-mod")) as Record<string, unknown>;
     delete oldCode.requiredTerrainModIds;
     delete oldCode.requiredTerrainModLocks;

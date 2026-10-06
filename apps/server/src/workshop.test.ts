@@ -157,7 +157,11 @@ describe("workshop persistence and data-only Mod objects", () => {
     await store.publishTerrainMod({ name: "叠层预览", description: "目录卡片带顶部图层", definition }, "作者");
 
     const summary = (await store.list()).terrainMods[0]!;
-    expect("preview" in summary).toBe(false);
+    expect(summary.preview).toMatchObject({
+      terrainId: "mod/oil-field",
+      visuals: { baseAssetId: "base-image", overlay: { assetId: "top-layer", scale: 0.8 } },
+      visualAssets: [{ id: "base-image" }, { id: "top-layer" }]
+    });
     const preview = await store.getTerrainModPreview(summary.id);
     expect(preview).toMatchObject({
       id: summary.id,
@@ -172,6 +176,12 @@ describe("workshop persistence and data-only Mod objects", () => {
     expect(preview?.preview.visualAssets.every(({ url }) => /^assets\/terrain\/[a-f0-9]{64}\.png$/.test(url))).toBe(true);
     const storedDatabase = JSON.parse(await readFile(join(dataDirectory, "workshop.json"), "utf8")) as unknown;
     expect(JSON.stringify(storedDatabase)).not.toContain("data:image/");
+    const storedEntry = (storedDatabase as { terrainMods: Array<Record<string, unknown>> }).terrainMods[0]!;
+    expect(storedEntry.terrainVisualLayerUrls).toEqual({
+      bottomImageUrl: expect.stringMatching(/^assets\/terrain\/[a-f0-9]{64}\.png$/),
+      topImageUrl: expect.stringMatching(/^assets\/terrain\/[a-f0-9]{64}\.png$/)
+    });
+    expect(storedEntry).not.toHaveProperty("visualAssetUrls");
     const imageUrl = preview!.preview.visualAssets[0]!.url;
     const imageBytes = await readFile(join(dataDirectory, imageUrl));
     expect(imageBytes.toString("base64")).toBe(topLayer.dataUrl.slice(topLayer.dataUrl.indexOf(",") + 1));
@@ -180,6 +190,26 @@ describe("workshop persistence and data-only Mod objects", () => {
     expect(detailAssets?.find(({ id }) => id === "base-image")?.url).toContain("assets/terrain/");
     expect(detailAssets?.every((asset) => !("dataUrl" in asset))).toBe(true);
     expect(await store.getTerrainModPreview("missing-publication")).toBeUndefined();
+  });
+
+  it("exposes color-only terrain previews without inventing image URLs", async () => {
+    const { visualAssets: _visualAssets, ...withoutAssets } = exampleModDefinition;
+    const definition = {
+      ...withoutAssets,
+      terrain: {
+        ...withoutAssets.terrain,
+        visuals: { baseColor: "#6f9d72", baseOpacity: 0.9 }
+      }
+    } as unknown as TerrainModDefinition;
+    await store.publishTerrainMod({ name: "纯色草地", description: "只有纯色底层", definition }, "作者");
+
+    const summary = (await store.list()).terrainMods[0]!;
+    expect(summary.preview?.visuals).toMatchObject({ baseColor: "#6f9d72", baseOpacity: 0.9 });
+    expect(summary.preview?.visualAssets).toEqual([]);
+    const database = JSON.parse(await readFile(join(dataDirectory, "workshop.json"), "utf8")) as {
+      terrainMods: Array<Record<string, unknown>>
+    };
+    expect(database.terrainMods[0]).not.toHaveProperty("terrainVisualLayerUrls");
   });
 
   it("rejects the removed multi-terrain definition format", async () => {
@@ -247,7 +277,7 @@ describe("workshop persistence and data-only Mod objects", () => {
     expect(summary).not.toHaveProperty("previewArtworkUrls");
     expect(await store.getTerrainModPreview(entry.id)).toMatchObject({
       id: entry.id,
-      preview: { terrainId: "mod/oil-field", visuals: { baseAssetId: "base-image" }, visualAssets: [] }
+      preview: { terrainId: "mod/oil-field", visuals: { baseColor: "#638f67" }, visualAssets: [] }
     });
     expect(await store.get({ kind: "terrain-mod", id: entry.id })).not.toHaveProperty("entry.previewArtworkUrls");
   });
@@ -475,7 +505,7 @@ describe("workshop persistence and data-only Mod objects", () => {
     expect(await readFile(join(dataDirectory, "workshop.json"), "utf8")).not.toContain("data:image/");
   });
 
-  it("appends immutable releases, only for its author, and requires a newer version", async () => {
+  it("keeps one current Mod row, only lets its author update it, and requires a newer version", async () => {
     const original = await store.publishTerrainMod({
       name: "衰蚀地", description: "旧版", definition: withBaseLayer(decayTerrainMod as unknown as TerrainModDefinition)
     }, "作者");
@@ -492,16 +522,15 @@ describe("workshop persistence and data-only Mod objects", () => {
     expect(updated).toEqual({ kind: "terrain-mod", id: expect.not.stringMatching(original.id) });
     const catalog = await store.list();
     expect(catalog.terrainMods).toMatchObject([
-      { id: updated.id, name: "腐蚀地", version: "0.4.0", description: "新版" },
-      { id: original.id, name: "衰蚀地", version: "0.3.1", description: "旧版" }
+      { id: updated.id, name: "腐蚀地", version: "0.4.0", description: "新版" }
     ]);
     expect(catalog.terrainMods[0]?.terrainId).toBe("mod/decay-terrain");
-    expect(catalog.terrainMods).toHaveLength(2);
+    expect(catalog.terrainMods).toHaveLength(1);
     expect(catalog.terrainMods.every((release) => release.contentHash?.startsWith("sha256:") === true)).toBe(true);
-    expect((await store.get({ kind: "terrain-mod", id: original.id }))?.kind).toBe("terrain-mod");
+    expect(await store.get({ kind: "terrain-mod", id: original.id })).toBeUndefined();
     await expect(store.updateTerrainMod({
       updateId: original.id, name: "再次更新", description: "过期页面", definition: withBaseLayer({ ...decayTerrainMod, version: "0.5.0" } as unknown as TerrainModDefinition)
-    }, "作者")).rejects.toThrow("当前发布版本已变化");
+    }, "作者")).rejects.toThrow("要更新的 Mod 已不存在");
   });
 
   it("publishes a JSON map without installing its required terrain Mod", async () => {
@@ -547,6 +576,86 @@ describe("workshop persistence and data-only Mod objects", () => {
         .rejects.toThrow(/已经发布/);
     } finally {
       reopened.close();
+    }
+  });
+
+  it("resolves a normalized player name to the same persistent user ID and stores subscriptions in SQLite", async () => {
+    const databasePath = join(dataDirectory, "accounts.sqlite");
+    let sqlite = new SqliteWorkshopStore(databasePath, dataDirectory);
+    try {
+      const firstDevice = await sqlite.resolveUserIdentity("ZVMAGL3");
+      const secondDevice = await sqlite.resolveUserIdentity("  zvmagl3  ");
+      const simultaneousLookups = await Promise.all([
+        sqlite.resolveUserIdentity("ZVMAGL3"),
+        sqlite.resolveUserIdentity(" zvmagl3 ")
+      ]);
+      const differentName = await sqlite.resolveUserIdentity("ZVMAGL4");
+      expect(secondDevice.userId).toBe(firstDevice.userId);
+      expect(simultaneousLookups.map(({ userId }) => userId)).toEqual([firstDevice.userId, firstDevice.userId]);
+      expect(differentName.userId).not.toBe(firstDevice.userId);
+
+      await sqlite.publishTerrainMod({ name: "油田", description: "资源地块", definition: exampleModDefinition }, "作者");
+      expect(await sqlite.setUserSubscription(firstDevice.userId, "mod-oil-field", true)).toEqual(["mod-oil-field"]);
+      expect(await sqlite.listUserSubscriptions(secondDevice.userId)).toEqual(["mod-oil-field"]);
+      expect(await sqlite.listUserSubscriptions(differentName.userId)).toEqual([]);
+
+      await sqlite.setUserSubscriptions(firstDevice.userId, ["mod-restored-legacy"]);
+      expect(await sqlite.listUserSubscriptions(firstDevice.userId)).toEqual(["mod-oil-field", "mod-restored-legacy"]);
+      expect(await sqlite.setUserSubscription(firstDevice.userId, "mod-oil-field", false)).toEqual(["mod-restored-legacy"]);
+      sqlite.close();
+      sqlite = new SqliteWorkshopStore(databasePath, dataDirectory);
+      expect((await sqlite.resolveUserIdentity("ZVMAGL3")).userId).toBe(firstDevice.userId);
+      expect(await sqlite.listUserSubscriptions(firstDevice.userId)).toEqual(["mod-restored-legacy"]);
+    } finally {
+      sqlite.close();
+    }
+  });
+
+  it("stores personal maps per workshop account, imports local cache only once, and acknowledges edits", async () => {
+    const databasePath = join(dataDirectory, "personal-maps.sqlite");
+    const sqlite = new SqliteWorkshopStore(databasePath, dataDirectory);
+    try {
+      const firstDevice = await sqlite.resolveUserIdentity("ZVMAGL3");
+      const secondDevice = await sqlite.resolveUserIdentity(" zvmagl3 ");
+      const anotherUser = await sqlite.resolveUserIdentity("ZVMAGL4");
+      const mapId = "test-map-explicit-mod";
+
+      const initial = await sqlite.syncPersonalMaps(firstDevice.userId, {
+        cachedMaps: [{ mapId, code: TEST_MAP_CODE }],
+        operations: []
+      });
+      expect(secondDevice.userId).toBe(firstDevice.userId);
+      expect(initial.maps.map((map) => map.mapId)).toEqual([mapId]);
+      expect(initial.acknowledgedOperationIds).toEqual([]);
+      expect((await sqlite.syncPersonalMaps(anotherUser.userId, { cachedMaps: [], operations: [] })).maps).toEqual([]);
+
+      const revisedCode = JSON.stringify({ ...(JSON.parse(TEST_MAP_CODE) as Record<string, unknown>), name: "更新后的个人地图" });
+      const saved = await sqlite.syncPersonalMaps(secondDevice.userId, {
+        // Existing account records must win over a stale local cache import.
+        cachedMaps: [{ mapId, code: TEST_MAP_CODE }],
+        operations: [{ operationId: "save-op", type: "upsert", mapId, code: revisedCode }]
+      });
+      expect(saved.maps).toHaveLength(1);
+      expect(JSON.parse(saved.maps[0]!.code)).toMatchObject({ name: "更新后的个人地图" });
+      expect(saved.acknowledgedOperationIds).toEqual(["save-op"]);
+
+      const deleted = await sqlite.syncPersonalMaps(firstDevice.userId, {
+        cachedMaps: [],
+        operations: [{ operationId: "delete-op", type: "delete", mapId }]
+      });
+      expect(deleted.maps).toEqual([]);
+      expect(deleted.acknowledgedOperationIds).toEqual(["delete-op"]);
+
+      sqlite.close();
+      const reopened = new SqliteWorkshopStore(databasePath, dataDirectory);
+      try {
+        const reopenedIdentity = await reopened.resolveUserIdentity("ZVMAGL3");
+        expect((await reopened.syncPersonalMaps(reopenedIdentity.userId, { cachedMaps: [], operations: [] })).maps).toEqual([]);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      sqlite.close();
     }
   });
 

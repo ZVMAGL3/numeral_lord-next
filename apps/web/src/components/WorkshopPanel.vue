@@ -42,7 +42,7 @@ interface TerrainDraft {
 import { computed, ref, watch } from "vue";
 import { getPoweredUnitIds, type GameState } from "@numeral-lord/game-core";
 import { createMatchFromMapCode, parseMapCode } from "@numeral-lord/core-content";
-import { installedMapCatalogs, installedTerrainCatalog, resolveMapCatalogs, terrainVisualAssetsForCatalogs } from "../content/installed-content";
+import { runtimeMapCatalogs, loadedTerrainCatalog, loadedTerrainCatalogRevision, resolveMapCatalogs, terrainVisualAssetsForCatalogs } from "../content/installed-content";
 import { paginate } from "../shared/list-pagination.js";
 import HexBoard from "./HexBoard.vue";
 import NumberStepper from "./NumberStepper.vue";
@@ -53,8 +53,6 @@ import { compareModVersions } from "../workshop/workshop-terrain-catalog.js";
 
 const props = withDefaults(defineProps<{
   terrainMods: readonly TerrainModEntry[];
-  /** All immutable published releases; browse cards use latest only. */
-  terrainModReleases?: readonly TerrainModEntry[];
   mapEntries: readonly MapWorkshopEntry[];
   savedMapIds: readonly string[];
   subscribedTerrainModIds?: readonly string[];
@@ -82,8 +80,7 @@ const emit = defineEmits<{
   "save-map": [code: string];
   "publish-map": [entry: MapSubmission];
   "publish-terrain-mod": [entry: TerrainModSubmission];
-  "install-terrain-mod": [definition: TerrainModDefinition];
-  "cache-terrain-mod-release": [definition: TerrainModDefinition];
+  "subscribe-terrain-mod": [definition: TerrainModDefinition];
   "unsubscribe-terrain-mod": [id: string];
   "terrain-mod-opened": [id: string];
   "request-terrain-mod-preview": [id: string];
@@ -544,14 +541,10 @@ const publishTerrainModJson = computed(() => JSON.stringify(
 const publishError = ref("");
 const downloadMessage = ref("");
 
-const selectedTerrain = computed(() => (props.terrainModReleases ?? props.terrainMods).find((entry) => entry.id === selectedTerrainId.value)
+const selectedTerrain = computed(() => props.terrainMods.find((entry) => entry.id === selectedTerrainId.value)
   ?? props.terrainMods.find((entry) => entry.id === selectedTerrainId.value));
 const selectedTerrainModId = computed(() => selectedTerrain.value?.modId ?? selectedTerrain.value?.id ?? "");
 const selectedTerrainIsSubscribed = computed(() => props.subscribedTerrainModIds?.includes(selectedTerrainModId.value) ?? false);
-const selectedTerrainIsLatest = computed(() => props.terrainMods.find((entry) => entry.modId === selectedTerrainModId.value)?.id === selectedTerrain.value?.id);
-const selectedModReleases = computed(() => (props.terrainModReleases ?? props.terrainMods)
-  .filter((entry) => (entry.modId ?? entry.id) === selectedTerrainModId.value)
-  .sort((left, right) => compareModVersions(right.version, left.version)));
 const selectedMap = computed(() => props.mapEntries.find((entry) => entry.id === selectedMapId.value));
 const selectedDefinitionAssetUrls = ref<Readonly<Record<string, string>>>({});
 const selectedDefinitionAssetStatus = ref("");
@@ -621,7 +614,7 @@ watch(() => props.mapEntries, (entries) => {
 interface Dependency {
   readonly id: string;
   readonly name: string;
-  readonly installed: boolean;
+  readonly available: boolean;
 }
 
 function resolveTerrainMod(id: string): TerrainModEntry | undefined {
@@ -634,6 +627,7 @@ function requestTerrainModPreview(id: string): void {
 }
 
 function mapDependencies(map: MapWorkshopEntry): Dependency[] {
+  void loadedTerrainCatalogRevision.value;
   const ids = new Set(map.requiredTerrainModIds ?? []);
   // A server-supplied package list is authoritative. The legend only stores
   // terrain IDs, which must not appear as additional package dependencies.
@@ -656,19 +650,19 @@ function mapDependencies(map: MapWorkshopEntry): Dependency[] {
   for (const id of ids) {
     const mod = resolveTerrainMod(id);
     const key = mod?.modId ?? mod?.id ?? id;
-    result.set(key, { id: key, name: mod?.name ?? id,
-      installed: activeMods ? Boolean(activeMods[key]) : (mod?.installed ?? false) });
+    result.set(key, { id: key, name: mod?.name ?? id, available: Boolean(activeMods?.[key]) });
   }
   return [...result.values()];
 }
 
 const selectedDependencies = computed(() => selectedMap.value ? mapDependencies(selectedMap.value) : []);
-const missingDependency = computed(() => selectedDependencies.value.some((entry) => !entry.installed));
+const missingDependency = computed(() => selectedDependencies.value.some((entry) => !entry.available));
 const mapIsSaved = computed(() => !!selectedMap.value && props.savedMapIds.includes(selectedMap.value.mapId ?? selectedMap.value.id));
 
 // The detail preview uses the very same Pixi board as the lobby and match.
 // An unavailable Mod must not be silently replaced by an invented rule tile.
 const previewState = computed<GameState | null>(() => {
+  void loadedTerrainCatalogRevision.value;
   if (!selectedMap.value?.code) return null;
   try {
     const catalogs = resolveMapCatalogs(selectedMap.value.code);
@@ -676,33 +670,40 @@ const previewState = computed<GameState | null>(() => {
   }
   catch { return null; }
 });
-const previewCatalogs = computed(() => selectedMap.value?.code ? resolveMapCatalogs(selectedMap.value.code) : null);
+const previewCatalogs = computed(() => {
+  void loadedTerrainCatalogRevision.value;
+  return selectedMap.value?.code ? resolveMapCatalogs(selectedMap.value.code) : null;
+});
 const previewTerrainVisualAssets = computed(() => terrainVisualAssetsForCatalogs(previewCatalogs.value));
 const previewPoweredUnitIds = computed(() => previewState.value
-  ? [...getPoweredUnitIds(previewState.value, previewCatalogs.value?.terrains ?? installedTerrainCatalog)] : []);
+  ? [...getPoweredUnitIds(previewState.value, previewCatalogs.value?.terrains ?? loadedTerrainCatalog)] : []);
 const previewDefinition = computed(() => {
+  void loadedTerrainCatalogRevision.value;
   if (!selectedMap.value?.code) return null;
-  try { return parseMapCode(selectedMap.value.code, previewCatalogs.value ?? { ...installedMapCatalogs, allowUnknownTerrainMods: true }); }
+  try { return parseMapCode(selectedMap.value.code, previewCatalogs.value ?? { ...runtimeMapCatalogs, allowUnknownTerrainMods: true }); }
   catch { return null; }
 });
 
-const mapCardPreviews = computed(() => new Map(props.mapEntries.flatMap((entry) => {
-  if (!entry.code) return [];
-  try {
-    const catalogs = resolveMapCatalogs(entry.code);
-    if (!catalogs) return [];
-    const state = createMatchFromMapCode(entry.code, catalogs);
-    return [[entry.id, {
-      state,
-      poweredUnitIds: [...getPoweredUnitIds(state, catalogs.terrains ?? installedTerrainCatalog)],
-      terrainCatalog: catalogs.terrains ?? installedTerrainCatalog,
-      terrainVisualAssets: terrainVisualAssetsForCatalogs(catalogs)
-    }] as const];
-  } catch {
-    // Maps with missing Mod dependencies cannot be shown faithfully.
-    return [];
-  }
-})));
+const mapCardPreviews = computed(() => {
+  void loadedTerrainCatalogRevision.value;
+  return new Map(props.mapEntries.flatMap((entry) => {
+    if (!entry.code) return [];
+    try {
+      const catalogs = resolveMapCatalogs(entry.code);
+      if (!catalogs) return [];
+      const state = createMatchFromMapCode(entry.code, catalogs);
+      return [[entry.id, {
+        state,
+        poweredUnitIds: [...getPoweredUnitIds(state, catalogs.terrains ?? loadedTerrainCatalog)],
+        terrainCatalog: catalogs.terrains ?? loadedTerrainCatalog,
+        terrainVisualAssets: terrainVisualAssetsForCatalogs(catalogs)
+      }] as const];
+    } catch {
+      // Maps with missing Mod dependencies cannot be shown faithfully.
+      return [];
+    }
+  }));
+});
 function selectCategory(next: Category): void {
   category.value = next;
   if (next === "terrain") terrainPage.value = 1;
@@ -723,13 +724,6 @@ function openTerrain(entry: TerrainModEntry): void {
   selectedTerrainId.value = entry.id;
   downloadMessage.value = "";
   category.value = "terrain";
-  viewMode.value = "detail";
-  if (!entry.definition) emit("select-terrain-mod", entry.id);
-}
-
-function openTerrainRelease(entry: TerrainModEntry): void {
-  selectedTerrainId.value = entry.id;
-  downloadMessage.value = "";
   viewMode.value = "detail";
   if (!entry.definition) emit("select-terrain-mod", entry.id);
 }
@@ -1009,7 +1003,6 @@ function openPublish(): void {
   movementRuleExpanded.value = false;
   publishImageError.value = "";
   publishError.value = "";
-  category.value = "terrain";
   viewMode.value = "publish";
 }
 
@@ -1226,11 +1219,10 @@ function toggleCapability(id: string): void {
   publishError.value = "";
 }
 
-function installSelectedTerrain(): void {
+function subscribeSelectedTerrain(): void {
   const definition = selectedTerrain.value?.definition;
   if (!definition) return;
-  if (!selectedTerrainIsLatest.value) emit("cache-terrain-mod-release", definition);
-  else if (!selectedTerrain.value?.installed) emit("install-terrain-mod", definition);
+  if (!selectedTerrainIsSubscribed.value) emit("subscribe-terrain-mod", definition);
 }
 </script>
 
@@ -1240,7 +1232,7 @@ function installSelectedTerrain(): void {
       <div>
         <p class="eyebrow">COMMUNITY WORKSHOP</p>
         <h2>创意工坊</h2>
-        <p>浏览地图与结构化地块 Mod。订阅内容保存在本机；打开创意工坊时检查更新，更新不会在对局中途应用。</p>
+        <p>地图与地块 Mod 保存在服务器数据库。订阅状态绑定到玩家名称对应的服务器账号；订阅只决定地图编辑器可选项。</p>
       </div>
       <div class="workshop-heading-actions">
         <button class="outline-button condition-reference-entry" type="button" @click="showConditionReference = true">条件语法参考</button>
@@ -1260,7 +1252,7 @@ function installSelectedTerrain(): void {
     <p v-if="actionMessage" class="action-message" :class="{ error: actionError }" role="status">{{ actionMessage }}</p>
 
     <div class="workshop-toolbar">
-      <div><strong>{{ category === 'terrain' ? '地块扩展' : '地图作品' }}</strong><p>{{ category === 'terrain' ? '查看结构化属性与包含地块。订阅并安装后，在打开创意工坊时检查更新；规则由游戏内核执行。' : '地图作品是一段可保存的地图码；开局前需要装齐所依赖的地块 Mod。' }}</p></div>
+      <div><strong>{{ category === 'terrain' ? '地块扩展' : '地图作品' }}</strong><p>{{ category === 'terrain' ? '查看结构化属性与当前地块定义。订阅只影响地图编辑器可选地块；地图和房间始终从服务器读取当前定义。' : '地图作品是一段可保存的地图码；地图依赖在加载时从服务器数据库读取。' }}</p></div>
       <button v-if="publishingEnabled && viewMode === 'browse'" class="outline-button publish-entry" type="button" @click="openPublish">＋ {{ category === 'terrain' ? '发布地块 Mod' : '发布地图作品' }}</button>
       <span v-else-if="!publishingEnabled" class="read-only-note">此环境暂不接受工坊发布</span>
     </div>
@@ -1272,7 +1264,7 @@ function installSelectedTerrain(): void {
           <span class="work-card-preview terrain-card-preview" aria-hidden="true">
             <TerrainModPreview :terrain-id="entry.terrainId" :name="entry.name" :definition="entry.definition" :preview="entry.preview" :publication-id="entry.id" @preview-requested="requestTerrainModPreview" />
           </span>
-          <span class="work-card-info"><span class="work-card-title"><strong>{{ entry.name }}</strong><em :class="{ installed: entry.installed }">{{ entry.installed ? '已安装' : '未安装' }}</em></span><span class="work-card-description">{{ entry.description || '暂无作品简介' }}</span><small>{{ entry.authorName || entry.author || '社区作者' }} · {{ entry.terrainId }}</small></span>
+          <span class="work-card-info"><span class="work-card-title"><strong>{{ entry.name }}</strong><em :class="{ installed: entry.subscribed }">{{ entry.subscribed ? '已订阅' : '未订阅' }}</em></span><span class="work-card-description">{{ entry.description || '暂无作品简介' }}</span><small>{{ entry.authorName || entry.author || '社区作者' }} · {{ entry.terrainId }}</small></span>
         </button>
         <p v-if="!terrainMods.length" class="empty-list">暂无地块 Mod 作品。</p>
       </template>
@@ -1285,7 +1277,7 @@ function installSelectedTerrain(): void {
               :powered-unit-ids="mapCardPreviews.get(entry.id)!.poweredUnitIds"
               :terrain-catalog="mapCardPreviews.get(entry.id)!.terrainCatalog"
               :terrain-visual-assets="mapCardPreviews.get(entry.id)!.terrainVisualAssets" />
-            <span v-else class="thumbnail-placeholder">安装地图依赖的 Mod 后可预览</span>
+            <span v-else class="thumbnail-placeholder">正在从服务器加载地图依赖</span>
           </div>
           <span class="work-card-info"><span class="work-card-title"><strong>{{ entry.name }}</strong><em :class="{ installed: savedMapIds.includes(entry.mapId ?? entry.id) }">{{ savedMapIds.includes(entry.mapId ?? entry.id) ? '已保存' : '地图码' }}</em></span><span class="work-card-description">{{ entry.description || '暂无作品简介' }}</span><small>{{ entry.authorName || entry.author || '社区作者' }} · {{ entry.players ?? '?' }} 人地图 · {{ mapDependencies(entry).length }} 个地块依赖</small></span>
         </button>
@@ -1303,23 +1295,19 @@ function installSelectedTerrain(): void {
       <button class="catalog-back" type="button" @click="viewMode = 'browse'">← 返回{{ category === 'terrain' ? '地块 Mod' : '地图作品' }}列表</button>
         <article v-if="category === 'terrain' && selectedTerrain" class="detail-card">
           <div class="detail-overline"><span>TERRAIN MOD</span><span>{{ selectedTerrain.modId || selectedTerrain.id }}</span></div>
-          <div class="title-row"><div><h3>{{ selectedTerrain.name }}</h3><p>{{ selectedTerrain.authorName || selectedTerrain.author || '社区作者' }} · v{{ selectedTerrain.version }}</p></div><span class="status-pill" :class="{ installed: selectedTerrain.installed || selectedTerrain.cached }">{{ selectedTerrain.installed ? '已安装' : selectedTerrain.cached ? '已缓存' : '未安装' }}</span></div>
+          <div class="title-row"><div><h3>{{ selectedTerrain.name }}</h3><p>{{ selectedTerrain.authorName || selectedTerrain.author || '社区作者' }} · 当前版本 v{{ selectedTerrain.version }}</p></div><span class="status-pill" :class="{ installed: selectedTerrainIsSubscribed }">{{ selectedTerrainIsSubscribed ? '已订阅' : '未订阅' }}</span></div>
           <div class="terrain-detail-preview"><TerrainModPreview large :terrain-id="selectedTerrain.terrainId" :name="selectedTerrain.name" :definition="selectedTerrain.definition" :preview="selectedTerrain.preview" :publication-id="selectedTerrain.id" @preview-requested="requestTerrainModPreview" /></div>
           <p class="description">{{ selectedTerrain.description }}</p>
           <div class="metadata-block"><strong>地块 ID</strong><div class="token-list"><code>{{ selectedTerrain.terrainId }}</code></div></div>
-          <div class="metadata-block release-history"><strong>不可变版本历史</strong><div v-for="release in selectedModReleases" :key="release.id" class="release-row">
-            <span><b>v{{ release.version }}</b><small>{{ release.createdAt ? new Date(release.createdAt).toLocaleDateString() : '发布记录' }} · {{ release.contentHash?.slice(0, 19) ?? '旧版未记录指纹' }}</small></span>
-            <button type="button" :class="{ active: release.id === selectedTerrain.id }" @click="openTerrainRelease(release)">{{ release.id === selectedTerrain.id ? '当前查看' : '查看版本' }}</button>
-          </div></div>
           <p v-if="selectedTerrain.readme" class="readme">{{ selectedTerrain.readme }}</p>
-          <div class="metadata-block"><strong>Mod 属性对象</strong><p class="quiet">这些是存入数据库并安装到本机的 JSON 属性；行为由游戏内核中对应的能力处理器执行，不运行上传脚本。</p></div>
+          <div class="metadata-block"><strong>Mod 属性对象</strong><p class="quiet">这是服务器数据库中的当前 JSON 定义；规则由游戏内核中对应的能力处理器执行，不运行上传脚本。</p></div>
           <p v-if="selectedDefinitionAssetStatus" class="quiet" role="status">{{ selectedDefinitionAssetStatus }}</p>
           <pre v-if="selectedDefinitionJson" class="definition-preview"><code>{{ selectedDefinitionJson }}</code></pre>
-          <p v-else class="source-empty">{{ selectedTerrain.definition === undefined ? '此作品使用旧版多地块格式，仍可浏览作品信息，但当前版本无法安装；作者可以按新格式重新发布。' : '正在加载作品详情…' }}</p>
+          <p v-else class="source-empty">{{ selectedTerrain.definition === undefined ? '此作品使用旧版多地块格式，仍可浏览作品信息，但当前版本无法用于地图；作者可以按新格式重新发布。' : '正在加载作品详情…' }}</p>
           <div class="detail-actions">
-            <button class="primary-button" type="button" :disabled="(selectedTerrainIsLatest ? selectedTerrain.installed && selectedTerrainIsSubscribed : selectedTerrain.cached) || !selectedTerrain.definition || working" @click="installSelectedTerrain">{{ !selectedTerrain.definition ? '需要重新发布' : selectedTerrainIsLatest ? (selectedTerrainIsSubscribed ? selectedTerrain.installed ? '已订阅并安装' : '已订阅，点击重新下载' : selectedTerrain.installed ? '订阅自动更新' : '订阅并安装 Mod') : selectedTerrain.cached ? '此版本已缓存' : '缓存此版本以加入对应房间' }}</button>
+            <button class="primary-button" type="button" :disabled="selectedTerrainIsSubscribed || !selectedTerrain.definition || working" @click="subscribeSelectedTerrain">{{ !selectedTerrain.definition ? '当前定义暂不可用' : selectedTerrainIsSubscribed ? '已订阅' : '订阅（用于地图编辑）' }}</button>
             <button v-if="selectedTerrainIsSubscribed" class="unsubscribe-button" type="button" :disabled="working" @click="emit('unsubscribe-terrain-mod', selectedTerrainModId)">取消订阅</button>
-            <button v-if="publishingEnabled && selectedTerrainIsLatest && selectedTerrain.definition && selectedTerrain.authorName === currentAuthorName.trim()" class="outline-button" type="button" :disabled="working" @click="editTerrain(selectedTerrain)">发布新版本</button>
+            <button v-if="publishingEnabled && selectedTerrain.definition && selectedTerrain.authorName === currentAuthorName.trim()" class="outline-button" type="button" :disabled="working" @click="editTerrain(selectedTerrain)">更新 Mod</button>
           </div>
           <p v-if="downloadMessage" class="copy-message" role="status">{{ downloadMessage }}</p>
         </article>
@@ -1331,10 +1319,10 @@ function installSelectedTerrain(): void {
           <div v-if="previewState" class="map-preview">
             <HexBoard preview :state="previewState" :selected-unit-id="null" :legal-action-cell-ids="[]" :actionable-unit-ids="[]" :powered-unit-ids="previewPoweredUnitIds" :terrain-catalog="previewCatalogs?.terrains" :terrain-visual-assets="previewTerrainVisualAssets" />
           </div>
-          <div v-else class="preview-unavailable">{{ selectedMap.code ? missingDependency ? '尚未安装所需地块 Mod，无法使用真实棋盘预览。' : '地图格式暂时无法预览，仍可查看地图码。' : '正在加载地图详情与预览…' }}</div>
+          <div v-else class="preview-unavailable">{{ selectedMap.code ? missingDependency ? '正在等待服务器提供所需地块 Mod，暂时无法预览。' : '地图格式暂时无法预览，仍可查看地图码。' : '正在加载地图详情与预览…' }}</div>
           <p v-if="previewDefinition" class="preview-caption">{{ previewDefinition.columns }} × {{ previewDefinition.terrain.length / previewDefinition.columns }} 格 · {{ previewDefinition.players }} 个玩家位</p>
-          <div class="metadata-block dependency-block"><strong>需要的地块 Mod</strong><div v-if="selectedDependencies.length" class="dependency-list"><span v-for="dependency in selectedDependencies" :key="dependency.id" class="dependency" :class="{ missing: !dependency.installed }"><b>{{ dependency.name }}</b><code>{{ dependency.id }}</code><em>{{ dependency.installed ? '已安装' : '缺失' }}</em></span></div><p v-else class="quiet">仅使用原生地块，无额外地块 Mod 依赖。</p></div>
-          <div v-if="missingDependency" class="dependency-warning" role="status">缺少依赖的地块 Mod。可以先保存地图码，但安装依赖前不能开局。<button class="outline-button" type="button" @click="openDependency(selectedDependencies.find((item) => !item.installed)?.id ?? '')">查看所需地块 Mod</button></div>
+          <div class="metadata-block dependency-block"><strong>需要的地块 Mod</strong><div v-if="selectedDependencies.length" class="dependency-list"><span v-for="dependency in selectedDependencies" :key="dependency.id" class="dependency" :class="{ missing: !dependency.available }"><b>{{ dependency.name }}</b><code>{{ dependency.id }}</code><em>{{ dependency.available ? '服务器可用' : '服务器未找到' }}</em></span></div><p v-else class="quiet">仅使用原生地块，无额外地块 Mod 依赖。</p></div>
+          <div v-if="missingDependency" class="dependency-warning" role="status">正在加载或服务器中不存在地图依赖的地块 Mod。地图码仍可保存；对局会按服务器当前定义加载。<button class="outline-button" type="button" @click="openDependency(selectedDependencies.find((item) => !item.available)?.id ?? '')">查看所需地块 Mod</button></div>
           <div class="detail-actions">
             <button class="primary-button" type="button" :disabled="mapIsSaved || !selectedMap.code || working" @click="selectedMap.code && emit('save-map', selectedMap.code)">{{ mapIsSaved ? '已在我的地图配置' : missingDependency ? '仅保存地图码（暂不可开局）' : '保存到我的地图配置' }}</button>
             <button class="outline-button" type="button" :disabled="!selectedMap.code" @click="copyMapCode">复制地图码</button>

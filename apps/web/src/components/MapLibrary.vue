@@ -5,12 +5,12 @@ import { getPoweredUnitIds, type GameState, type UnitId } from "@numeral-lord/ga
 import { createMatchFromMapCode, parseMapCode, type MapDefinition } from "@numeral-lord/core-content";
 import { missingTerrainMods, type ConfiguredMap } from "../maps/map-library";
 import { clearMapEditorDraft, mapEditorDraftIdFromPath } from "../maps/map-editor-draft-route";
-import { installedMapCatalogs, installedTerrainCatalog, resolveMapCatalogs, terrainVisualAssetsForCatalogs } from "../content/installed-content";
+import { runtimeMapCatalogs, loadedTerrainCatalog, loadedTerrainCatalogRevision, resolveMapCatalogs, terrainVisualAssetsForCatalogs } from "../content/installed-content";
 import { paginate } from "../shared/list-pagination.js";
 import HexBoard from "./HexBoard.vue";
 import MapEditor from "./MapEditor.vue";
 
-const props = defineProps<{ maps: readonly ConfiguredMap[]; selectedId: string; actionMessage: string; actionError: boolean }>();
+const props = defineProps<{ maps: readonly ConfiguredMap[]; selectedId: string; actionMessage: string; actionError: boolean; importing?: boolean; subscribedModIds: readonly string[] }>();
 const route = useRoute(), router = useRouter();
 const emit = defineEmits<{
   back: []; select: [id: string]; add: [code: string]; save: [definition: MapDefinition]; remove: [id: string];
@@ -26,7 +26,7 @@ const codeField = ref<HTMLTextAreaElement | null>(null);
 const editingDefinition = ref<MapDefinition | null>(null);
 const newDraftAvailable = ref(false);
 const EDITOR_DRAFT_KEY = "numeral-lord.map-editor-draft.v1";
-const draftCatalogs = { ...installedMapCatalogs, allowUnknownTerrainMods: true };
+const draftCatalogs = { ...runtimeMapCatalogs, allowUnknownTerrainMods: true };
 const selected = computed(() => props.maps.find((map) => map.definition.id === props.selectedId) ?? props.maps[0]);
 const MAP_PAGE_SIZE = 12;
 const mapPage = ref(1);
@@ -36,7 +36,10 @@ watch(() => props.maps.length, (currentLength, previousLength) => {
     ? Math.ceil(currentLength / MAP_PAGE_SIZE)
     : mapPageSlice.value.currentPage;
 });
-const selectedMissingMods = computed(() => selected.value ? missingTerrainMods(selected.value) : []);
+const selectedMissingMods = computed(() => {
+  void loadedTerrainCatalogRevision.value;
+  return selected.value ? missingTerrainMods(selected.value) : [];
+});
 watch(() => props.selectedId, () => { showCode.value = false; copyStatus.value = ""; });
 function readEditorDraft(mapId: string): MapDefinition | null {
   try {
@@ -85,34 +88,41 @@ watch(() => route.path, (path, previousPath) => {
   restoreEditorRoute(path);
 }, { immediate: true });
 const previewState = computed<GameState | null>(() => {
+  void loadedTerrainCatalogRevision.value;
   if (!selected.value) return null;
   try {
     const catalogs = resolveMapCatalogs(selected.value.code);
     return catalogs ? createMatchFromMapCode(selected.value.code, catalogs) : null;
   } catch { return null; }
 });
-const previewCatalogs = computed(() => selected.value ? resolveMapCatalogs(selected.value.code) : null);
-const previewTerrainCatalog = computed(() => previewCatalogs.value?.terrains ?? installedTerrainCatalog);
+const previewCatalogs = computed(() => {
+  void loadedTerrainCatalogRevision.value;
+  return selected.value ? resolveMapCatalogs(selected.value.code) : null;
+});
+const previewTerrainCatalog = computed(() => previewCatalogs.value?.terrains ?? loadedTerrainCatalog);
 const previewTerrainVisualAssets = computed(() => terrainVisualAssetsForCatalogs(previewCatalogs.value));
 const previewPoweredUnitIds = computed(() => previewState.value ? [...getPoweredUnitIds(previewState.value, previewTerrainCatalog.value)] : []);
-const cardPreviews = computed(() => new Map(props.maps.flatMap((map) => {
-  try {
-    const catalogs = resolveMapCatalogs(map.code);
-    if (!catalogs) return [];
-    const state = createMatchFromMapCode(map.code, catalogs);
-    return [[map.definition.id, {
-      state,
-      poweredUnitIds: [...getPoweredUnitIds(state, catalogs.terrains ?? installedTerrainCatalog)],
-      terrainCatalog: catalogs.terrains ?? installedTerrainCatalog,
-      terrainVisualAssets: terrainVisualAssetsForCatalogs(catalogs)
-    }] as const];
-  } catch {
-    // Unknown terrain Mod data cannot be rendered faithfully. Show an explicit
-    // dependency placeholder instead of drawing a misleading substitute map.
-    return [];
-  }
-})));
-function cardPreview(map: ConfiguredMap): { state: GameState; poweredUnitIds: readonly UnitId[]; terrainCatalog: typeof installedTerrainCatalog; terrainVisualAssets: Readonly<Record<string, Readonly<Record<string, string>>>> } | undefined {
+const cardPreviews = computed(() => {
+  void loadedTerrainCatalogRevision.value;
+  return new Map(props.maps.flatMap((map) => {
+    try {
+      const catalogs = resolveMapCatalogs(map.code);
+      if (!catalogs) return [];
+      const state = createMatchFromMapCode(map.code, catalogs);
+      return [[map.definition.id, {
+        state,
+        poweredUnitIds: [...getPoweredUnitIds(state, catalogs.terrains ?? loadedTerrainCatalog)],
+        terrainCatalog: catalogs.terrains ?? loadedTerrainCatalog,
+        terrainVisualAssets: terrainVisualAssetsForCatalogs(catalogs)
+      }] as const];
+    } catch {
+      // Unknown terrain Mod data cannot be rendered faithfully. Show an explicit
+      // dependency placeholder instead of drawing a misleading substitute map.
+      return [];
+    }
+  }));
+});
+function cardPreview(map: ConfiguredMap): { state: GameState; poweredUnitIds: readonly UnitId[]; terrainCatalog: typeof loadedTerrainCatalog; terrainVisualAssets: Readonly<Record<string, Readonly<Record<string, string>>>> } | undefined {
   return cardPreviews.value.get(map.definition.id);
 }
 function selectMap(id: string): void { emit("select", id); view.value = "detail"; }
@@ -147,7 +157,9 @@ function cancelEditor(): void {
   void router.push("/maps");
 }
 function addMap(): void { emit("add", codeDraft.value.trim()); }
-function clearCodeDraft(): void { codeDraft.value = ""; }
+function clearCodeDraft(importedCode?: string): void {
+  if (importedCode === undefined || codeDraft.value.trim() === importedCode.trim()) codeDraft.value = "";
+}
 async function copyCode(): Promise<void> {
   if (!selected.value) return;
   try { if (!navigator.clipboard?.writeText) throw new Error(); await navigator.clipboard.writeText(selected.value.code); copyStatus.value = "地图码已复制"; return; }
@@ -163,12 +175,12 @@ defineExpose({ clearCodeDraft });
 <template>
   <section class="map-library" :class="{ 'editing-map': view === 'editor' }">
     <header class="library-heading">
-      <div><p class="kicker">MAP LIBRARY</p><h2>地图配置</h2><p>地图保存在当前浏览器；你可以导入地图码，或直接创建和编辑地图。</p></div>
+      <div><p class="kicker">MAP LIBRARY</p><h2>地图配置</h2><p>地图同步到工坊账号，并在当前浏览器保留缓存；使用相同玩家名称可在其他设备继续使用。</p></div>
       <div class="heading-actions"><button v-if="view !== 'library'" class="outline-button" @click="view = 'library'">← 返回地图库</button><button class="back-link" @click="emit('back')">返回主页</button></div>
     </header>
 
     <template v-if="view === 'library'">
-      <div class="library-toolbar"><div><strong>我的地图</strong><span>{{ maps.length }} 张 · 仅保存在本机</span></div><div><button v-if="newDraftAvailable" class="outline-button" @click="resumeNewDraft">继续编辑草稿</button><button class="outline-button" @click="view = 'import'">导入地图</button><button class="primary-button" @click="startCreate">＋ 创建地图</button></div></div>
+      <div class="library-toolbar"><div><strong>我的地图</strong><span>{{ maps.length }} 张 · 账号同步 / 本机缓存</span></div><div><button v-if="newDraftAvailable" class="outline-button" @click="resumeNewDraft">继续编辑草稿</button><button class="outline-button" @click="view = 'import'">导入地图</button><button class="primary-button" @click="startCreate">＋ 创建地图</button></div></div>
       <p v-if="actionMessage" class="action-message" :class="{ error: actionError }" role="status">{{ actionMessage }}</p>
       <div class="map-cards">
         <button v-for="map in mapPageSlice.items" :key="map.definition.id" class="map-card" @click="selectMap(map.definition.id)">
@@ -190,18 +202,18 @@ defineExpose({ clearCodeDraft });
         <div class="detail-title"><div><h3>{{ selected.definition.name }}</h3><p>{{ selected.definition.columns }} × {{ selected.definition.terrain.length / selected.definition.columns }} 格 · {{ selected.definition.players }} 个玩家位 · {{ selected.definition.soldiers.length }} 个初始单位</p></div><span class="version-badge">地图码 v{{ selected.definition.version }}</span></div>
         <p class="dependency-line">需要地块 Mod：{{ selected.definition.requiredTerrainModIds.length ? selected.definition.requiredTerrainModIds.join('、') : '无' }}</p>
         <p v-if="selectedMissingMods.length" class="missing-mod-note" role="status">尚未安装 {{ selectedMissingMods.join('、') }}；安装所需 Mod 后即可完整预览和开局。</p>
-        <div v-if="previewState" class="detail-board"><HexBoard preview :state="previewState" :selected-unit-id="null" :legal-action-cell-ids="[]" :actionable-unit-ids="[]" :powered-unit-ids="previewPoweredUnitIds" :terrain-catalog="previewTerrainCatalog" :terrain-visual-assets="previewTerrainVisualAssets" /></div><div v-else class="preview-fallback">暂时无法完整预览；请先安装地图依赖的 Mod。</div>
+        <div v-if="previewState" class="detail-board"><HexBoard preview :show-unit-labels="false" :state="previewState" :selected-unit-id="null" :legal-action-cell-ids="[]" :actionable-unit-ids="[]" :powered-unit-ids="previewPoweredUnitIds" :terrain-catalog="previewTerrainCatalog" :terrain-visual-assets="previewTerrainVisualAssets" /></div><div v-else class="preview-fallback">暂时无法完整预览；请先安装地图依赖的 Mod。</div>
         <div class="detail-actions"><button class="primary-button" @click="copyCode">复制地图码 ↗</button><button class="outline-button" :disabled="selectedMissingMods.length > 0" :title="selectedMissingMods.length ? '先安装地图依赖的 Mod，避免编辑时丢失未知地形' : ''" @click="startEdit">编辑地图</button><button class="outline-button" @click="showCode = !showCode">{{ showCode ? '收起地图码' : '显示地图码' }}</button><button v-if="!selected.isDefault" class="remove-button" @click="requestRemove">删除</button></div>
         <p v-if="copyStatus" class="copy-status" role="status">{{ copyStatus }}</p><textarea v-if="showCode" ref="codeField" class="code-output" readonly :value="selected.code" aria-label="地图码" @focus="($event.target as HTMLTextAreaElement).select()" />
       </article>
     </template>
 
     <template v-else-if="view === 'import'">
-      <article class="import-card"><div class="import-head"><div><h3>导入地图</h3><p>地图码只在你点击“显示地图码”或“复制地图码”时出现，不会占据地图库页面。</p></div><button class="outline-button" @click="startCreate">打开地图编辑器</button></div><label for="map-code">地图码</label><textarea id="map-code" v-model="codeDraft" class="code-input" spellcheck="false" placeholder="粘贴地图码 JSON…" /><div class="import-bottom"><span :class="{ error: actionError }" role="status">{{ actionMessage }}</span><button class="primary-button" :disabled="!codeDraft.trim()" @click="addMap">导入到我的地图</button></div></article>
+      <article class="import-card"><div class="import-head"><div><h3>导入地图</h3><p>支持当前 JSON 地图码和原版地图码。原版地图导入后可继续编辑和复制；玩法、电脑和计时使用当前系统设置。</p></div><button class="outline-button" @click="startCreate">打开地图编辑器</button></div><label for="map-code">地图码</label><textarea id="map-code" v-model="codeDraft" class="code-input" :disabled="importing" spellcheck="false" placeholder="粘贴 JSON 或原版地图码（eN…）…" /><div class="import-bottom"><span :class="{ error: actionError }" role="status">{{ actionMessage }}</span><button class="primary-button" :disabled="importing || !codeDraft.trim()" @click="addMap">{{ importing ? '正在导入…' : '导入到我的地图' }}</button></div></article>
     </template>
-    <MapEditor v-else-if="view === 'editor'" :initial="editingDefinition" @draft="saveEditorDraft" @save="saveDefinition" @cancel="cancelEditor" />
+    <MapEditor v-else-if="view === 'editor'" :initial="editingDefinition" :subscribed-mod-ids="subscribedModIds" @draft="saveEditorDraft" @save="saveDefinition" @cancel="cancelEditor" />
 
-    <div v-if="confirmRemoveId" class="confirm-backdrop" @click.self="confirmRemoveId = null"><div class="confirm-dialog" role="dialog" aria-modal="true" aria-label="移除地图"><h3>从本机移除地图？</h3><p>这只会删除当前浏览器中的个人地图，不会影响已复制的地图码或创意工坊作品。</p><div><button class="outline-button" @click="confirmRemoveId = null">取消</button><button class="danger-button" @click="confirmRemove">移除地图</button></div></div></div>
+    <div v-if="confirmRemoveId" class="confirm-backdrop" @click.self="confirmRemoveId = null"><div class="confirm-dialog" role="dialog" aria-modal="true" aria-label="移除地图"><h3>从账号地图中移除？</h3><p>移除会同步到工坊账号，并从其他设备的个人地图列表中删除；不会影响已复制的地图码或公开工坊作品。</p><div><button class="outline-button" @click="confirmRemoveId = null">取消</button><button class="danger-button" @click="confirmRemove">移除地图</button></div></div></div>
   </section>
 </template>
 

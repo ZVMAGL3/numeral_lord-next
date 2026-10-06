@@ -4,8 +4,8 @@ import type { TerrainModDefinition } from "@numeral-lord/content-schema";
 import { cloneTerrainModDefinition } from "./mod-installation.js";
 import { validateTerrainModObject } from "./installed-content.js";
 
-describe("terrain Mod persistence serialization", () => {
-  it("unwraps nested Vue proxies before structured cloning for IndexedDB", () => {
+describe("server-loaded terrain Mod serialization", () => {
+  it("unwraps nested Vue proxies before holding definitions in memory", () => {
     const definition = reactive({
       id: "mod-test-terrain",
       version: "1.0.0",

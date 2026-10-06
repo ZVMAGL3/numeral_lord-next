@@ -1,206 +1,88 @@
 import type { TerrainModDefinition } from "@numeral-lord/content-schema";
-import { hashModContent, modContentIdentity } from "@numeral-lord/game-sdk";
 
-const DATABASE_NAME = "numeral-lord-content";
-// Version 6 removes app-bundled / stale Mod packages from every browser once.
-// User subscriptions remain intact so the external Workshop can reinstall them.
-const DATABASE_VERSION = 6;
-const STORE_NAME = "installed-terrain-mods";
-const SUBSCRIPTION_STORE = "subscribed-terrain-mods";
-const RELEASE_STORE = "terrain-mod-releases";
-const contentHashCache = new WeakMap<object, string>();
+const LEGACY_DATABASE_NAME = "numeral-lord-content";
+const LEGACY_SUBSCRIPTION_STORE = "subscribed-terrain-mods";
 
-export interface CachedTerrainModRelease {
-  readonly releaseKey: string;
-  readonly id: string;
-  readonly version: string;
-  readonly contentHash: string;
-  readonly name: string;
-  readonly definition: TerrainModDefinition;
-}
-
-export interface InstalledTerrainModObject {
-  readonly id: string;
-  readonly name: string;
-  readonly definition: TerrainModDefinition;
-}
-
-export interface ModSubscription {
-  readonly id: string;
-  readonly subscribedAt: string;
-  readonly installedVersion: string;
-}
-
-
-/**
- * Workshop definitions are JSON data and may be Vue reactive proxies when they
- * arrive through component props. JSON round-tripping unwraps those proxies
- * before IndexedDB receives the value.
- */
+/** JSON round-trip unwraps nested Vue proxies before Mod data enters runtime memory. */
 export function cloneTerrainModDefinition(definition: TerrainModDefinition): TerrainModDefinition {
   const serialized = JSON.stringify(definition);
   if (serialized === undefined) throw new Error("Mod 属性对象无法序列化。");
   return JSON.parse(serialized) as TerrainModDefinition;
 }
 
-function openDatabase(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
-    request.onupgradeneeded = (event) => {
-      const database = request.result;
-      if (!database.objectStoreNames.contains(STORE_NAME)) {
-        database.createObjectStore(STORE_NAME, { keyPath: "id" });
-      }
-      if (!database.objectStoreNames.contains(SUBSCRIPTION_STORE)) database.createObjectStore(SUBSCRIPTION_STORE, { keyPath: "id" });
-      if (!database.objectStoreNames.contains(RELEASE_STORE)) database.createObjectStore(RELEASE_STORE, { keyPath: "releaseKey" });
-      if (database.objectStoreNames.contains("content-meta")) database.deleteObjectStore("content-meta");
-      // Force one clean download from the Workshop after removing bundled Mods.
-      // Subscriptions are intentionally retained; only installed packages and
-      // room-release caches are cleared so they cannot masquerade as built-ins.
-      if (event.oldVersion < 6 && request.transaction) {
-        request.transaction.objectStore(STORE_NAME).clear();
-        request.transaction.objectStore(RELEASE_STORE).clear();
-      }
-    };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error("IndexedDB 打开失败。"));
-    request.onblocked = () => reject(new Error("本地 Mod 数据库正在升级，请关闭其他游戏标签页后重试。"));
+/**
+ * One-time bridge from the old browser-only Mod database. Runtime content and
+ * current subscriptions are server-owned; this is the sole remaining IndexedDB
+ * access and is removed together with the old database after server ack.
+ */
+export async function readLegacyModSubscriptions(): Promise<string[] | null> {
+  const database = await openExistingLegacyDatabase();
+  if (!database) return null;
+  try {
+    if (!database.objectStoreNames.contains(LEGACY_SUBSCRIPTION_STORE)) return [];
+    return await new Promise((resolve, reject) => {
+      const request = database.transaction(LEGACY_SUBSCRIPTION_STORE, "readonly")
+        .objectStore(LEGACY_SUBSCRIPTION_STORE).getAll();
+      request.onsuccess = () => resolve((request.result as unknown[]).flatMap((record) => {
+        if (typeof record !== "object" || record === null || !("id" in record)) return [];
+        const id = (record as { id?: unknown }).id;
+        return typeof id === "string" && /^mod-[a-z0-9][a-z0-9._-]{0,63}$/.test(id) ? [id] : [];
+      }));
+      request.onerror = () => reject(request.error ?? new Error("读取旧订阅记录失败。"));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+/** Call only after the server confirms the subscription migration was saved. */
+export async function deleteLegacyModDatabase(): Promise<void> {
+  const database = await openExistingLegacyDatabase();
+  if (!database) return;
+  try {
+    const stores = [...database.objectStoreNames];
+    if (stores.length) {
+      await new Promise<void>((resolve, reject) => {
+        const transaction = database.transaction(stores, "readwrite");
+        for (const name of stores) transaction.objectStore(name).clear();
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(transaction.error ?? new Error("清除旧 Mod 记录失败。"));
+        transaction.onabort = () => reject(transaction.error ?? new Error("清除旧 Mod 记录被中断。"));
+      });
+    }
+  } finally {
+    database.close();
+  }
+  await new Promise<void>((resolve, reject) => {
+    const request = indexedDB.deleteDatabase(LEGACY_DATABASE_NAME);
+    // All object stores are already empty. Another old tab may keep the empty
+    // database alive; a later connection retries deletion after its ack.
+    request.onblocked = () => resolve();
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error ?? new Error("删除旧 Mod 数据库失败。"));
   });
 }
 
-export function terrainModContentHash(definition: TerrainModDefinition): string {
-  const cacheKey = definition as object;
-  const cached = contentHashCache.get(cacheKey);
-  if (cached) return cached;
-  const contentHash = hashModContent(modContentIdentity(definition as import("@numeral-lord/game-sdk").ModDefinition));
-  contentHashCache.set(cacheKey, contentHash);
-  return contentHash;
-}
-
-function releaseRecord(definition: TerrainModDefinition, name: string): CachedTerrainModRelease {
-  const contentHash = terrainModContentHash(definition);
-  return {
-    releaseKey: `${definition.id}\u0000${definition.version}\u0000${contentHash}`,
-    id: definition.id,
-    version: definition.version,
-    contentHash,
-    name,
-    definition
-  };
-}
-
-export async function loadInstalledTerrainModObjects(): Promise<InstalledTerrainModObject[]> {
-  const database = await openDatabase();
-  try {
-    return await new Promise((resolve, reject) => {
-      const request = database.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).getAll();
-      request.onsuccess = () => resolve(request.result as InstalledTerrainModObject[]);
-      request.onerror = () => reject(request.error ?? new Error("读取本地 Mod 失败。"));
-    });
-  } finally {
-    database.close();
-  }
-}
-
-export async function loadInstalledTerrainModReleases(): Promise<CachedTerrainModRelease[]> {
-  const database = await openDatabase();
-  try {
-    return await new Promise((resolve, reject) => {
-      const request = database.transaction(RELEASE_STORE, "readonly").objectStore(RELEASE_STORE).getAll();
-      request.onsuccess = () => resolve(request.result as CachedTerrainModRelease[]);
-      request.onerror = () => reject(request.error ?? new Error("读取已缓存 Mod 版本失败。"));
-    });
-  } finally { database.close(); }
-}
-
-export async function persistInstalledTerrainModObject(definition: TerrainModDefinition, name: string): Promise<void> {
-  const storedDefinition = cloneTerrainModDefinition(definition);
-  const database = await openDatabase();
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const transaction = database.transaction([STORE_NAME, RELEASE_STORE], "readwrite");
-      transaction.objectStore(STORE_NAME).put({ id: storedDefinition.id, name, definition: storedDefinition } satisfies InstalledTerrainModObject);
-      transaction.objectStore(RELEASE_STORE).put(releaseRecord(storedDefinition, name));
-      transaction.oncomplete = () => resolve();
-      transaction.onerror = () => reject(transaction.error ?? new Error("保存本地 Mod 失败。"));
-      transaction.onabort = () => reject(transaction.error ?? new Error("保存本地 Mod 被中断。"));
-    });
-  } finally {
-    database.close();
-  }
-}
-
-/** Cache a room-compatible release without changing which release is active for subscriptions. */
-export async function cacheTerrainModRelease(definition: TerrainModDefinition, name: string): Promise<void> {
-  const storedDefinition = cloneTerrainModDefinition(definition);
-  const database = await openDatabase();
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const transaction = database.transaction(RELEASE_STORE, "readwrite");
-      transaction.objectStore(RELEASE_STORE).put(releaseRecord(storedDefinition, name));
-      transaction.oncomplete = () => resolve();
-      transaction.onerror = () => reject(transaction.error ?? new Error("缓存 Mod 版本失败。"));
-      transaction.onabort = () => reject(transaction.error ?? new Error("缓存 Mod 版本被中断。"));
-    });
-  } finally { database.close(); }
-}
-
-export async function loadModSubscriptions(): Promise<ModSubscription[]> {
-  const database = await openDatabase();
-  try {
-    return await new Promise((resolve, reject) => {
-      const request = database.transaction(SUBSCRIPTION_STORE, "readonly").objectStore(SUBSCRIPTION_STORE).getAll();
-      request.onsuccess = () => resolve(request.result as ModSubscription[]);
-      request.onerror = () => reject(request.error ?? new Error("读取 Mod 订阅失败。"));
-    });
-  } finally { database.close(); }
-}
-
-export async function subscribeToTerrainMod(definition: TerrainModDefinition, name: string): Promise<void> {
-  const storedDefinition = cloneTerrainModDefinition(definition);
-  const database = await openDatabase();
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const transaction = database.transaction([SUBSCRIPTION_STORE, STORE_NAME, RELEASE_STORE], "readwrite");
-      transaction.objectStore(STORE_NAME).put({ id: storedDefinition.id, name, definition: storedDefinition } satisfies InstalledTerrainModObject);
-      transaction.objectStore(RELEASE_STORE).put(releaseRecord(storedDefinition, name));
-      transaction.objectStore(SUBSCRIPTION_STORE).put({ id: definition.id, subscribedAt: new Date().toISOString(), installedVersion: definition.version } satisfies ModSubscription);
-      transaction.oncomplete = () => resolve();
-      transaction.onerror = () => reject(transaction.error ?? new Error("订阅并安装 Mod 失败。"));
-      transaction.onabort = () => reject(transaction.error ?? new Error("订阅并安装 Mod 被中断。"));
-    });
-  } finally { database.close(); }
-}
-
-export async function updateSubscribedMod(definition: TerrainModDefinition, name: string): Promise<void> {
-  const storedDefinition = cloneTerrainModDefinition(definition);
-  const database = await openDatabase();
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const transaction = database.transaction([SUBSCRIPTION_STORE, STORE_NAME, RELEASE_STORE], "readwrite");
-      transaction.objectStore(STORE_NAME).put({ id: storedDefinition.id, name, definition: storedDefinition } satisfies InstalledTerrainModObject);
-      transaction.objectStore(RELEASE_STORE).put(releaseRecord(storedDefinition, name));
-      const store = transaction.objectStore(SUBSCRIPTION_STORE);
-      const existing = store.get(definition.id);
-      existing.onsuccess = () => {
-        const old = existing.result as ModSubscription | undefined;
-        store.put({ id: definition.id, subscribedAt: old?.subscribedAt ?? new Date().toISOString(), installedVersion: definition.version } satisfies ModSubscription);
-      };
-      transaction.oncomplete = () => resolve();
-      transaction.onerror = () => reject(transaction.error ?? new Error("更新订阅 Mod 失败。"));
-    });
-  } finally { database.close(); }
-}
-
-export async function unsubscribeFromTerrainMod(id: string): Promise<void> {
-  const database = await openDatabase();
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const transaction = database.transaction(SUBSCRIPTION_STORE, "readwrite");
-      transaction.objectStore(SUBSCRIPTION_STORE).delete(id);
-      transaction.oncomplete = () => resolve();
-      transaction.onerror = () => reject(transaction.error ?? new Error("取消订阅 Mod 失败。"));
-      transaction.onabort = () => reject(transaction.error ?? new Error("取消订阅 Mod 被中断。"));
-    });
-  } finally { database.close(); }
+function openExistingLegacyDatabase(): Promise<IDBDatabase | null> {
+  if (typeof indexedDB === "undefined") return Promise.resolve(null);
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(LEGACY_DATABASE_NAME);
+    let didNotExist = false;
+    request.onupgradeneeded = (event) => {
+      if (event.oldVersion !== 0) return;
+      didNotExist = true;
+      request.transaction?.abort();
+    };
+    request.onsuccess = () => {
+      if (didNotExist) {
+        request.result.close();
+        resolve(null);
+      } else resolve(request.result);
+    };
+    request.onerror = () => {
+      if (didNotExist) resolve(null);
+      else reject(request.error ?? new Error("旧 Mod 数据库打开失败。"));
+    };
+    request.onblocked = () => reject(new Error("旧 Mod 数据库正被其他标签页占用，请关闭其他游戏标签页后重试。"));
+  });
 }

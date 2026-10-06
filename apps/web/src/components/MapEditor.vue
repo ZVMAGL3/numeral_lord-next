@@ -7,11 +7,12 @@ import HexBoard from "./HexBoard.vue";
 import MapEditorToolbar from "./MapEditorToolbar.vue";
 import NumberStepper from "./NumberStepper.vue";
 import { getMapCellRangeIndices } from "../maps/map-cell-range";
-import { clampMapEditorPan } from "../maps/map-editor-pan";
+import { clampMapEditorPan, clampMapEditorZoom, getMapEditorMaxZoom } from "../maps/map-editor-pan";
+import { getBoardHexRadius } from "../board/board-layout.js";
 import { changeSeatColor } from "../maps/map-player-colors";
-import { installedMapCatalogs, installedTerrainMods, resolveMapCatalogs, terrainVisualAssetsForCatalogs } from "../content/installed-content";
+import { runtimeMapCatalogs, loadedTerrainMods, resolveMapCatalogs, terrainVisualAssetsForCatalogs } from "../content/installed-content";
 
-const props = defineProps<{ initial?: MapDefinition | null }>();
+const props = defineProps<{ initial?: MapDefinition | null; subscribedModIds?: readonly string[] }>();
 const emit = defineEmits<{ save: [definition: MapDefinition]; draft: [definition: MapDefinition]; cancel: [] }>();
 type TerrainOption = { id: string; name: string; color: string; baseOpacity?: number; transparent?: boolean; blocked?: boolean; modId?: string; artwork?: { src: string; scale: number; opacity: number; offsetX: number; offsetY: number }[] };
 const coreTerrains: TerrainOption[] = [
@@ -20,7 +21,8 @@ const coreTerrains: TerrainOption[] = [
   { id: "core/stronghold", name: "据点", color: "#63985d" }, { id: "core/mountain", name: "山地", color: "#52627b", blocked: true },
   { id: "core/void", name: "虚无", color: "#101927", blocked: true, transparent: true }
 ];
-const allTerrainOptions = computed<TerrainOption[]>(() => [...coreTerrains, ...installedTerrainMods.flatMap((mod) => {
+const subscribedTerrainMods = computed(() => loadedTerrainMods.filter((mod) => props.subscribedModIds?.includes(mod.id)));
+const allTerrainOptions = computed<TerrainOption[]>(() => [...coreTerrains, ...subscribedTerrainMods.value.flatMap((mod) => {
   const terrain = mod.terrain;
   if (!terrain) return [];
   const assets = new Map((mod.visualAssets ?? []).map((asset) => [asset.id, asset.dataUrl]));
@@ -46,7 +48,7 @@ const terrainOptions = computed<TerrainOption[]>(() => [
   ...coreTerrains,
   ...allTerrainOptions.value.filter((option) => option.modId && selectedTerrainModIds.value.includes(option.modId))
 ]);
-const terrainModOptions = computed(() => installedTerrainMods.map((mod) => ({
+const terrainModOptions = computed(() => subscribedTerrainMods.value.map((mod) => ({
   id: mod.id,
   name: mod.terrain?.displayName ?? mod.id,
   terrainId: mod.terrain?.id ?? ""
@@ -77,7 +79,7 @@ const unitPreset = computed<string>({
 });
 const settingsOpen = ref(false), playerSettingsOpen = ref(false);
 const formError = ref(""), terrainLookup = computed(() => new Map(terrainOptions.value.map((entry) => [entry.id, entry])));
-const editorZoom = ref(1), editorPan = ref({ x: 0, y: 0 });
+const editorZoom = ref(1), editorZoomLimit = ref(1), editorPan = ref({ x: 0, y: 0 });
 const boardWorkspace = ref<HTMLDivElement | null>(null), editorBoard = ref<HTMLDivElement | null>(null);
 const editorPointers = new Map<number, { x: number; y: number }>();
 let editorDrag: { x: number; y: number; panX: number; panY: number } | undefined;
@@ -86,6 +88,14 @@ let editorDraggingAt = 0;
 let editorAltPainting = false;
 let lastAltPaintIndex = -1;
 let workspaceResizeObserver: ResizeObserver | undefined;
+let editorViewportMetrics: {
+  readonly width: number;
+  readonly height: number;
+  readonly hostWidth: number;
+  readonly hostHeight: number;
+  readonly hostCenterX: number;
+  readonly hostCenterY: number;
+} | undefined;
 
 function toggleMapSettings(): void {
   settingsOpen.value = !settingsOpen.value;
@@ -96,33 +106,56 @@ function togglePlayerSettings(): void {
   if (playerSettingsOpen.value) settingsOpen.value = false;
 }
 
-function constrainEditorPan(): void {
+function measureEditorViewport(): void {
   const workspace = boardWorkspace.value, boardHost = editorBoard.value;
-  if (!workspace || !boardHost) return;
+  if (!workspace || !boardHost) {
+    editorViewportMetrics = undefined;
+    return;
+  }
   const viewport = workspace.getBoundingClientRect(), host = boardHost.getBoundingClientRect();
-  if (viewport.width < 1 || viewport.height < 1 || host.width < 1 || host.height < 1) return;
-  const radius = Math.max(1, Math.min(
-    (host.width - 14) / (Math.sqrt(3) * (width.value + 0.5)),
-    (host.height - 14) / (1.5 * (height.value - 1) + 2)
-  ));
+  if (viewport.width < 1 || viewport.height < 1 || host.width < 1 || host.height < 1) {
+    editorViewportMetrics = undefined;
+    return;
+  }
+  editorViewportMetrics = {
+    width: viewport.width,
+    height: viewport.height,
+    hostWidth: host.width,
+    hostHeight: host.height,
+    hostCenterX: host.left - viewport.left + host.width / 2,
+    hostCenterY: host.top - viewport.top + host.height / 2
+  };
+}
+
+function constrainEditorPan(): void {
+  const metrics = editorViewportMetrics;
+  if (!metrics) return;
+  const radius = getBoardHexRadius(metrics.hostWidth, metrics.hostHeight, width.value, height.value, 14, true);
+  editorZoomLimit.value = getMapEditorMaxZoom(radius);
+  editorZoom.value = clampMapEditorZoom(editorZoom.value, editorZoomLimit.value);
   const boardWidth = Math.sqrt(3) * radius * (width.value + 0.5) * editorZoom.value;
   const boardHeight = (2 + 1.5 * (height.value - 1)) * radius * editorZoom.value;
-  const hostCenterX = host.left - viewport.left + host.width / 2;
-  const hostCenterY = host.top - viewport.top + host.height / 2;
   // Large maps can extend beyond the viewport, but cannot be panned away.
   editorPan.value = clampMapEditorPan(editorPan.value,
-    { width: viewport.width, height: viewport.height },
+    { width: metrics.width, height: metrics.height },
     { width: boardWidth, height: boardHeight },
-    { x: hostCenterX, y: hostCenterY });
+    { x: metrics.hostCenterX, y: metrics.hostCenterY });
 }
-watch([width, height, editorZoom], constrainEditorPan, { flush: "post" });
+watch([width, height], constrainEditorPan, { flush: "post" });
 onMounted(() => {
-  workspaceResizeObserver = new ResizeObserver(constrainEditorPan);
+  workspaceResizeObserver = new ResizeObserver(() => {
+    measureEditorViewport();
+    constrainEditorPan();
+  });
   if (boardWorkspace.value) workspaceResizeObserver.observe(boardWorkspace.value);
   if (editorBoard.value) workspaceResizeObserver.observe(editorBoard.value);
+  measureEditorViewport();
   constrainEditorPan();
 });
-onBeforeUnmount(() => workspaceResizeObserver?.disconnect());
+onBeforeUnmount(() => {
+  workspaceResizeObserver?.disconnect();
+  editorViewportMetrics = undefined;
+});
 
 function resetFromDefinition(definition?: MapDefinition | null): void {
   width.value = definition?.columns ?? 9; height.value = definition ? definition.terrain.length / definition.columns : 9;
@@ -227,10 +260,10 @@ const previewDefinition = computed<MapDefinition>(() => {
 });
 const editorCatalogs = computed(() => {
   const exact = props.initial ? resolveMapCatalogs(JSON.stringify(props.initial)) : null;
-  if (!exact) return installedMapCatalogs;
-  const terrains = { ...installedMapCatalogs.terrains };
-  const terrainModIds = { ...installedMapCatalogs.terrainModIds };
-  const mods = { ...installedMapCatalogs.mods };
+  if (!exact) return runtimeMapCatalogs;
+  const terrains = { ...runtimeMapCatalogs.terrains };
+  const terrainModIds = { ...runtimeMapCatalogs.terrainModIds };
+  const mods = { ...runtimeMapCatalogs.mods };
   for (const modId of props.initial?.requiredTerrainModIds ?? []) {
     const pinned = exact.mods?.[modId];
     if (!pinned) continue;
@@ -254,7 +287,7 @@ const playerOptions = computed(() => Array.from({ length: players.value }, (_, i
   name: playerNames.value[index]?.trim() || `玩家 ${index + 1}`,
   color: playerColors.value[index] ?? "#668fb8"
 })));
-const previewPoweredUnitIds = computed(() => [...getPoweredUnitIds(previewState.value, editorCatalogs.value.terrains ?? installedMapCatalogs.terrains)]);
+const previewPoweredUnitIds = computed(() => [...getPoweredUnitIds(previewState.value, editorCatalogs.value.terrains ?? runtimeMapCatalogs.terrains)]);
 watch(previewDefinition, (definition) => emit("draft", definition), { immediate: true });
 
 function paintCellId(cellId: CellId): void {
@@ -345,7 +378,7 @@ function onEditorPointerMove(event: PointerEvent): void {
   if (points.length > 1 && editorPinch) {
     const [a, b] = points;
     if (a && b) {
-      if (editorPinch.distance > 0) editorZoom.value = Math.max(.6, Math.min(3, editorPinch.zoom * Math.hypot(a.x - b.x, a.y - b.y) / editorPinch.distance));
+      if (editorPinch.distance > 0) editorZoom.value = clampMapEditorZoom(editorPinch.zoom * Math.hypot(a.x - b.x, a.y - b.y) / editorPinch.distance, editorZoomLimit.value);
       editorPan.value = { x: editorPinch.panX + (a.x + b.x) / 2 - editorPinch.x, y: editorPinch.panY + (a.y + b.y) / 2 - editorPinch.y };
       constrainEditorPan();
     }
@@ -372,7 +405,7 @@ function onEditorPointerUp(event: PointerEvent): void {
   editorDrag = point ? { x: point.x, y: point.y, panX: editorPan.value.x, panY: editorPan.value.y } : undefined;
 }
 function onEditorWheel(event: WheelEvent): void {
-  editorZoom.value = Math.max(.6, Math.min(3, editorZoom.value * (event.deltaY < 0 ? 1.1 : .91)));
+  editorZoom.value = clampMapEditorZoom(editorZoom.value * (event.deltaY < 0 ? 1.1 : .91), editorZoomLimit.value);
   constrainEditorPan();
 }
 function saveMap(): void {
@@ -419,7 +452,7 @@ function createId(): string { return typeof crypto.randomUUID === "function" ? c
             <input type="checkbox" :checked="selectedTerrainModIds.includes(mod.id)" :disabled="selectedTerrainModIds.includes(mod.id) && terrainModIsInUse(mod.id)" @change="toggleTerrainMod(mod.id, $event)" />
             <span><strong>{{ mod.name }}</strong><small>{{ mod.id }} · {{ mod.terrainId }}{{ terrainModIsInUse(mod.id) ? ' · 棋盘上使用中' : '' }}</small></span>
           </label>
-          <p v-if="!terrainModOptions.length" class="map-mod-empty">本机尚未安装额外地形 Mod，可先到创意工坊订阅并安装。</p>
+          <p v-if="!terrainModOptions.length" class="map-mod-empty">当前账号尚未订阅地块 Mod，可先到创意工坊订阅。</p>
         </div>
       </aside>
       <aside v-if="playerSettingsOpen" class="editor-settings player-settings" role="dialog" aria-label="玩家位置设置">

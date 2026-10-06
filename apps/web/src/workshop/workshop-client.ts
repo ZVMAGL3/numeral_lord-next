@@ -1,6 +1,7 @@
 import { Client, type Room } from "@colyseus/sdk";
-import type { TerrainModDefinition, TerrainModDefinitionAssetReferences, WorkshopTerrainModPreview } from "@numeral-lord/content-schema";
+import type { TerrainModDefinition, TerrainModDefinitionAssetReferences, TerrainModVisualPreview, WorkshopPersonalMapSyncRequest, WorkshopPersonalMapsPayload, WorkshopTerrainModPreview } from "@numeral-lord/content-schema";
 import type { MapSubmission, MapWorkshopEntry, TerrainModEntry, TerrainModSubmission } from "./types";
+import { deleteLegacyModDatabase, readLegacyModSubscriptions } from "../content/mod-installation";
 
 /** Server summaries omit the install flag, which is client-build-specific. */
 export type WorkshopMapSummary = Omit<MapWorkshopEntry, "code"> & {
@@ -8,7 +9,7 @@ export type WorkshopMapSummary = Omit<MapWorkshopEntry, "code"> & {
   readonly requiredTerrainModIds: readonly string[];
 };
 
-export type WorkshopTerrainModSummary = Omit<TerrainModEntry, "installed" | "definition" | "preview" | "visualAssetUrls"> & {
+export type WorkshopTerrainModSummary = Omit<TerrainModEntry, "subscribed" | "definition" | "visualAssetUrls"> & {
   readonly modId: string;
 };
 
@@ -34,12 +35,21 @@ export interface WorkshopIdentity {
   readonly name: string;
 }
 
+export interface WorkshopAccountPayload {
+  readonly userId: string;
+  readonly displayName: string;
+  readonly subscribedModIds: readonly string[];
+}
+
 export type WorkshopConnectionStatus = "offline" | "connecting" | "connected";
 
 export interface WorkshopClientEvents {
+  readonly account: (payload: WorkshopAccountPayload) => void;
+  readonly subscriptions: (payload: Pick<WorkshopAccountPayload, "userId" | "subscribedModIds">) => void;
   readonly catalog: (payload: WorkshopCatalogPayload) => void;
   readonly detail: (payload: WorkshopDetailPayload) => void;
   readonly preview: (payload: WorkshopTerrainModPreview) => void;
+  readonly personalMaps: (payload: WorkshopPersonalMapsPayload) => void;
   readonly published: (payload: WorkshopPublishedPayload) => void;
   readonly error: (message: string) => void;
   readonly status?: (status: WorkshopConnectionStatus) => void;
@@ -80,6 +90,7 @@ export class WorkshopClient {
   private readonly pendingReadRequests = new Map<string, { readonly type: "workshop-get" | "workshop-preview"; readonly payload: unknown }>();
   private generation = 0;
   private currentStatus: WorkshopConnectionStatus = "offline";
+  private identityName = "";
 
   constructor(
     private readonly relayEndpoint: string,
@@ -90,8 +101,16 @@ export class WorkshopClient {
   get connected(): boolean { return this.room !== undefined; }
 
   async connect(identity: WorkshopIdentity): Promise<boolean> {
-    if (this.room) return true;
-    if (this.connecting) return this.connecting;
+    const normalizedName = identity.name.normalize("NFKC").trim().toLowerCase();
+    if (this.room && this.identityName === normalizedName) return true;
+    if (this.room) await this.leave();
+    if (this.connecting) {
+      const connected = await this.connecting;
+      if (!connected) return false;
+      if (this.identityName === normalizedName) return true;
+      await this.leave();
+      return this.connect(identity);
+    }
     const generation = ++this.generation;
     this.setStatus("connecting");
     const promise = (async () => {
@@ -102,13 +121,67 @@ export class WorkshopClient {
           return false;
         }
         this.room = room;
+        this.identityName = normalizedName;
+        room.onMessage("workshop-account", (payload: unknown) => {
+          if (!this.isCurrent(room, generation)) return;
+          if (!isRecord(payload) || typeof payload.userId !== "string" || typeof payload.displayName !== "string"
+            || !Array.isArray(payload.subscribedModIds)
+            || !payload.subscribedModIds.every((id) => typeof id === "string")) {
+            this.events.error("创意工坊返回了无效的用户身份或订阅列表。");
+            return;
+          }
+          const account = payload as unknown as WorkshopAccountPayload;
+          this.events.account(account);
+          void this.migrateLegacyModSubscriptions(room, generation);
+        });
+        room.onMessage("workshop-personal-maps", (payload: unknown) => {
+          if (!this.isCurrent(room, generation)) return;
+          if (!isRecord(payload) || typeof payload.userId !== "string" || !Array.isArray(payload.maps)
+            || !payload.maps.every((map) => isRecord(map) && typeof map.mapId === "string" && typeof map.code === "string" && typeof map.updatedAt === "string")
+            || !Array.isArray(payload.acknowledgedOperationIds)
+            || !payload.acknowledgedOperationIds.every((id) => typeof id === "string")) {
+            this.events.error("创意工坊返回了无效的个人地图列表。");
+            return;
+          }
+          this.events.personalMaps(payload as unknown as WorkshopPersonalMapsPayload);
+        });
+        room.onMessage("workshop-subscriptions", (payload: unknown) => {
+          if (!this.isCurrent(room, generation) || !isRecord(payload) || typeof payload.userId !== "string"
+            || !Array.isArray(payload.subscribedModIds)
+            || !payload.subscribedModIds.every((id) => typeof id === "string")) return;
+          this.events.subscriptions(payload as unknown as Pick<WorkshopAccountPayload, "userId" | "subscribedModIds">);
+        });
+        room.onMessage("workshop-migration-complete", (payload: unknown) => {
+          if (!this.isCurrent(room, generation) || !isRecord(payload) || typeof payload.userId !== "string"
+            || !Array.isArray(payload.subscribedModIds)
+            || !payload.subscribedModIds.every((id) => typeof id === "string")) return;
+          const result = payload as unknown as Pick<WorkshopAccountPayload, "userId" | "subscribedModIds">;
+          void deleteLegacyModDatabase().then(() => {
+            if (this.isCurrent(room, generation)) this.events.subscriptions(result);
+          }).catch((error) => {
+            if (this.isCurrent(room, generation)) this.events.error(error instanceof Error
+              ? `${error.message} 服务端已保存订阅，旧库清理将在下次连接重试。`
+              : "服务端已保存订阅，但清理旧本地记录失败；下次连接会重试。");
+          });
+        });
         room.onMessage("workshop-list", (payload: unknown) => {
           if (!this.isCurrent(room, generation)) return;
           if (!isRecord(payload) || !Array.isArray(payload.maps) || !Array.isArray(payload.terrainMods)) {
             this.events.error("创意工坊返回了无效的作品列表。");
             return;
           }
-          this.events.catalog(payload as unknown as WorkshopCatalogPayload);
+          try {
+            const catalog = payload as unknown as WorkshopCatalogPayload;
+            this.events.catalog({
+              ...catalog,
+              terrainMods: catalog.terrainMods.map((entry) => ({
+                ...entry,
+                ...(entry.preview ? { preview: this.normalizeTerrainVisualPreview(entry.preview) } : {})
+              }))
+            });
+          } catch {
+            this.events.error("创意工坊返回了无效的地块预览或图片地址。");
+          }
         });
         room.onMessage("workshop-detail", (payload: unknown) => {
           if (!this.isCurrent(room, generation)) return;
@@ -127,17 +200,10 @@ export class WorkshopClient {
             return;
           }
           try {
-            const preview = payload.preview as Record<string, unknown>;
-            const assets = (preview.visualAssets as unknown[]).map((asset: unknown) => {
-              if (!isRecord(asset) || typeof asset.id !== "string" || typeof asset.url !== "string") {
-                throw new Error("创意工坊返回了无效的图片地址。");
-              }
-              return { id: asset.id, url: this.assetUrl(asset.url) };
-            });
             this.events.preview({
               id: payload.id,
-              preview: { ...preview, visualAssets: assets }
-            } as unknown as WorkshopTerrainModPreview);
+              preview: this.normalizeTerrainVisualPreview(payload.preview)
+            });
           } catch {
             this.events.error("创意工坊返回了无效的地块图片地址。");
           }
@@ -157,6 +223,7 @@ export class WorkshopClient {
         room.onLeave(() => {
           if (!this.isCurrent(room, generation)) return;
           this.room = undefined;
+          this.identityName = "";
           this.setStatus("offline");
           this.events.error("创意工坊连接已断开。");
         });
@@ -165,6 +232,7 @@ export class WorkshopClient {
           this.events.error(`创意工坊连接错误（${code}）：${message}`);
         });
         this.setStatus("connected");
+        room.send("workshop-account");
         room.send("workshop-list");
         for (const request of this.pendingReadRequests.values()) room.send(request.type, request.payload);
         this.pendingReadRequests.clear();
@@ -203,10 +271,19 @@ export class WorkshopClient {
     return this.send("publish-terrain-mod", entry);
   }
 
+  setSubscription(modId: string, subscribed: boolean): boolean {
+    return this.send("workshop-subscribe", { modId, subscribed });
+  }
+
+  syncPersonalMaps(request: WorkshopPersonalMapSyncRequest): boolean {
+    return this.send("workshop-sync-personal-maps", request);
+  }
+
   async leave(): Promise<void> {
     ++this.generation;
     const room = this.room;
     this.room = undefined;
+    this.identityName = "";
     this.connecting = undefined;
     this.pendingReadRequests.clear();
     this.setStatus("offline");
@@ -254,11 +331,37 @@ export class WorkshopClient {
     }
   }
 
+  private async migrateLegacyModSubscriptions(room: Room, generation: number): Promise<void> {
+    try {
+      const modIds = await readLegacyModSubscriptions();
+      if (!this.isCurrent(room, generation) || modIds === null) return;
+      room.send("workshop-migrate-subscriptions", { modIds });
+    } catch (error) {
+      if (this.isCurrent(room, generation)) this.events.error(error instanceof Error
+        ? `${error.message} 旧本地记录暂时保留。`
+        : "读取旧本地订阅失败；旧记录暂时保留。");
+    }
+  }
+
   private assetUrl(reference: string): string {
     if (!/^assets\/terrain\/[a-f0-9]{64}\.(?:png|webp|svg)$/.test(reference)) {
       throw new Error("地块图片地址无效。");
     }
     return new URL(reference, this.httpBaseUrl()).href;
+  }
+
+  private normalizeTerrainVisualPreview(value: unknown): TerrainModVisualPreview {
+    if (!isRecord(value) || typeof value.terrainId !== "string" || typeof value.displayName !== "string"
+      || !Array.isArray(value.visualAssets)) {
+      throw new Error("地块预览格式无效。");
+    }
+    const visualAssets = value.visualAssets.map((asset: unknown) => {
+      if (!isRecord(asset) || typeof asset.id !== "string" || typeof asset.url !== "string") {
+        throw new Error("地块图片地址无效。");
+      }
+      return { id: asset.id, url: this.assetUrl(asset.url) };
+    });
+    return { ...value, visualAssets } as unknown as TerrainModVisualPreview;
   }
 
   async uploadTerrainAsset(dataUrl: string): Promise<string> {
@@ -290,7 +393,8 @@ export class WorkshopClient {
   }
 
   private httpBaseUrl(): URL {
-    const base = new URL(this.relayEndpoint, window.location.href);
+    const fallbackBase = typeof window === "undefined" ? "http://localhost/" : window.location.href;
+    const base = new URL(this.relayEndpoint, fallbackBase);
     base.protocol = base.protocol === "wss:" ? "https:" : "http:";
     base.pathname = `${base.pathname.replace(/\/+$/, "")}/`;
     base.search = "";

@@ -35,26 +35,21 @@ import {
 } from "@numeral-lord/core-content";
 import HexBoard from "../components/HexBoard.vue";
 import type { MapSubmission, MapWorkshopEntry, TerrainModEntry, TerrainModSubmission } from "../workshop/types";
-import type { WorkshopTerrainModPreview } from "@numeral-lord/content-schema";
-import { addMapToLibrary, loadMapLibrary, removeMapFromLibrary, saveMapToLibrary } from "../maps/map-library";
+import type { WorkshopPersonalMapsPayload, WorkshopTerrainModPreview } from "@numeral-lord/content-schema";
+import { addMapToLibrary, createPersonalMapSyncRequest, loadMapLibrary, reconcilePersonalMapLibrary, removeMapFromLibrary, saveMapToLibrary } from "../maps/map-library";
+import { normalizeImportedMapCode } from "../maps/legacy-map-code";
 import {
-  hydrateInstalledTerrainMods,
-  registerInstalledTerrainModObject,
-  installedTerrainModContentHashes,
+  registerServerTerrainModDefinition,
   validateTerrainModObject,
-  installedMapCatalogs,
-  installedTerrainCatalog,
-  installedTerrainMods,
+  runtimeMapCatalogs,
+  loadedTerrainCatalog,
+  loadedTerrainCatalogRevision,
+  loadedTerrainMods,
   terrainVisualAssetsForCatalogs,
-  cachedTerrainModReleases,
-  cacheInstalledTerrainModRelease,
-  resolveMapCatalogs,
-  terrainModDefinitionObject
+  resolveMapCatalogs
 } from "../content/installed-content";
 import { WorkshopClient, type WorkshopConnectionStatus } from "../workshop/workshop-client";
-import { canApplySubscribedModUpdate, compareModVersions, latestTerrainModVersions, mapTerrainModUpdateCandidates, mergeWorkshopTerrainCatalog, terrainModUpdateCandidates } from "../workshop/workshop-terrain-catalog";
-import { shouldConnectWorkshopOnStartup } from "../workshop/workshop-startup";
-import { cacheTerrainModRelease, loadModSubscriptions, subscribeToTerrainMod, terrainModContentHash, unsubscribeFromTerrainMod, updateSubscribedMod } from "../content/mod-installation";
+import { latestTerrainModVersions } from "../workshop/workshop-terrain-catalog";
 import { requestReturnToLobby } from "../rooms/room-reset";
 import { useBoardInteraction } from "../board/board-interaction";
 import { getDisconnectedPlayerIds } from "../rooms/player-presence";
@@ -75,7 +70,16 @@ import {
   type MatchClockSnapshot
 } from "../rooms/match-clock";
 
-export function useAppRuntime() {
+export interface AppRuntime {
+  readonly shell: Record<string, any>;
+  readonly dialogs: Record<string, any>;
+  readonly home: Record<string, any>;
+  readonly maps: Record<string, any>;
+  readonly workshop: Record<string, any>;
+  readonly rooms: Record<string, any>;
+}
+
+export function useAppRuntime(): AppRuntime {
   const PLAYER_NAME_STORAGE_KEY = "numeral-lord.player-name";
   const ACCOUNT_ID_STORAGE_KEY = "numeral-lord.account-id";
   const CONNECTION_LOG_STORAGE_KEY = "numeral-lord.connection-log.v1";
@@ -247,11 +251,12 @@ export function useAppRuntime() {
   const commandTimeline = createCommandTimeline();
   const isRepairing = ref(false);
   const playerName = ref(loadOrCreateLocalValue(PLAYER_NAME_STORAGE_KEY, randomPlayerName));
-  const configuredMaps = ref(loadMapLibrary());
-  const installedModsHydrated = ref(false);
+  const configuredMaps = ref(loadMapLibrary(playerName.value));
   const selectedMapLibraryId = ref(configuredMaps.value[0]?.definition.id ?? "");
   const mapActionMessage = ref("");
   const mapActionError = ref(false);
+  const mapImporting = ref(false);
+  const mapImportNotice = ref("");
   const gameBoardRef = ref<InstanceType<typeof HexBoard> | null>(null);
   function registerGameBoard(board: InstanceType<typeof HexBoard> | null): void { gameBoardRef.value = board; }
   function zoomBoard(action: "in" | "out" | "reset"): void {
@@ -260,27 +265,8 @@ export function useAppRuntime() {
     else gameBoardRef.value?.resetZoom();
   }
   const remoteTerrainMods = ref<TerrainModEntry[]>([]);
-  const remoteTerrainModReleases = ref<TerrainModEntry[]>([]);
   const remoteMapWorks = ref<MapWorkshopEntry[]>([]);
-  const localInstalledTerrainMods = computed<TerrainModEntry[]>(() => installedTerrainMods.map((mod) => ({
-    id: `local-installed:${mod.id}`,
-    modId: mod.id,
-    name: mod.terrain?.displayName ?? mod.id,
-    version: mod.version,
-    contentHash: terrainModContentHash(terrainModDefinitionObject(mod)),
-    description: mod.id === "mod-desert-terrain"
-      ? "沿用平原的驻兵、导电和战斗规则；驻在沙漠上的单位不产生回合点数。"
-      : "本机已安装的地块 Mod。连接工坊后可同步作品信息与更新。",
-    terrainId: mod.terrain?.id ?? `mod/${mod.id.slice(4)}`,
-    installed: true,
-    authorName: "本机安装",
-    definition: terrainModDefinitionObject(mod)
-  })));
-  const workshopTerrainMods = computed(() => mergeWorkshopTerrainCatalog(
-    remoteTerrainMods.value,
-    [],
-    localInstalledTerrainMods.value
-  ));
+  const workshopTerrainMods = computed(() => remoteTerrainMods.value);
   const workshopMapWorks = computed(() => remoteMapWorks.value);
   const workshopStatus = ref<WorkshopConnectionStatus>("offline");
   // 客户端可显示发布入口，是否接受写入由当前环境的服务器开关决定。
@@ -290,11 +276,35 @@ export function useAppRuntime() {
   const workshopWorking = ref(false);
   const pendingWorkshopModUpdate = ref(false);
   const subscribedTerrainModIds = ref<string[]>([]);
+  const workshopUserId = ref<string | null>(null);
   const pendingSubscribedModUpdateIds = ref<string[]>([]);
   const pendingWorkshopTerrainModId = ref<string | null>(null);
   const pendingRoomModUpdateId = ref<string | null>(null);
   const roomModUpdateMessage = ref("");
   let workshopClient: WorkshopClient | undefined;
+
+  function normalizedWorkshopName(value: string): string {
+    return value.normalize("NFKC").trim().toLowerCase();
+  }
+
+  function setPlayerNameAndPersonalMaps(value: string): void {
+    const previousKey = normalizedWorkshopName(playerName.value);
+    playerName.value = value;
+    localStorage.setItem(PLAYER_NAME_STORAGE_KEY, value);
+    if (previousKey === normalizedWorkshopName(value)) return;
+    mapImportNotice.value = "";
+    mapActionMessage.value = "";
+    mapActionError.value = false;
+    configuredMaps.value = loadMapLibrary(value);
+    if (!configuredMaps.value.some((map) => map.definition.id === selectedMapLibraryId.value)) {
+      selectedMapLibraryId.value = configuredMaps.value[0]?.definition.id ?? "";
+    }
+  }
+
+  function syncPersonalMaps(identityName = playerName.value): boolean {
+    if (!workshopUserId.value || !workshopClient?.connected) return false;
+    return workshopClient.syncPersonalMaps(createPersonalMapSyncRequest(identityName));
+  }
   let lastLobbyModCatalogCheckKey = "";
   // One browser profile uses one temporary PvP identity across its tabs. This
   // is only a local guest identity, not a verified account or login credential.
@@ -333,18 +343,16 @@ export function useAppRuntime() {
     mapCode: "",
     mapName: "",
     requiredTerrainModIds: [],
-    effectiveTerrainModReleases: [],
-    modVersionMismatchIds: [],
     roomModSettings: {},
     settings: { ...DEFAULT_LOBBY_SETTINGS },
     members: []
   });
   const lobbyError = ref("");
-  const activeMapCatalogs = computed(() => resolveMapCatalogs(
-    lobbyState.value.mapCode,
-    lobbyState.value.effectiveTerrainModReleases
-  ) ?? installedMapCatalogs);
-  const activeTerrainCatalog = computed(() => activeMapCatalogs.value.terrains ?? installedTerrainCatalog);
+  const activeMapCatalogs = computed(() => {
+    void loadedTerrainCatalogRevision.value;
+    return resolveMapCatalogs(lobbyState.value.mapCode) ?? runtimeMapCatalogs;
+  });
+  const activeTerrainCatalog = computed(() => activeMapCatalogs.value.terrains ?? loadedTerrainCatalog);
   const activeTerrainVisualAssets = computed(() => terrainVisualAssetsForCatalogs(activeMapCatalogs.value));
   const publicBattleRooms = ref<BattleRoomListing[]>([]);
   const battleLobbyStatus = ref<"offline" | "connecting" | "connected" | "error">("offline");
@@ -494,15 +502,15 @@ export function useAppRuntime() {
   const showRoomEntry = computed(() => activeRouteSection.value === "rooms"
     && (relayStatus.value === "未连接" || relayStatus.value === "连接失败" || relayStatus.value === "连接已断开"));
   watch(
-    () => [activeRouteSection.value, subscribedTerrainModIds.value.join("\u0000")] as const,
-    ([currentPage, subscriptionIds]) => {
-      if (currentPage === "rooms" && subscriptionIds && !invitedRoomId) connectWorkshopForLobbyModUpdates(true);
+    () => [activeRouteSection.value, subscribedTerrainModIds.value.join("\u0000"), getMapRequiredTerrainModIds().join("\u0000")] as const,
+    ([currentPage]) => {
+      if (currentPage === "rooms" && !invitedRoomId) connectWorkshopForLobbyModUpdates(true);
     }
   );
   watch(
     () => [activeRouteSection.value, configuredMaps.value.map((map) => map.definition.requiredTerrainModIds.join("\u0000")).join("\u0001"), subscribedTerrainModIds.value.join("\u0000")] as const,
     ([currentPage]) => {
-      if (currentPage === "maps" && installedModsHydrated.value) connectWorkshopForMapPreviewUpdates();
+      if (currentPage === "maps") connectWorkshopForMapPreviewUpdates();
     }
   );
   watch(
@@ -519,8 +527,8 @@ export function useAppRuntime() {
   const hasLiveSnapshot = ref(false);
   const showGame = computed(() => relayStatus.value === "已连接" && lobbyState.value.phase === "playing" && hasLiveSnapshot.value);
   const showGameLoading = computed(() => relayStatus.value === "已连接" && lobbyState.value.phase === "playing" && !hasLiveSnapshot.value);
-  const missingLocalModIds = computed(() => lobbyState.value.requiredTerrainModIds.filter(
-    (id) => !resolveMapCatalogs(lobbyState.value.mapCode, lobbyState.value.effectiveTerrainModReleases)?.mods?.[id]
+  const missingLoadedModIds = computed(() => lobbyState.value.requiredTerrainModIds.filter(
+    (id) => !resolveMapCatalogs(lobbyState.value.mapCode)?.mods?.[id]
   ));
   const isSpectator = computed(() => lobbyState.value.phase === "playing" && relayPlayerId.value === null);
   const canActCurrentPlayer = computed(() => !relayRoom || (lobbyState.value.phase === "playing"
@@ -932,9 +940,6 @@ export function useAppRuntime() {
       const options = {
         name: playerName.value,
         accountId: relayAccountKey,
-        installedModIds: installedTerrainMods.map((mod) => mod.id),
-        installedModVersions: Object.fromEntries(installedTerrainMods.map((mod) => [mod.id, mod.version])),
-        installedModContentHashes: installedTerrainModContentHashes(),
         ...(mode === "create" ? { mapCode: configuredMaps.value.find((map) => map.definition.id === selectedMapLibraryId.value)?.code } : {})
       };
       const room = mode === "join" && requestedRoomId
@@ -962,14 +967,14 @@ export function useAppRuntime() {
       });
       room.onMessage("room-state", (payload: LobbyRoomState) => {
         const wasPlaying = lobbyState.value.phase === "playing";
-        const normalizedPayload = { ...payload, effectiveTerrainModReleases: payload.effectiveTerrainModReleases ?? [] };
+        const normalizedPayload = payload;
         lobbyState.value = normalizedPayload;
+        if (normalizedPayload.requiredTerrainModIds.length > 0) connectWorkshopForLobbyModUpdates();
         if (normalizedPayload.phase === "lobby") {
-          reportInstalledModsToRoom();
           const catalogCheckKey = `${relayRoomId.value}\u0000${[...normalizedPayload.requiredTerrainModIds].sort().join("\u0000")}`;
           const refreshModCatalog = wasPlaying || catalogCheckKey !== lastLobbyModCatalogCheckKey;
           lastLobbyModCatalogCheckKey = catalogCheckKey;
-          connectWorkshopForLobbyModUpdates(refreshModCatalog);
+          if (normalizedPayload.requiredTerrainModIds.length > 0) connectWorkshopForLobbyModUpdates(refreshModCatalog);
         }
         const ownMember = normalizedPayload.members.find((member) => member.sessionId === relaySessionId.value);
         if (ownMember) {
@@ -1115,9 +1120,10 @@ export function useAppRuntime() {
           if (relayIsHost.value && payload.handoff) broadcastSnapshot();
           return;
         }
-        if (missingLocalModIds.value.length > 0) {
-          logConnection("snapshot.missing-mods", { missingModIds: missingLocalModIds.value });
-          notice.value = `当前设备缺少地块 Mod：${missingLocalModIds.value.join("、")}。安装后才能进入对局。`;
+        if (missingLoadedModIds.value.length > 0) {
+          logConnection("snapshot.missing-mods", { missingModIds: missingLoadedModIds.value });
+          notice.value = `正在从服务器加载对局所需地块：${missingLoadedModIds.value.join("、")}…`;
+          requestTerrainModDefinitions(missingLoadedModIds.value);
           return;
         }
         logConnection("snapshot.received", {
@@ -1205,110 +1211,173 @@ export function useAppRuntime() {
 
   function startFromHome(): void {
     const normalizedName = playerName.value.trim().slice(0, 24) || randomPlayerName();
-    playerName.value = normalizedName;
-    localStorage.setItem(PLAYER_NAME_STORAGE_KEY, normalizedName);
+    setPlayerNameAndPersonalMaps(normalizedName);
     void router.push({ path: "/rooms", query: route.query });
   }
 
   function updatePlayerName(value: string): void {
-    playerName.value = value;
     const normalizedName = value.trim().slice(0, 24);
-    if (normalizedName) localStorage.setItem(PLAYER_NAME_STORAGE_KEY, normalizedName);
+    if (!normalizedName) {
+      playerName.value = value;
+      return;
+    }
+    setPlayerNameAndPersonalMaps(normalizedName);
+    if (showMaps.value || showWorkshop.value) {
+      void ensureWorkshopClient().connect({ name: normalizedName }).then((connected) => {
+        if (connected) syncPersonalMaps(normalizedName);
+      });
+    }
   }
 
   function openMapLibrary(): void {
     void router.push("/maps");
   }
 
+  const requestedTerrainModIds = new Set<string>();
+  const pendingSubscriptionChanges = new Map<string, boolean>();
+
+  function getMapRequiredTerrainModIds(): string[] {
+    return [...new Set(configuredMaps.value.flatMap((map) => map.definition.requiredTerrainModIds))];
+  }
+
+  function requiredModIdsFromCode(code: string): string[] {
+    try {
+      const data: unknown = JSON.parse(code);
+      if (typeof data !== "object" || data === null || Array.isArray(data)) return [];
+      const ids = (data as { requiredTerrainModIds?: unknown }).requiredTerrainModIds;
+      return Array.isArray(ids) ? [...new Set(ids.filter((id): id is string => typeof id === "string"))] : [];
+    } catch { return []; }
+  }
+
+  function requestTerrainModDefinitions(modIds: readonly string[]): void {
+    const client = workshopClient;
+    if (!client?.connected) return;
+    for (const id of new Set(modIds)) {
+      if (loadedTerrainMods.some((mod) => mod.id === id) || requestedTerrainModIds.has(id)) continue;
+      const entry = remoteTerrainMods.value.find((candidate) => candidate.modId === id);
+      if (entry && client.requestDetail("terrain-mod", entry.id)) requestedTerrainModIds.add(id);
+    }
+  }
+
+  function requestedTerrainModIdsForCurrentUse(): string[] {
+    return [...new Set([
+      ...subscribedTerrainModIds.value,
+      ...getMapRequiredTerrainModIds(),
+      ...lobbyState.value.requiredTerrainModIds
+    ])];
+  }
+
   function ensureWorkshopClient(): WorkshopClient {
     if (!workshopClient) {
       workshopClient = new WorkshopClient(resolveRelayEndpoint(), {
+        account: (account) => {
+          workshopUserId.value = account.userId;
+          subscribedTerrainModIds.value = [...account.subscribedModIds];
+          setPlayerNameAndPersonalMaps(account.displayName);
+          remoteTerrainMods.value = remoteTerrainMods.value.map((entry) => ({
+            ...entry, subscribed: account.subscribedModIds.includes(entry.modId ?? entry.id)
+          }));
+          requestTerrainModDefinitions(requestedTerrainModIdsForCurrentUse());
+          syncPersonalMaps(account.displayName);
+        },
+        personalMaps: (payload: WorkshopPersonalMapsPayload) => {
+          if (payload.userId !== workshopUserId.value) return;
+          configuredMaps.value = reconcilePersonalMapLibrary(playerName.value, payload);
+          if (!configuredMaps.value.some((map) => map.definition.id === selectedMapLibraryId.value)) {
+            selectedMapLibraryId.value = configuredMaps.value[0]?.definition.id ?? "";
+          }
+          if (mapActionMessage.value.includes("同步账号")) {
+            mapActionMessage.value = `个人地图已与工坊账号同步。${mapImportNotice.value}`;
+            mapActionError.value = false;
+          }
+          // Keep edits made while the previous sync was in flight queued until
+          // the server acknowledges their own operation IDs.
+          const request = createPersonalMapSyncRequest(playerName.value);
+          if (request.operations.length) syncPersonalMaps(playerName.value);
+        },
+        subscriptions: ({ userId, subscribedModIds }) => {
+          if (userId !== workshopUserId.value) return;
+          const nextIds = new Set(subscribedModIds);
+          subscribedTerrainModIds.value = [...subscribedModIds];
+          remoteTerrainMods.value = remoteTerrainMods.value.map((entry) => ({
+            ...entry, subscribed: subscribedModIds.includes(entry.modId ?? entry.id)
+          }));
+          for (const [modId, desired] of pendingSubscriptionChanges) {
+            if (nextIds.has(modId) !== desired) continue;
+            pendingSubscriptionChanges.delete(modId);
+            workshopWorking.value = false;
+            workshopActionError.value = false;
+            workshopActionMessage.value = desired ? `已在服务器账号中订阅「${modId}」。` : `已在服务器账号中取消订阅「${modId}」。`;
+          }
+          requestTerrainModDefinitions(requestedTerrainModIdsForCurrentUse());
+        },
         catalog: (catalog) => {
           remoteMapWorks.value = catalog.maps.map((entry) => ({ ...entry }));
-          const toReleaseEntry = (entry: import("../workshop/workshop-client").WorkshopTerrainModSummary): TerrainModEntry => {
-            const active = installedTerrainMods.find((mod) => mod.id === entry.modId);
-            const cached = cachedTerrainModReleases.some((release) => release.id === entry.modId
-              && release.version === entry.version && release.contentHash === entry.contentHash);
-            return { ...entry, installed: active?.version === entry.version, cached };
-          };
-          const latest = latestTerrainModVersions(catalog.terrainMods);
-          remoteTerrainModReleases.value = catalog.terrainMods.map(toReleaseEntry);
-          remoteTerrainMods.value = latest.map(toReleaseEntry);
-          void requestSubscribedModUpdates(latest);
-          const pendingModId = pendingRoomModUpdateId.value;
-          if (pendingModId) {
-            const roomRelease = lobbyState.value.effectiveTerrainModReleases.find((candidate) => candidate.id === pendingModId);
-            const entry = roomRelease ? catalog.terrainMods.find((candidate) => candidate.modId === pendingModId
-              && candidate.version === roomRelease.version && candidate.contentHash === roomRelease.contentHash) : undefined;
-            if (!entry) {
-              pendingRoomModUpdateId.value = null;
-              roomModUpdateMessage.value = roomRelease
-                ? `创意工坊中未找到房主当前使用的「${pendingModId}」v${roomRelease.version}。`
-                : "房间还没有收到房主的 Mod 版本信息，请稍后重试。";
-            } else if (!workshopClient?.requestDetail("terrain-mod", entry.id)) {
-              pendingRoomModUpdateId.value = null;
-              roomModUpdateMessage.value = "无法请求地块 Mod 详情，请稍后重试。";
-            }
-          }
+          const currentIds = new Set(subscribedTerrainModIds.value);
+          const latest = latestTerrainModVersions(catalog.terrainMods).map((entry) => ({
+            ...entry, subscribed: currentIds.has(entry.modId)
+          }));
+          remoteTerrainMods.value = latest;
+          requestTerrainModDefinitions(requestedTerrainModIdsForCurrentUse());
         },
         detail: (detail) => {
           if (detail.kind === "map") {
             remoteMapWorks.value = remoteMapWorks.value.map((entry) => entry.id === detail.entry.id
               ? { ...entry, ...detail.entry } : entry);
-          } else {
-            remoteTerrainMods.value = remoteTerrainMods.value.map((entry) => entry.id === detail.entry.id
-              ? { ...entry, ...detail.entry } : entry);
-            const existingRelease = remoteTerrainModReleases.value.some((entry) => entry.id === detail.entry.id);
-            remoteTerrainModReleases.value = existingRelease
-              ? remoteTerrainModReleases.value.map((entry) => entry.id === detail.entry.id ? { ...entry, ...detail.entry } : entry)
-              : [{ ...detail.entry, installed: false, cached: false }, ...remoteTerrainModReleases.value];
-            if (detail.entry.definition && pendingRoomModUpdateId.value === detail.entry.modId) {
-              void installRoomModUpdate(detail.entry.definition);
-            } else if (detail.entry.definition && remoteTerrainMods.value.some((entry) =>
-              entry.id === detail.entry.id && entry.modId === detail.entry.definition!.id)) {
-              void autoUpdateSubscribedMod(detail.entry.definition);
-            }
-            else if (pendingRoomModUpdateId.value === detail.entry.modId) {
-              pendingRoomModUpdateId.value = null;
-              roomModUpdateMessage.value = "工坊没有返回可安装的 Mod 版本。";
+            requestTerrainModDefinitions(requiredModIdsFromCode(detail.entry.code));
+            return;
+          }
+          if (detail.entry.definition) {
+            try {
+              validateTerrainModObject(detail.entry.definition);
+              registerServerTerrainModDefinition(detail.entry.definition, detail.entry.name);
+              requestedTerrainModIds.delete(detail.entry.modId ?? detail.entry.definition.id);
+            } catch (error) {
+              workshopActionError.value = true;
+              workshopActionMessage.value = error instanceof Error ? error.message : "服务器返回的地块 Mod 无效。";
+              return;
             }
           }
+          remoteTerrainMods.value = remoteTerrainMods.value.map((entry) => entry.id === detail.entry.id
+            ? { ...entry, ...detail.entry, subscribed: subscribedTerrainModIds.value.includes(detail.entry.modId ?? detail.entry.id) }
+            : entry);
+          if (pendingRoomModUpdateId.value === detail.entry.modId) {
+            pendingRoomModUpdateId.value = null;
+            roomModUpdateMessage.value = `已从服务器加载「${detail.entry.modId}」的当前版本。`;
+          }
+          if (pendingMatchStartPayload && relayRoleReceived.value) flushPendingMatchStart();
         },
         preview: (payload: WorkshopTerrainModPreview) => {
-          const attachPreview = (entry: TerrainModEntry): TerrainModEntry => entry.id === payload.id
-            ? { ...entry, preview: payload.preview }
-            : entry;
-          remoteTerrainMods.value = remoteTerrainMods.value.map(attachPreview);
-          remoteTerrainModReleases.value = remoteTerrainModReleases.value.map(attachPreview);
+          remoteTerrainMods.value = remoteTerrainMods.value.map((entry) => entry.id === payload.id
+            ? { ...entry, preview: payload.preview } : entry);
         },
         published: (published) => {
           workshopWorking.value = false;
           workshopActionError.value = false;
-          workshopActionMessage.value = published.kind === "map" ? "地图码已发布到创意工坊。"
-            : pendingWorkshopModUpdate.value ? "地块 Mod 已更新，订阅玩家进入战斗大厅时会自动获取新版本。" : "地块 Mod 已发布供其他玩家预览。";
+          workshopActionMessage.value = published.kind === "map" ? "地图码已发布到创意工坊。" : "地块 Mod 已发布到服务器数据库。";
           pendingWorkshopModUpdate.value = false;
           workshopClient?.requestList();
         },
         error: (message) => {
           workshopWorking.value = false;
           pendingWorkshopModUpdate.value = false;
-          if (pendingSubscribedModUpdateIds.value.length > 0) {
-            pendingSubscribedModUpdateIds.value = [];
-            if (activeRouteSection.value === "rooms" && lobbyState.value.phase === "lobby") {
-              roomModUpdateMessage.value = `订阅 Mod 更新检查失败，已保留当前版本：${message}`;
-            }
-          }
           if (pendingRoomModUpdateId.value) {
             pendingRoomModUpdateId.value = null;
             roomModUpdateMessage.value = message;
           }
           workshopActionError.value = true;
           workshopActionMessage.value = message;
+          if (message.includes("个人地图")) {
+            mapActionError.value = true;
+            mapActionMessage.value = message;
+          }
         },
         status: (status) => {
           workshopStatus.value = status;
-          // A request may have raced the first join in an earlier navigation.
-          // Once the room is live, don't leave that transient warning on screen.
+          if (status === "offline") {
+            requestedTerrainModIds.clear();
+            workshopUserId.value = null;
+          }
           if (status === "connected" && workshopActionMessage.value === "创意工坊尚未连接。") {
             workshopActionMessage.value = "";
             workshopActionError.value = false;
@@ -1319,49 +1388,34 @@ export function useAppRuntime() {
     return workshopClient;
   }
 
-  function connectWorkshopForLobbyModUpdates(refreshCatalog = false): void {
-    if (activeRouteSection.value !== "rooms" || lobbyState.value.phase !== "lobby"
-      || (subscribedTerrainModIds.value.length === 0 && lobbyState.value.requiredTerrainModIds.length === 0)) return;
-    ensureWorkshopClient();
-    if (workshopClient?.connected) {
-      if (refreshCatalog) workshopClient.requestList();
-      return;
-    }
-    const name = playerName.value.trim().slice(0, 24) || randomPlayerName();
-    playerName.value = name;
-    void workshopClient?.connect({ name });
-  }
-
-  function getMapRequiredTerrainModIds(): string[] {
-    return [...new Set(configuredMaps.value.flatMap((map) => map.definition.requiredTerrainModIds))];
-  }
-
-  function mapPreviewNeedsWorkshopUpdate(): boolean {
-    return getMapRequiredTerrainModIds().length > 0;
-  }
-
-  function connectWorkshopForMapPreviewUpdates(): void {
-    if (!showMaps.value || !installedModsHydrated.value || !mapPreviewNeedsWorkshopUpdate()) return;
+  async function connectWorkshopForLobbyModUpdates(refreshCatalog = false): Promise<void> {
+    if (activeRouteSection.value !== "rooms") return;
     const client = ensureWorkshopClient();
-    if (client.connected) {
-      client.requestList();
-      return;
-    }
     const name = playerName.value.trim().slice(0, 24) || randomPlayerName();
-    playerName.value = name;
-    void client.connect({ name });
+    setPlayerNameAndPersonalMaps(name);
+    if (!await client.connect({ name })) return;
+    requestTerrainModDefinitions(lobbyState.value.requiredTerrainModIds);
+    if (refreshCatalog) client.requestList();
+  }
+
+  async function connectWorkshopForMapPreviewUpdates(): Promise<void> {
+    if (!showMaps.value) return;
+    const client = ensureWorkshopClient();
+    const name = playerName.value.trim().slice(0, 24) || randomPlayerName();
+    setPlayerNameAndPersonalMaps(name);
+    if (!await client.connect({ name })) return;
+    client.requestList();
+    requestTerrainModDefinitions(requestedTerrainModIdsForCurrentUse());
   }
 
   async function openWorkshop(): Promise<boolean> {
     await router.push("/workshop");
     const client = ensureWorkshopClient();
     const name = playerName.value.trim().slice(0, 24) || randomPlayerName();
-    playerName.value = name;
-    if (client.connected) {
-      client.requestList();
-      return true;
-    }
-    return client.connect({ name });
+    setPlayerNameAndPersonalMaps(name);
+    const connected = await client.connect({ name });
+    if (connected) client.requestList();
+    return connected;
   }
 
   function selectWorkshopMap(id: string): void {
@@ -1370,32 +1424,14 @@ export function useAppRuntime() {
   }
 
   function selectWorkshopTerrainMod(id: string): void {
-    const entry = remoteTerrainModReleases.value.find((candidate) => candidate.id === id)
-      ?? remoteTerrainMods.value.find((candidate) => candidate.id === id || candidate.modId === id);
+    const entry = remoteTerrainMods.value.find((candidate) => candidate.id === id || candidate.modId === id);
     if (entry && !entry.definition) workshopClient?.requestDetail("terrain-mod", entry.id);
   }
 
   function terrainModDisplayName(definition: import("@numeral-lord/content-schema").TerrainModDefinition): string {
-    return remoteTerrainModReleases.value.find((entry) => entry.modId === definition.id && entry.version === definition.version)?.name
-      ?? remoteTerrainMods.value.find((entry) => entry.modId === definition.id)?.name
-      ?? installedTerrainMods.find((mod) => mod.id === definition.id)?.terrain?.displayName
+    return remoteTerrainMods.value.find((entry) => entry.modId === definition.id)?.name
+      ?? loadedTerrainMods.find((mod) => mod.id === definition.id)?.terrain?.displayName
       ?? definition.id.slice(4).replace(/-/g, " ");
-  }
-
-  async function cacheWorkshopTerrainModRelease(definition: import("@numeral-lord/content-schema").TerrainModDefinition): Promise<void> {
-    try {
-      validateTerrainModObject(definition);
-      const name = terrainModDisplayName(definition);
-      await cacheTerrainModRelease(definition, name);
-      cacheInstalledTerrainModRelease(definition, name);
-      remoteTerrainModReleases.value = remoteTerrainModReleases.value.map((entry) => entry.modId === definition.id
-        && entry.version === definition.version ? { ...entry, cached: true, definition } : entry);
-      workshopActionError.value = false;
-      workshopActionMessage.value = `「${definition.id}」v${definition.version} 已缓存，可在房间要求该版本时使用。`;
-    } catch (error) {
-      workshopActionError.value = true;
-      workshopActionMessage.value = error instanceof Error ? error.message : "缓存 Mod 版本失败。";
-    }
   }
 
   async function openWorkshopForMissingTerrainMod(id: string): Promise<void> {
@@ -1411,118 +1447,53 @@ export function useAppRuntime() {
     else requestHome();
   }
 
-  async function installWorkshopTerrainMod(definition: import("@numeral-lord/content-schema").TerrainModDefinition): Promise<void> {
+  async function subscribeWorkshopTerrainMod(definition: import("@numeral-lord/content-schema").TerrainModDefinition): Promise<void> {
     try {
       validateTerrainModObject(definition);
-      const name = terrainModDisplayName(definition);
-      await subscribeToTerrainMod(definition, name);
-      registerInstalledTerrainModObject(definition, name);
-      reportInstalledModsToRoom();
-      if (!subscribedTerrainModIds.value.includes(definition.id)) subscribedTerrainModIds.value = [...subscribedTerrainModIds.value, definition.id];
-      remoteTerrainModReleases.value = remoteTerrainModReleases.value.map((entry) => entry.modId === definition.id
-        && entry.version === definition.version ? { ...entry, cached: true, definition } : entry);
-      remoteTerrainMods.value = remoteTerrainMods.value.map((entry) => entry.modId === definition.id
-        ? { ...entry, installed: true } : entry);
+      const name = playerName.value.trim().slice(0, 24) || randomPlayerName();
+      setPlayerNameAndPersonalMaps(name);
+      const client = ensureWorkshopClient();
+      if (!await client.connect({ name })) throw new Error("创意工坊尚未连接，无法保存订阅。");
+      pendingSubscriptionChanges.set(definition.id, true);
+      workshopWorking.value = true;
       workshopActionError.value = false;
-      workshopActionMessage.value = `「${definition.id}」v${definition.version} 已安装并载入本机规则目录。`;
+      workshopActionMessage.value = `正在把「${definition.id}」订阅保存到服务器账号…`;
+      if (!client.setSubscription(definition.id, true)) throw new Error("订阅请求未能发送到服务器。");
     } catch (error) {
+      pendingSubscriptionChanges.delete(definition.id);
+      workshopWorking.value = false;
       workshopActionError.value = true;
-      workshopActionMessage.value = error instanceof Error ? error.message : "Mod 安装失败。";
+      workshopActionMessage.value = error instanceof Error ? error.message : "保存订阅失败。";
     }
-  }
-
-  function reportInstalledModsToRoom(): void {
-    if (!relayRoom || lobbyState.value.phase !== "lobby") return;
-    const report = new Map(installedTerrainMods.map((mod) => [mod.id, mod]));
-    // The host reports its active release; other members report the room's exact
-    // selected release when already installed or cached, without downgrading
-    // their global subscription version.
-    const isRoomHost = lobbyState.value.members.some((member) => member.sessionId === relaySessionId.value && member.isHost);
-    if (!isRoomHost) for (const roomRelease of lobbyState.value.effectiveTerrainModReleases) {
-      const exact = [...installedTerrainMods.map(terrainModDefinitionObject), ...cachedTerrainModReleases.map((release) => release.definition)]
-        .find((definition) => definition.id === roomRelease.id
-          && definition.version === roomRelease.version
-          && terrainModContentHash(definition) === roomRelease.contentHash);
-      if (exact) report.set(roomRelease.id, exact as import("@numeral-lord/game-sdk").ModDefinition);
-    }
-    const reportedMods = [...report.values()];
-    relayRoom.send("lobby-installed-mods", {
-      installedModIds: reportedMods.map((mod) => mod.id),
-      installedModVersions: Object.fromEntries(reportedMods.map((mod) => [mod.id, mod.version])),
-      installedModContentHashes: Object.fromEntries(reportedMods.map((mod) => [mod.id,
-        terrainModContentHash(terrainModDefinitionObject(mod) as import("@numeral-lord/content-schema").TerrainModDefinition)]))
-    });
   }
 
   function updateRoomModVersion(modId: string): void {
-    if (lobbyState.value.phase !== "lobby" || !lobbyState.value.modVersionMismatchIds.includes(modId)) return;
+    if (loadedTerrainMods.some((mod) => mod.id === modId)) return;
     pendingRoomModUpdateId.value = modId;
-    const roomRelease = lobbyState.value.effectiveTerrainModReleases.find((candidate) => candidate.id === modId);
-    if (!roomRelease) {
-      pendingRoomModUpdateId.value = null;
-      roomModUpdateMessage.value = "正在等待房主的 Mod 版本信息，请稍后重试。";
-      return;
-    }
-    roomModUpdateMessage.value = `正在获取房主当前使用的「${modId}」v${roomRelease.version}…`;
-    ensureWorkshopClient();
-    if (workshopClient?.connected) workshopClient.requestList();
-    else {
-      const name = playerName.value.trim().slice(0, 24) || randomPlayerName();
-      playerName.value = name;
-      void workshopClient?.connect({ name });
-    }
-  }
-
-  async function installRoomModUpdate(definition: import("@numeral-lord/content-schema").TerrainModDefinition): Promise<void> {
-    const modId = pendingRoomModUpdateId.value;
-    if (!modId || definition.id !== modId) return;
-    try {
-      validateTerrainModObject(definition);
-      const roomRelease = lobbyState.value.effectiveTerrainModReleases.find((candidate) => candidate.id === modId);
-      if (!roomRelease) throw new Error("房间还没有收到房主的 Mod 版本信息，请稍后重试。");
-      if (definition.version !== roomRelease.version || terrainModContentHash(definition) !== roomRelease.contentHash) {
-        throw new Error(`房主当前使用「${modId}」v${roomRelease.version}，当前下载的 Mod 版本或内容不匹配。`);
-      }
-      const name = terrainModDisplayName(definition);
-      await cacheTerrainModRelease(definition, name);
-      cacheInstalledTerrainModRelease(definition, name);
-      remoteTerrainModReleases.value = remoteTerrainModReleases.value.map((entry) => entry.modId === modId
-        && entry.version === definition.version ? { ...entry, cached: true, definition } : entry);
-      remoteTerrainMods.value = remoteTerrainMods.value.map((entry) => entry.modId === modId
-        ? { ...entry, definition } : entry);
-      reportInstalledModsToRoom();
-      roomModUpdateMessage.value = roomRelease
-        ? `已缓存房主使用的「${modId}」v${definition.version}，现在可以重新准备。`
-        : `「${modId}」已更新到 v${definition.version}，全体玩家需要重新准备。`;
-      logConnection("room.mods.quick-updated", { modId, version: definition.version, hostRelease: Boolean(roomRelease) });
-    } catch (error) {
-      roomModUpdateMessage.value = error instanceof Error ? error.message : "地块 Mod 快速更新失败。";
-    } finally {
-      pendingRoomModUpdateId.value = null;
-    }
+    roomModUpdateMessage.value = `正在从服务器加载「${modId}」的当前 Mod…`;
+    const client = ensureWorkshopClient();
+    const name = playerName.value.trim().slice(0, 24) || randomPlayerName();
+    setPlayerNameAndPersonalMaps(name);
+    void client.connect({ name }).then((connected) => {
+      if (!connected) return;
+      client.requestList();
+      requestTerrainModDefinitions([modId]);
+    });
   }
 
   async function unsubscribeWorkshopTerrainMod(id: string): Promise<void> {
     if (!subscribedTerrainModIds.value.includes(id)) return;
-    const dependentMaps = configuredMaps.value.filter((map) => map.definition.requiredTerrainModIds.includes(id));
-    const inCurrentRoom = lobbyState.value?.requiredTerrainModIds.includes(id) ?? false;
-    const impact = [
-      dependentMaps.length ? `本机有 ${dependentMaps.length} 张地图依赖此 Mod` : "",
-      inCurrentRoom ? "当前房间地图也需要此 Mod" : ""
-    ].filter(Boolean).join("；");
-    const warning = impact ? `\n\n${impact}。取消订阅不会卸载当前版本；更新订阅取消后，地图继续使用本机当前安装版本。` : "";
-    if (!window.confirm(`取消「${id}」的自动更新订阅？本机已下载版本不会删除。${warning}`)) return;
+    if (!window.confirm(`取消「${id}」的服务器账号订阅？订阅只控制地图编辑器的可选地块；已有地图和房间仍会从服务器读取当前 Mod。`)) return;
     workshopWorking.value = true;
-    try {
-      await unsubscribeFromTerrainMod(id);
-      subscribedTerrainModIds.value = subscribedTerrainModIds.value.filter((entry) => entry !== id);
-      workshopActionError.value = false;
-      workshopActionMessage.value = `已取消「${id}」的自动更新订阅，本机当前版本和地图依赖均保留。`;
-    } catch (error) {
-      workshopActionError.value = true;
-      workshopActionMessage.value = error instanceof Error ? error.message : "取消订阅失败。";
-    } finally {
+    pendingSubscriptionChanges.set(id, false);
+    const client = ensureWorkshopClient();
+    const name = playerName.value.trim().slice(0, 24) || randomPlayerName();
+    setPlayerNameAndPersonalMaps(name);
+    if (!await client.connect({ name }) || !client.setSubscription(id, false)) {
+      pendingSubscriptionChanges.delete(id);
       workshopWorking.value = false;
+      workshopActionError.value = true;
+      workshopActionMessage.value = "创意工坊尚未连接，取消订阅请求未能发送。";
     }
   }
 
@@ -1530,76 +1501,16 @@ export function useAppRuntime() {
     if (pendingWorkshopTerrainModId.value === id) pendingWorkshopTerrainModId.value = null;
   }
 
-  async function requestSubscribedModUpdates(entries: readonly import("../workshop/workshop-client").WorkshopTerrainModSummary[]): Promise<void> {
-    try {
-      // Published updates are checked in the workshop or battle lobby, never during a match.
-      const mapLibraryIsOpen = showMaps.value;
-      if (!canApplySubscribedModUpdate(showWorkshop.value, lobbyState.value.phase === "playing", activeRouteSection.value === "rooms", mapLibraryIsOpen)) return;
-      const subscriptions = await loadModSubscriptions();
-      if (!canApplySubscribedModUpdate(showWorkshop.value, lobbyState.value.phase === "playing", activeRouteSection.value === "rooms", showMaps.value)) return;
-      subscribedTerrainModIds.value = subscriptions.map((entry) => entry.id);
-      const updates = (showMaps.value
-        ? mapTerrainModUpdateCandidates(entries, subscriptions, installedTerrainMods, getMapRequiredTerrainModIds())
-        : terrainModUpdateCandidates(
-          entries,
-          subscriptions,
-          installedTerrainMods
-        )).filter(({ id }) => !pendingSubscribedModUpdateIds.value.includes(id));
-      pendingSubscribedModUpdateIds.value = updates.map(({ id }) => id);
-      if (updates.length > 0 && activeRouteSection.value === "rooms" && lobbyState.value.phase === "lobby") sendLobbyReady(false);
-      for (const { id, entry } of updates) {
-        if (!workshopClient?.requestDetail("terrain-mod", entry.id)) clearPendingSubscribedModUpdate(id);
-      }
-    } catch (error) {
-      pendingSubscribedModUpdateIds.value = [];
-      logConnection("mods.update-check.failed", { message: error instanceof Error ? error.message : String(error) });
-      if (activeRouteSection.value === "rooms" && lobbyState.value.phase === "lobby") {
-        roomModUpdateMessage.value = `Mod 更新检查失败，已保留当前版本：${error instanceof Error ? error.message : String(error)}`;
-      }
-    }
-  }
-
-  async function autoUpdateSubscribedMod(definition: import("@numeral-lord/content-schema").TerrainModDefinition): Promise<void> {
-    try {
-      const subscriptions = await loadModSubscriptions();
-      // A catalog reply can arrive after the user has entered a match; recheck at apply time.
-      if (!canApplySubscribedModUpdate(showWorkshop.value, lobbyState.value.phase === "playing", activeRouteSection.value === "rooms", showMaps.value)) return;
-      const isSubscribed = subscriptions.some((entry) => entry.id === definition.id);
-      const isMapDependency = showMaps.value && getMapRequiredTerrainModIds().includes(definition.id);
-      if (showMaps.value && !isMapDependency) return;
-      if (!isSubscribed) return;
-      const current = installedTerrainMods.find((mod) => mod.id === definition.id)?.version;
-      if (current && compareModVersions(definition.version, current) <= 0) return;
-      validateTerrainModObject(definition);
-      const name = terrainModDisplayName(definition);
-      await updateSubscribedMod(definition, name);
-      registerInstalledTerrainModObject(definition, name);
-      reportInstalledModsToRoom();
-      logConnection("mods.updated", { modId: definition.id, version: definition.version });
-      if (activeRouteSection.value === "rooms") roomModUpdateMessage.value = `已自动更新「${definition.id}」v${definition.version}；房间成员需统一版本后重新准备。`;
-      remoteTerrainModReleases.value = remoteTerrainModReleases.value.map((entry) => entry.modId === definition.id
-        && entry.version === definition.version ? { ...entry, cached: true, definition } : entry);
-      remoteTerrainMods.value = remoteTerrainMods.value.map((entry) => entry.modId === definition.id
-        ? { ...entry, installed: true } : entry);
-    } catch (error) {
-      logConnection("mods.update.failed", { modId: definition.id, message: error instanceof Error ? error.message : String(error) });
-      if (activeRouteSection.value === "rooms") roomModUpdateMessage.value = error instanceof Error ? error.message : "Mod 自动更新失败。";
-    } finally {
-      clearPendingSubscribedModUpdate(definition.id);
-    }
-  }
-
-  function clearPendingSubscribedModUpdate(id: string): void {
-    pendingSubscribedModUpdateIds.value = pendingSubscribedModUpdateIds.value.filter((pendingId) => pendingId !== id);
-  }
-
   function saveWorkshopMap(code: string): void {
     try {
-      const next = addMapToLibrary(configuredMaps.value, code);
+      const next = addMapToLibrary(configuredMaps.value, code, playerName.value);
       configuredMaps.value = next;
       selectedMapLibraryId.value = next.at(-1)?.definition.id ?? "";
+      const syncRequested = syncPersonalMaps();
       workshopActionError.value = false;
-      workshopActionMessage.value = `「${next.at(-1)?.definition.name ?? "地图"}」已保存到我的地图配置。`;
+      workshopActionMessage.value = syncRequested
+        ? `「${next.at(-1)?.definition.name ?? "地图"}」已保存到本机缓存，正在同步账号。`
+        : `「${next.at(-1)?.definition.name ?? "地图"}」已保存到本机缓存，联网后同步账号。`;
     } catch (error) {
       workshopActionError.value = true;
       workshopActionMessage.value = error instanceof Error ? error.message : "地图码无法保存。";
@@ -1623,27 +1534,44 @@ export function useAppRuntime() {
     workshopActionError.value = false;
   }
 
-  function addConfiguredMap(rawCode: string): boolean {
+  async function addConfiguredMap(rawCode: string): Promise<boolean> {
+    if (mapImporting.value) return false;
+    mapImporting.value = true;
+    mapImportNotice.value = "";
+    const identity = normalizedWorkshopName(playerName.value);
     try {
-      const next = addMapToLibrary(configuredMaps.value, rawCode);
+      const imported = await normalizeImportedMapCode(rawCode);
+      if (identity !== normalizedWorkshopName(playerName.value)) throw new Error("导入期间玩家账号已切换，请重新导入地图。");
+      const next = addMapToLibrary(configuredMaps.value, imported.code, playerName.value);
       configuredMaps.value = next;
       selectedMapLibraryId.value = next.at(-1)?.definition.id ?? "";
-      mapActionMessage.value = `「${next.at(-1)?.definition.name ?? "地图"}」已保存到本机。`;
+      const syncRequested = syncPersonalMaps();
+      mapActionMessage.value = syncRequested
+        ? `「${next.at(-1)?.definition.name ?? "地图"}」已保存到本机缓存，正在同步账号。`
+        : `「${next.at(-1)?.definition.name ?? "地图"}」已保存到本机缓存，联网后同步账号。`;
+      mapImportNotice.value = imported.legacy ? ` 原版地图码已转换为当前格式。${imported.warnings.join(" ")}` : "";
+      mapActionMessage.value += mapImportNotice.value;
       mapActionError.value = false;
       return true;
     } catch (error) {
       mapActionMessage.value = error instanceof Error ? error.message : "地图码无法导入。";
       mapActionError.value = true;
       return false;
+    } finally {
+      mapImporting.value = false;
     }
   }
 
   function saveConfiguredMap(definition: import("@numeral-lord/core-content").MapDefinition): void {
+    mapImportNotice.value = "";
     try {
-      const next = saveMapToLibrary(configuredMaps.value, serializeMapCode(definition, { ...installedMapCatalogs, allowUnknownTerrainMods: true }));
+      const next = saveMapToLibrary(configuredMaps.value, serializeMapCode(definition, { ...runtimeMapCatalogs, allowUnknownTerrainMods: true }), playerName.value);
       configuredMaps.value = next;
       selectedMapLibraryId.value = definition.id;
-      mapActionMessage.value = `「${definition.name}」已保存到当前浏览器。`;
+      const syncRequested = syncPersonalMaps();
+      mapActionMessage.value = syncRequested
+        ? `「${definition.name}」已保存到本机缓存，正在同步账号。`
+        : `「${definition.name}」已保存到本机缓存，联网后同步账号。`;
       mapActionError.value = false;
     } catch (error) {
       mapActionMessage.value = error instanceof Error ? error.message : "地图无法保存。";
@@ -1652,10 +1580,14 @@ export function useAppRuntime() {
   }
 
   function removeConfiguredMap(id: string): void {
+    mapImportNotice.value = "";
     const removed = configuredMaps.value.find((map) => map.definition.id === id);
-    configuredMaps.value = removeMapFromLibrary(configuredMaps.value, id);
+    configuredMaps.value = removeMapFromLibrary(configuredMaps.value, id, playerName.value);
     selectedMapLibraryId.value = configuredMaps.value[0]?.definition.id ?? "";
-    mapActionMessage.value = removed ? `「${removed.definition.name}」已从本机移除。` : "";
+    const syncRequested = removed ? syncPersonalMaps() : false;
+    mapActionMessage.value = removed ? syncRequested
+      ? `「${removed.definition.name}」已从本机移除，正在同步账号。`
+      : `「${removed.definition.name}」已从本机移除，删除将在联网后同步账号。` : "";
     mapActionError.value = false;
   }
 
@@ -1701,8 +1633,6 @@ export function useAppRuntime() {
       mapCode: "",
       mapName: "",
       requiredTerrainModIds: [],
-      effectiveTerrainModReleases: [],
-      modVersionMismatchIds: [],
       roomModSettings: {},
       settings: { ...DEFAULT_LOBBY_SETTINGS },
       members: []
@@ -1769,6 +1699,23 @@ export function useAppRuntime() {
       logConnection("match.waiting-for-room-role", { roomId: relayRoomId.value });
       return;
     }
+    const requiredModIds = requiredModIdsFromCode(payload.mapCode);
+    const missingModIds = requiredModIds.filter((id) => !loadedTerrainMods.some((mod) => mod.id === id));
+    if (missingModIds.length > 0) {
+      pendingMatchStartPayload = payload;
+      hasLiveSnapshot.value = false;
+      notice.value = `正在从服务器加载本局地块：${missingModIds.join("、")}…`;
+      logConnection("match.waiting-for-server-mods", { missingModIds });
+      const client = ensureWorkshopClient();
+      const name = playerName.value.trim().slice(0, 24) || randomPlayerName();
+      setPlayerNameAndPersonalMaps(name);
+      void client.connect({ name }).then((connected) => {
+        if (!connected) return;
+        client.requestList();
+        requestTerrainModDefinitions(missingModIds);
+      });
+      return;
+    }
     pendingMatchStartPayload = null;
     commandTimeline.reset(null);
     isRepairing.value = false;
@@ -1798,15 +1745,9 @@ export function useAppRuntime() {
       assignmentFound: Boolean(assignment),
       assignmentSessionMatches: assignment?.sessionId === relaySessionId.value
     });
-    if (missingLocalModIds.value.length > 0) {
-      hasLiveSnapshot.value = false;
-      notice.value = `当前设备缺少地块 Mod：${missingLocalModIds.value.join("、")}。安装后才能进入对局。`;
-      logConnection("match.missing-mods", { missingModIds: missingLocalModIds.value });
-      return;
-    }
     try {
-      const exactMapCatalogs = resolveMapCatalogs(payload.mapCode, payload.effectiveTerrainModReleases ?? []);
-      if (!exactMapCatalogs) throw new Error("无法解析房主为本局选择的地块 Mod 版本。");
+      const exactMapCatalogs = resolveMapCatalogs(payload.mapCode);
+      if (!exactMapCatalogs) throw new Error("无法从服务器解析本局使用的地块 Mod。");
       matchStore.setGame(createMatchFromMapCode(payload.mapCode, {
       ...exactMapCatalogs,
       activePlayerIds: assignments.map((candidate) => candidate.playerId as PlayerId),
@@ -2287,24 +2228,12 @@ export function useAppRuntime() {
     logConnection("browser.unhandled-rejection", { message: message.slice(0, 250) });
   }
 
-  onMounted(async () => {
-    try {
-      await hydrateInstalledTerrainMods();
-      logConnection("mods.hydrated", { count: installedTerrainMods.length });
-      const subscriptions = await loadModSubscriptions();
-      subscribedTerrainModIds.value = subscriptions.map((entry) => entry.id);
-      installedModsHydrated.value = true;
-      const checkBattleLobbySubscriptions = activeRouteSection.value === "rooms" && !invitedRoomId && subscriptions.length > 0;
-      const checkMapPreviewDependencies = activeRouteSection.value === "maps" && mapPreviewNeedsWorkshopUpdate();
-      if (shouldConnectWorkshopOnStartup(showWorkshop.value, checkBattleLobbySubscriptions, checkMapPreviewDependencies)) {
-        ensureWorkshopClient();
-        const name = playerName.value.trim().slice(0, 24) || randomPlayerName();
-        playerName.value = name;
-        void workshopClient?.connect({ name });
-      }
-    } catch (error) {
-      logConnection("mods.hydrate-failed", { message: String(error).slice(0, 250) });
-      notice.value = "本地 Mod 缓存读取失败；内置内容仍可使用。";
+  onMounted(() => {
+    if (showMaps.value || showWorkshop.value || showRoomEntry.value) {
+      const name = playerName.value.trim().slice(0, 24) || randomPlayerName();
+      setPlayerNameAndPersonalMaps(name);
+      if (showMaps.value || showWorkshop.value) void ensureWorkshopClient().connect({ name });
+      else connectWorkshopForLobbyModUpdates(true);
     }
     logConnection("page.loaded", { path: window.location.pathname, invitedRoom: Boolean(invitedRoomId), online: navigator.onLine });
     window.addEventListener("online", logBrowserConnectionState);
@@ -2348,15 +2277,15 @@ export function useAppRuntime() {
       },
       home: { playerName, updatePlayerName, startFromHome, openMapLibrary, openWorkshop },
       maps: {
-        configuredMaps, selectedMapLibraryId, mapActionMessage, mapActionError,
+        configuredMaps, selectedMapLibraryId, mapActionMessage, mapActionError, mapImporting, subscribedModIds: subscribedTerrainModIds,
         requestHome, addConfiguredMap, saveConfiguredMap, removeConfiguredMap
       },
       workshop: {
-        workshopTerrainMods, remoteTerrainModReleases, workshopMapWorks, configuredMaps,
+        workshopTerrainMods, workshopMapWorks, configuredMaps,
         subscribedTerrainModIds, playerName, pendingWorkshopTerrainModId, workshopActionMessage,
         workshopActionError, workshopWorking, workshopPublishingEnabled, returnFromWorkshop,
         selectWorkshopMap, selectWorkshopTerrainMod, saveWorkshopMap, publishWorkshopMap,
-        publishWorkshopTerrainMod, installWorkshopTerrainMod, cacheWorkshopTerrainModRelease,
+        publishWorkshopTerrainMod, subscribeWorkshopTerrainMod,
         unsubscribeWorkshopTerrainMod, clearPendingWorkshopTerrainMod,
         requestTerrainModPreview(id: string) { workshopClient?.requestTerrainModPreview(id); },
         uploadTerrainAsset(dataUrl: string) { return ensureWorkshopClient().uploadTerrainAsset(dataUrl); },
@@ -2370,7 +2299,7 @@ export function useAppRuntime() {
         activeTerrainVisualAssets, lobbyError, pendingRoomModUpdateId, roomModUpdateMessage,
         pendingSubscribedModUpdateIds, sendLobbyReady, sendLobbySeat, sendLobbyParticipation,
         sendLobbyColor, sendLobbySettings, sendLobbyModSettings, sendLobbyAssignment, sendLobbyMap,
-        openWorkshopForMissingTerrainMod, updateRoomModVersion, showGameLoading, missingLocalModIds,
+        openWorkshopForMissingTerrainMod, updateRoomModVersion, showGameLoading, missingLoadedModIds,
         showGame, isMatchFinished, matchResultTitle, matchResultMessage, relayIsHost,
         resetMatch, players, currentPlayer, hoveredTeamId, disconnectedPlayerIds,
         teamColors, publicBoardPoints, onPlayerCardPointerEnter, clearPlayerCardHover, game,

@@ -2,6 +2,7 @@
 import { inject, proxyRefs } from "vue";
 import WorkshopPanel from "../components/WorkshopPanel.vue";
 import { appRuntimeKey } from "../app/app-runtime-key";
+import type { ConfiguredMap } from "../maps/map-library";
 
 const runtime = inject(appRuntimeKey);
 if (!runtime) throw new Error("创意工坊未连接应用运行时");
@@ -11,9 +12,8 @@ const page = proxyRefs(runtime.workshop);
 <template>
   <WorkshopPanel
     :terrain-mods="page.workshopTerrainMods"
-    :terrain-mod-releases="page.remoteTerrainModReleases"
     :map-entries="page.workshopMapWorks"
-    :saved-map-ids="page.configuredMaps.map((map) => map.definition.id)"
+    :saved-map-ids="page.configuredMaps.map((map: ConfiguredMap) => map.definition.id)"
     :subscribed-terrain-mod-ids="page.subscribedTerrainModIds"
     :current-author-name="page.playerName"
     :pending-terrain-mod-id="page.pendingWorkshopTerrainModId"
@@ -29,8 +29,7 @@ const page = proxyRefs(runtime.workshop);
     @save-map="page.saveWorkshopMap"
     @publish-map="page.publishWorkshopMap"
     @publish-terrain-mod="page.publishWorkshopTerrainMod"
-    @install-terrain-mod="page.installWorkshopTerrainMod"
-    @cache-terrain-mod-release="page.cacheWorkshopTerrainModRelease"
+    @subscribe-terrain-mod="page.subscribeWorkshopTerrainMod"
     @unsubscribe-terrain-mod="page.unsubscribeWorkshopTerrainMod"
     @terrain-mod-opened="page.clearPendingWorkshopTerrainMod"
     @request-terrain-mod-preview="page.requestTerrainModPreview"

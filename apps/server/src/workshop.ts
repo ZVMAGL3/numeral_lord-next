@@ -12,7 +12,11 @@ import type {
   WorkshopTerrainModDetailEntry,
   WorkshopTerrainModPreview,
   WorkshopTerrainModEntry,
-  WorkshopTerrainModSummary
+  WorkshopTerrainModSummary,
+  WorkshopPersonalMap,
+  WorkshopPersonalMapOperation,
+  WorkshopPersonalMapSyncRequest,
+  WorkshopPersonalMapsPayload
 } from "@numeral-lord/content-schema";
 import { validateTerrainModDefinition } from "@numeral-lord/content-schema";
 import { parseMapCode, serializeMapCode } from "@numeral-lord/core-content";
@@ -34,6 +38,7 @@ import {
 } from "./workshop-assets.js";
 
 const MAX_MAPS = 200;
+const MAX_PERSONAL_MAPS = 32;
 const MAX_TERRAIN_MODS = 1_024;
 const MAX_TERRAIN_MOD_RELEASES_PER_MOD = 128;
 const MAX_MAP_CODE_BYTES = 64 * 1024;
@@ -48,11 +53,26 @@ interface WorkshopDatabase {
   readonly version: 1;
   readonly maps: readonly WorkshopMapEntry[];
   readonly terrainMods: readonly StoredWorkshopTerrainModEntry[];
+  readonly userMaps: readonly StoredWorkshopPersonalMap[];
+}
+
+interface StoredWorkshopPersonalMap extends WorkshopPersonalMap {
+  readonly userId: string;
 }
 
 /** Database form: definitions are JSON-only and art is deduplicated in persistent files. */
-interface StoredWorkshopTerrainModEntry extends Omit<WorkshopTerrainModEntry, "definition"> {
+interface StoredTerrainVisualLayerUrls {
+  /** Bottom layer image URL. Omitted for color or transparent fills. */
+  readonly bottomImageUrl?: string;
+  /** Top/overlay image URL. Omitted when the terrain has no top image. */
+  readonly topImageUrl?: string;
+}
+
+interface StoredWorkshopTerrainModEntry extends Omit<WorkshopTerrainModEntry, "definition" | "preview"> {
   readonly definition?: Omit<TerrainModDefinition, "visualAssets">;
+  /** Stable, layer-specific image references used by the renderer and workshop preview. */
+  readonly terrainVisualLayerUrls?: StoredTerrainVisualLayerUrls;
+  /** Read only when migrating records written before URLs were stored by terrain layer. */
   readonly visualAssetUrls?: Readonly<Record<string, string>>;
   /** Presentation-only artwork is separate from the immutable playable Mod definition/hash. */
   readonly previewArtworkUrls?: Readonly<Record<string, string>>;
@@ -86,6 +106,16 @@ interface TerrainAssetBinding {
   readonly boundAt: string;
 }
 
+export interface WorkshopUserIdentity {
+  readonly userId: string;
+  readonly displayName: string;
+}
+
+interface WorkshopUserRow {
+  readonly user_id: string;
+  readonly display_name: string;
+}
+
 export class WorkshopInputError extends Error {}
 
 /**
@@ -94,7 +124,7 @@ export class WorkshopInputError extends Error {}
  * successful disk write. Run one server process per data directory.
  */
 export class WorkshopStore {
-  private database: WorkshopDatabase = { version: 1, maps: [], terrainMods: [] };
+  private database: WorkshopDatabase = { version: 1, maps: [], terrainMods: [], userMaps: [] };
   private loading: Promise<void> | undefined;
   private pendingWrite: Promise<unknown> = Promise.resolve();
 
@@ -132,6 +162,24 @@ export class WorkshopStore {
     if (!entry) return undefined;
     const preview = terrainModVisualPreview(entry);
     return preview ? { id, preview } : undefined;
+  }
+
+  async syncPersonalMaps(userId: string, rawRequest: unknown): Promise<WorkshopPersonalMapsPayload> {
+    const request = validatePersonalMapSyncRequest(rawRequest);
+    return this.mutate((database) => {
+      const userMaps = [...database.userMaps];
+      for (const map of request.cachedMaps) {
+        if (userMaps.some((entry) => entry.userId === userId && entry.mapId === map.mapId)) continue;
+        userMaps.push({ userId, mapId: map.mapId, code: map.code, updatedAt: new Date().toISOString() });
+      }
+      applyPersonalMapOperations(userMaps, userId, request.operations);
+      const accountMaps = userMaps.filter((entry) => entry.userId === userId);
+      if (accountMaps.length > MAX_PERSONAL_MAPS) throw new WorkshopInputError(`每个工坊账号最多可保存 ${MAX_PERSONAL_MAPS} 张个人地图。`);
+      return {
+        database: { ...database, userMaps },
+        result: personalMapSyncPayload(userId, accountMaps, request.operations.map(({ operationId }) => operationId))
+      };
+    });
   }
 
   async publishMap(input: unknown, authorName: string): Promise<WorkshopPublished> {
@@ -206,7 +254,7 @@ export class WorkshopStore {
       const entry = createUpdatedTerrainMod(current, payload, normalizedAuthor, database.terrainMods);
       const storedEntry = await storeTerrainModAssets(entry, this.dataDirectory);
       return {
-        database: { ...database, terrainMods: [storedEntry, ...database.terrainMods] },
+        database: { ...database, terrainMods: [storedEntry, ...database.terrainMods.filter((mod) => mod.modId !== current.modId)] },
         result: { kind: "terrain-mod", id: entry.id } as const
       };
     });
@@ -224,12 +272,13 @@ export class WorkshopStore {
     if (size > MAX_DATABASE_BYTES) throw new Error("Workshop database exceeds its size limit.");
     const decoded: unknown = JSON.parse(await readFile(file, "utf8"));
     if (!isRecord(decoded) || decoded.version !== 1 || !Array.isArray(decoded.maps) || !Array.isArray(decoded.terrainMods)
+      || (decoded.userMaps !== undefined && !Array.isArray(decoded.userMaps))
       || decoded.maps.length > MAX_MAPS || decoded.terrainMods.length > MAX_TERRAIN_MODS) {
       throw new Error("Workshop database has an invalid format.");
     }
     // This file is server-owned. Refuse an invalid snapshot instead of
     // silently overwriting it and losing submissions.
-    const legacyDatabase = decoded as unknown as WorkshopDatabase;
+    const legacyDatabase = decoded as unknown as Omit<WorkshopDatabase, "userMaps"> & { readonly userMaps?: readonly StoredWorkshopPersonalMap[] };
     const terrainMods: StoredWorkshopTerrainModEntry[] = [];
     let migrated = false;
     for (const entry of legacyDatabase.terrainMods) {
@@ -237,7 +286,7 @@ export class WorkshopStore {
       if (JSON.stringify(storedEntry) !== JSON.stringify(entry)) migrated = true;
       terrainMods.push(storedEntry);
     }
-    this.database = { ...legacyDatabase, terrainMods };
+    this.database = { ...legacyDatabase, terrainMods, userMaps: legacyDatabase.userMaps ?? [] };
     if (migrated) await this.writeDatabase(this.database);
   }
 
@@ -304,6 +353,120 @@ export class PostgresWorkshopStore {
       }),
       terrainMods: terrainMods.rows.map(({ entry }) => terrainModSummary(parseStoredEntry<StoredWorkshopTerrainModEntry>(entry)))
     };
+  }
+
+  async resolveUserIdentity(value: unknown): Promise<WorkshopUserIdentity> {
+    await this.load();
+    const displayName = normalizeAccountName(value);
+    const usernameKey = accountNameKey(displayName);
+    const result = await this.pool.query<WorkshopUserRow>(
+      `INSERT INTO nl_workshop_users (user_id, username_key, display_name)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (username_key) DO UPDATE SET display_name = EXCLUDED.display_name
+       RETURNING user_id, display_name`,
+      [randomUUID(), usernameKey, displayName]
+    );
+    const row = result.rows[0];
+    if (!row) throw new Error("Failed to resolve workshop user identity.");
+    return { userId: row.user_id, displayName: row.display_name };
+  }
+
+  async listUserSubscriptions(userId: string): Promise<string[]> {
+    await this.load();
+    const result = await this.pool.query<{ mod_id: string }>(
+      "SELECT mod_id FROM nl_workshop_mod_subscriptions WHERE user_id = $1 ORDER BY subscribed_at, mod_id", [userId]
+    );
+    return result.rows.map(({ mod_id }) => mod_id);
+  }
+
+  async setUserSubscriptions(userId: string, modIds: readonly string[]): Promise<string[]> {
+    await this.load();
+    const normalizedIds = normalizeSubscriptionIds(modIds);
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT user_id FROM nl_workshop_users WHERE user_id = $1 FOR UPDATE", [userId]);
+      for (const modId of normalizedIds) {
+        await client.query(
+          "INSERT INTO nl_workshop_mod_subscriptions (user_id, mod_id) VALUES ($1, $2) ON CONFLICT (user_id, mod_id) DO NOTHING",
+          [userId, modId]
+        );
+      }
+      const result = await client.query<{ mod_id: string }>(
+        "SELECT mod_id FROM nl_workshop_mod_subscriptions WHERE user_id = $1 ORDER BY subscribed_at, mod_id", [userId]
+      );
+      await client.query("COMMIT");
+      return result.rows.map(({ mod_id }) => mod_id);
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async syncPersonalMaps(userId: string, rawRequest: unknown): Promise<WorkshopPersonalMapsPayload> {
+    await this.load();
+    const request = validatePersonalMapSyncRequest(rawRequest);
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const account = await client.query("SELECT user_id FROM nl_workshop_users WHERE user_id = $1 FOR UPDATE", [userId]);
+      if (!account.rowCount) throw new WorkshopInputError("工坊用户身份尚未就绪，请重新连接。");
+      const now = new Date().toISOString();
+      for (const map of request.cachedMaps) {
+        await client.query(
+          "INSERT INTO nl_workshop_user_maps (user_id, map_id, code, updated_at) VALUES ($1, $2, $3, $4) ON CONFLICT (user_id, map_id) DO NOTHING",
+          [userId, map.mapId, map.code, now]
+        );
+      }
+      for (const operation of request.operations) {
+        if (operation.type === "delete") {
+          await client.query("DELETE FROM nl_workshop_user_maps WHERE user_id = $1 AND map_id = $2", [userId, operation.mapId]);
+        } else {
+          await client.query(
+            `INSERT INTO nl_workshop_user_maps (user_id, map_id, code, updated_at) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (user_id, map_id) DO UPDATE SET code = EXCLUDED.code, updated_at = EXCLUDED.updated_at`,
+            [userId, operation.mapId, operation.code, now]
+          );
+        }
+      }
+      const count = await client.query<{ count: string }>("SELECT count(*)::text AS count FROM nl_workshop_user_maps WHERE user_id = $1", [userId]);
+      if (Number(count.rows[0]?.count ?? 0) > MAX_PERSONAL_MAPS) {
+        throw new WorkshopInputError(`每个工坊账号最多可保存 ${MAX_PERSONAL_MAPS} 张个人地图。`);
+      }
+      const result = await client.query<{ map_id: string; code: string; updated_at: string }>(
+        "SELECT map_id, code, updated_at::text FROM nl_workshop_user_maps WHERE user_id = $1 ORDER BY updated_at DESC, map_id", [userId]
+      );
+      await client.query("COMMIT");
+      return {
+        userId,
+        maps: result.rows.map(({ map_id, code, updated_at }) => ({ mapId: map_id, code, updatedAt: updated_at })),
+        acknowledgedOperationIds: request.operations.map(({ operationId }) => operationId)
+      };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      if (error instanceof WorkshopInputError) throw error;
+      throw new Error("Failed to synchronize personal maps.", { cause: error });
+    } finally {
+      client.release();
+    }
+  }
+
+  async setUserSubscription(userId: string, modId: string, subscribed: boolean): Promise<string[]> {
+    await this.load();
+    if (!isTerrainModId(modId)) throw new WorkshopInputError("地块 Mod ID 无效。");
+    if (subscribed) {
+      const available = await this.pool.query("SELECT 1 FROM nl_workshop_terrain_mods WHERE mod_id = $1 LIMIT 1", [modId]);
+      if (!available.rowCount) throw new WorkshopInputError("这个地块 Mod 已不在创意工坊中。");
+      await this.pool.query(
+        "INSERT INTO nl_workshop_mod_subscriptions (user_id, mod_id) VALUES ($1, $2) ON CONFLICT (user_id, mod_id) DO NOTHING",
+        [userId, modId]
+      );
+    } else {
+      await this.pool.query("DELETE FROM nl_workshop_mod_subscriptions WHERE user_id = $1 AND mod_id = $2", [userId, modId]);
+    }
+    return this.listUserSubscriptions(userId);
   }
 
   async get(request: WorkshopGetRequest): Promise<WorkshopDetail | undefined> {
@@ -385,7 +548,7 @@ export class PostgresWorkshopStore {
     try {
       await client.query("BEGIN");
       await client.query("SELECT pg_advisory_xact_lock($1)", [DATABASE_MIGRATION_LOCK]);
-      const count = await client.query<{ count: string }>("SELECT count(*)::text AS count FROM nl_workshop_terrain_mods");
+      const count = await client.query<{ count: string }>("SELECT count(DISTINCT mod_id)::text AS count FROM nl_workshop_terrain_mods");
       if (Number(count.rows[0]?.count ?? 0) >= MAX_TERRAIN_MODS) throw new WorkshopInputError("工坊地块 Mod 已达到容量上限。");
       const previousRelease = await client.query("SELECT 1 FROM nl_workshop_terrain_mods WHERE mod_id = $1 LIMIT 1", [entry.modId]);
       if (previousRelease.rowCount) throw new WorkshopInputError("该 Mod ID 已有不可变发布记录，请通过“发布新版本”更新。");
@@ -422,6 +585,8 @@ export class PostgresWorkshopStore {
       const releases = versions.rows.map(({ entry }) => parseStoredEntry<WorkshopTerrainModEntry>(entry));
       const entry = createUpdatedTerrainMod(current, payload, normalizedAuthor, releases);
       const storedEntry = await storeTerrainModAssets(entry, this.dataDirectory);
+      await client.query("DELETE FROM nl_workshop_asset_bindings WHERE mod_id = $1", [current.modId]);
+      await client.query("DELETE FROM nl_workshop_terrain_mods WHERE mod_id = $1", [current.modId]);
       await client.query("INSERT INTO nl_workshop_terrain_mods (id, mod_id, version, entry, created_at) VALUES ($1, $2, $3, $4, $5)",
         [entry.id, entry.modId, entry.version, JSON.stringify(storedEntry), entry.createdAt]);
       await insertPostgresTerrainAssetBindings(client, storedEntry);
@@ -498,6 +663,27 @@ export class PostgresWorkshopStore {
         created_at timestamptz NOT NULL
       );
       CREATE INDEX IF NOT EXISTS nl_workshop_maps_created_idx ON nl_workshop_maps (created_at DESC);
+      CREATE TABLE IF NOT EXISTS nl_workshop_users (
+        user_id text PRIMARY KEY,
+        username_key text NOT NULL UNIQUE,
+        display_name text NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE TABLE IF NOT EXISTS nl_workshop_mod_subscriptions (
+        user_id text NOT NULL REFERENCES nl_workshop_users(user_id) ON DELETE CASCADE,
+        mod_id text NOT NULL,
+        subscribed_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (user_id, mod_id)
+      );
+      CREATE INDEX IF NOT EXISTS nl_workshop_mod_subscriptions_mod_idx ON nl_workshop_mod_subscriptions (mod_id);
+      CREATE TABLE IF NOT EXISTS nl_workshop_user_maps (
+        user_id text NOT NULL REFERENCES nl_workshop_users(user_id) ON DELETE CASCADE,
+        map_id text NOT NULL,
+        code text NOT NULL CHECK (jsonb_typeof(code::jsonb) = 'object'),
+        updated_at timestamptz NOT NULL,
+        PRIMARY KEY (user_id, map_id)
+      );
+      CREATE INDEX IF NOT EXISTS nl_workshop_user_maps_updated_idx ON nl_workshop_user_maps (user_id, updated_at DESC);
       CREATE TABLE IF NOT EXISTS nl_workshop_terrain_mods (
         id text PRIMARY KEY,
         mod_id text NOT NULL,
@@ -532,6 +718,7 @@ export class PostgresWorkshopStore {
     await this.importLegacyJsonOnce();
     await this.removeLegacySourceFilesOnce();
     await this.externalizeInlineTerrainAssetsOnce();
+    await this.migrateTerrainVisualLayerUrlsOnce();
     await this.backfillTerrainAssetBindings();
   }
 
@@ -654,6 +841,36 @@ export class PostgresWorkshopStore {
     }
   }
 
+  /** Persist base/top image URLs explicitly so catalog previews do not depend on asset-ID joins. */
+  private async migrateTerrainVisualLayerUrlsOnce(): Promise<void> {
+    const migrationName = "terrain_visual_layer_urls_v1";
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock($1)", [DATABASE_MIGRATION_LOCK]);
+      const done = await client.query("SELECT 1 FROM nl_schema_migrations WHERE name = $1", [migrationName]);
+      if (!done.rowCount) {
+        const rows = await client.query<{ id: string; entry: string }>(
+          "SELECT id, entry FROM nl_workshop_terrain_mods FOR UPDATE"
+        );
+        for (const row of rows.rows) {
+          const current = parseStoredEntry<StoredWorkshopTerrainModEntry>(row.entry);
+          const migrated = await storeTerrainModAssets(current, this.dataDirectory);
+          if (JSON.stringify(migrated) !== JSON.stringify(current)) {
+            await client.query("UPDATE nl_workshop_terrain_mods SET entry = $2 WHERE id = $1", [row.id, JSON.stringify(migrated)]);
+          }
+        }
+        await client.query("INSERT INTO nl_schema_migrations (name) VALUES ($1)", [migrationName]);
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
 }
 
 /** Local development uses the same portable JSON records inside a SQLite file. */
@@ -682,6 +899,104 @@ export class SqliteWorkshopStore {
       }),
       terrainMods: terrainMods.map(({ entry }) => terrainModSummary(parseStoredEntry<StoredWorkshopTerrainModEntry>(entry)))
     };
+  }
+
+  async resolveUserIdentity(value: unknown): Promise<WorkshopUserIdentity> {
+    await this.load();
+    const displayName = normalizeAccountName(value);
+    const row = this.database!.prepare(
+      `INSERT INTO nl_workshop_users (user_id, username_key, display_name)
+       VALUES (?, ?, ?)
+       ON CONFLICT(username_key) DO UPDATE SET display_name = excluded.display_name
+       RETURNING user_id, display_name`
+    ).get(randomUUID(), accountNameKey(displayName), displayName) as WorkshopUserRow | undefined;
+    if (!row) throw new Error("Failed to resolve workshop user identity.");
+    return { userId: row.user_id, displayName: row.display_name };
+  }
+
+  async listUserSubscriptions(userId: string): Promise<string[]> {
+    await this.load();
+    return (this.database!.prepare(
+      "SELECT mod_id FROM nl_workshop_mod_subscriptions WHERE user_id = ? ORDER BY subscribed_at, mod_id"
+    ).all(userId) as { mod_id: string }[]).map(({ mod_id }) => mod_id);
+  }
+
+  async setUserSubscriptions(userId: string, modIds: readonly string[]): Promise<string[]> {
+    await this.load();
+    const normalizedIds = normalizeSubscriptionIds(modIds);
+    const database = this.database!;
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      for (const modId of normalizedIds) {
+        database.prepare(
+          "INSERT INTO nl_workshop_mod_subscriptions (user_id, mod_id) VALUES (?, ?) ON CONFLICT(user_id, mod_id) DO NOTHING"
+        ).run(userId, modId);
+      }
+      const rows = database.prepare(
+        "SELECT mod_id FROM nl_workshop_mod_subscriptions WHERE user_id = ? ORDER BY subscribed_at, mod_id"
+      ).all(userId) as { mod_id: string }[];
+      database.exec("COMMIT");
+      return rows.map(({ mod_id }) => mod_id);
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async syncPersonalMaps(userId: string, rawRequest: unknown): Promise<WorkshopPersonalMapsPayload> {
+    await this.load();
+    const request = validatePersonalMapSyncRequest(rawRequest);
+    const database = this.database!;
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      if (!database.prepare("SELECT 1 FROM nl_workshop_users WHERE user_id = ?").get(userId)) {
+        throw new WorkshopInputError("工坊用户身份尚未就绪，请重新连接。");
+      }
+      const now = new Date().toISOString();
+      const insertCached = database.prepare(
+        "INSERT INTO nl_workshop_user_maps (user_id, map_id, code, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(user_id, map_id) DO NOTHING"
+      );
+      for (const map of request.cachedMaps) insertCached.run(userId, map.mapId, map.code, now);
+      const upsert = database.prepare(
+        `INSERT INTO nl_workshop_user_maps (user_id, map_id, code, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(user_id, map_id) DO UPDATE SET code = excluded.code, updated_at = excluded.updated_at`
+      );
+      const remove = database.prepare("DELETE FROM nl_workshop_user_maps WHERE user_id = ? AND map_id = ?");
+      for (const operation of request.operations) {
+        if (operation.type === "delete") remove.run(userId, operation.mapId);
+        else upsert.run(userId, operation.mapId, operation.code, now);
+      }
+      const count = database.prepare("SELECT count(*) AS count FROM nl_workshop_user_maps WHERE user_id = ?").get(userId) as { count: number };
+      if (count.count > MAX_PERSONAL_MAPS) throw new WorkshopInputError(`每个工坊账号最多可保存 ${MAX_PERSONAL_MAPS} 张个人地图。`);
+      const rows = database.prepare(
+        "SELECT map_id, code, updated_at FROM nl_workshop_user_maps WHERE user_id = ? ORDER BY updated_at DESC, map_id"
+      ).all(userId) as { map_id: string; code: string; updated_at: string }[];
+      database.exec("COMMIT");
+      return {
+        userId,
+        maps: rows.map(({ map_id, code, updated_at }) => ({ mapId: map_id, code, updatedAt: updated_at })),
+        acknowledgedOperationIds: request.operations.map(({ operationId }) => operationId)
+      };
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async setUserSubscription(userId: string, modId: string, subscribed: boolean): Promise<string[]> {
+    await this.load();
+    if (!isTerrainModId(modId)) throw new WorkshopInputError("地块 Mod ID 无效。");
+    const database = this.database!;
+    if (subscribed) {
+      const available = database.prepare("SELECT 1 FROM nl_workshop_terrain_mods WHERE mod_id = ? LIMIT 1").get(modId);
+      if (!available) throw new WorkshopInputError("这个地块 Mod 已不在创意工坊中。");
+      database.prepare(
+        "INSERT INTO nl_workshop_mod_subscriptions (user_id, mod_id) VALUES (?, ?) ON CONFLICT(user_id, mod_id) DO NOTHING"
+      ).run(userId, modId);
+    } else {
+      database.prepare("DELETE FROM nl_workshop_mod_subscriptions WHERE user_id = ? AND mod_id = ?").run(userId, modId);
+    }
+    return this.listUserSubscriptions(userId);
   }
 
   async get(request: WorkshopGetRequest): Promise<WorkshopDetail | undefined> {
@@ -752,7 +1067,7 @@ export class SqliteWorkshopStore {
     const database = this.database!;
     database.exec("BEGIN IMMEDIATE");
     try {
-      const count = database.prepare("SELECT count(*) AS count FROM nl_workshop_terrain_mods").get() as { count: number };
+      const count = database.prepare("SELECT count(DISTINCT mod_id) AS count FROM nl_workshop_terrain_mods").get() as { count: number };
       if (count.count >= MAX_TERRAIN_MODS) throw new WorkshopInputError("工坊地块 Mod 已达到容量上限。");
       const previousRelease = database.prepare("SELECT 1 FROM nl_workshop_terrain_mods WHERE mod_id = ? LIMIT 1").get(entry.modId);
       if (previousRelease) throw new WorkshopInputError("该 Mod ID 已有不可变发布记录，请通过“发布新版本”更新。");
@@ -784,6 +1099,8 @@ export class SqliteWorkshopStore {
         .map(({ entry }) => parseStoredEntry<WorkshopTerrainModEntry>(entry));
       const entry = createUpdatedTerrainMod(current, payload, normalizedAuthor, releases);
       const storedEntry = await storeTerrainModAssets(entry, this.legacyDataDirectory);
+      database.prepare("DELETE FROM nl_workshop_asset_bindings WHERE mod_id = ?").run(current.modId);
+      database.prepare("DELETE FROM nl_workshop_terrain_mods WHERE mod_id = ?").run(current.modId);
       database.prepare("INSERT INTO nl_workshop_terrain_mods (id, mod_id, version, entry, created_at) VALUES (?, ?, ?, ?, ?)")
         .run(entry.id, entry.modId, entry.version, JSON.stringify(storedEntry), entry.createdAt);
       insertSqliteTerrainAssetBindings(database, storedEntry);
@@ -868,6 +1185,27 @@ export class SqliteWorkshopStore {
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS nl_workshop_maps_created_idx ON nl_workshop_maps (created_at DESC);
+      CREATE TABLE IF NOT EXISTS nl_workshop_users (
+        user_id TEXT PRIMARY KEY,
+        username_key TEXT NOT NULL UNIQUE,
+        display_name TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS nl_workshop_mod_subscriptions (
+        user_id TEXT NOT NULL REFERENCES nl_workshop_users(user_id) ON DELETE CASCADE,
+        mod_id TEXT NOT NULL,
+        subscribed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (user_id, mod_id)
+      );
+      CREATE INDEX IF NOT EXISTS nl_workshop_mod_subscriptions_mod_idx ON nl_workshop_mod_subscriptions (mod_id);
+      CREATE TABLE IF NOT EXISTS nl_workshop_user_maps (
+        user_id TEXT NOT NULL REFERENCES nl_workshop_users(user_id) ON DELETE CASCADE,
+        map_id TEXT NOT NULL,
+        code TEXT NOT NULL CHECK (json_valid(code) AND json_type(code) = 'object'),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, map_id)
+      );
+      CREATE INDEX IF NOT EXISTS nl_workshop_user_maps_updated_idx ON nl_workshop_user_maps (user_id, updated_at DESC);
       CREATE TABLE IF NOT EXISTS nl_workshop_terrain_mods (
         id TEXT PRIMARY KEY,
         mod_id TEXT NOT NULL,
@@ -902,6 +1240,7 @@ export class SqliteWorkshopStore {
     this.importLegacyJsonOnce();
     this.removeLegacySourceFilesOnce();
     await this.externalizeInlineTerrainAssetsOnce();
+    await this.migrateTerrainVisualLayerUrlsOnce();
     this.backfillTerrainAssetBindings();
   }
 
@@ -932,6 +1271,27 @@ export class SqliteWorkshopStore {
       for (const row of rows) {
         const stored = await storeTerrainModAssets(parseStoredEntry<WorkshopTerrainModEntry>(row.entry), this.legacyDataDirectory);
         update.run(JSON.stringify(stored), row.id);
+      }
+      database.prepare("INSERT INTO nl_schema_migrations (name) VALUES (?)").run(migrationName);
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private async migrateTerrainVisualLayerUrlsOnce(): Promise<void> {
+    const database = this.database!;
+    const migrationName = "terrain_visual_layer_urls_v1";
+    if (database.prepare("SELECT 1 FROM nl_schema_migrations WHERE name = ?").get(migrationName)) return;
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      const rows = database.prepare("SELECT id, entry FROM nl_workshop_terrain_mods").all() as { id: string; entry: string }[];
+      const update = database.prepare("UPDATE nl_workshop_terrain_mods SET entry = ? WHERE id = ?");
+      for (const row of rows) {
+        const current = parseStoredEntry<StoredWorkshopTerrainModEntry>(row.entry);
+        const migrated = await storeTerrainModAssets(current, this.legacyDataDirectory);
+        if (JSON.stringify(migrated) !== JSON.stringify(current)) update.run(JSON.stringify(migrated), row.id);
       }
       database.prepare("INSERT INTO nl_schema_migrations (name) VALUES (?)").run(migrationName);
       database.exec("COMMIT");
@@ -1004,6 +1364,7 @@ export class SqliteWorkshopStore {
  */
 export class WorkshopRoom extends Room {
   private readonly authorNames = new Map<string, string>();
+  private readonly userIds = new Map<string, string>();
   private readonly publicationRates = new Map<string, PublicationRate>();
   private readonly store = sharedWorkshopStore;
 
@@ -1012,21 +1373,85 @@ export class WorkshopRoom extends Room {
     await this.setMetadata({ kind: "workshop" });
     this.maxClients = 256;
     this.autoDispose = false;
+    this.onMessage("workshop-account", (client) => { void this.sendAccount(client); });
+    this.onMessage("workshop-sync-personal-maps", (client, payload: unknown) => { void this.syncPersonalMaps(client, payload); });
     this.onMessage("workshop-list", (client) => { void this.sendList(client); });
     this.onMessage("workshop-get", (client, payload: unknown) => { void this.sendDetail(client, payload); });
     this.onMessage("workshop-preview", (client, payload: unknown) => { void this.sendTerrainModPreview(client, payload); });
+    this.onMessage("workshop-subscribe", (client, payload: unknown) => { void this.updateSubscription(client, payload); });
+    this.onMessage("workshop-migrate-subscriptions", (client, payload: unknown) => { void this.migrateSubscriptions(client, payload); });
     this.onMessage("publish-map", (client, payload: unknown) => { void this.publish(client, "map", payload); });
     this.onMessage("publish-terrain-mod", (client, payload: unknown) => { void this.publish(client, "terrain-mod", payload); });
   }
 
   override async onJoin(client: Client, options: Record<string, unknown> = {}): Promise<void> {
-    this.authorNames.set(client.sessionId, normalizeAuthorName(options.name));
-    await this.sendList(client);
+    try {
+      const identity = await this.store.resolveUserIdentity(options.name);
+      this.authorNames.set(client.sessionId, identity.displayName);
+      this.userIds.set(client.sessionId, identity.userId);
+    } catch (error) {
+      this.sendError(client, error instanceof WorkshopInputError ? error.message : "无法读取工坊用户身份。");
+    }
   }
 
   override onLeave(client: Client): void {
     this.authorNames.delete(client.sessionId);
+    this.userIds.delete(client.sessionId);
     this.publicationRates.delete(client.sessionId);
+  }
+
+  private async updateSubscription(client: Client, payload: unknown): Promise<void> {
+    const userId = this.userIds.get(client.sessionId);
+    if (!userId) return this.sendError(client, "工坊用户身份尚未就绪，请重新连接。");
+    if (!isRecord(payload) || !isTerrainModId(payload.modId) || typeof payload.subscribed !== "boolean") {
+      return this.sendError(client, "地块 Mod 订阅请求无效。");
+    }
+    try {
+      const subscribedModIds = await this.store.setUserSubscription(userId, payload.modId, payload.subscribed);
+      client.send("workshop-subscriptions", { userId, subscribedModIds });
+    } catch (error) {
+      this.sendError(client, error instanceof WorkshopInputError ? error.message : "保存地块 Mod 订阅失败。");
+    }
+  }
+
+  private async sendAccount(client: Client): Promise<void> {
+    const userId = this.userIds.get(client.sessionId);
+    const displayName = this.authorNames.get(client.sessionId);
+    if (!userId || !displayName) return this.sendError(client, "工坊用户身份尚未就绪，请稍后重试。");
+    try {
+      client.send("workshop-account", {
+        userId,
+        displayName,
+        subscribedModIds: await this.store.listUserSubscriptions(userId)
+      });
+    } catch (error) {
+      this.sendError(client, error instanceof WorkshopInputError ? error.message : "无法读取工坊用户身份。");
+    }
+  }
+
+  private async syncPersonalMaps(client: Client, payload: unknown): Promise<void> {
+    const userId = this.userIds.get(client.sessionId);
+    if (!userId) return this.sendError(client, "工坊用户身份尚未就绪，请重新连接。");
+    try {
+      client.send("workshop-personal-maps", await this.store.syncPersonalMaps(userId, payload));
+    } catch (error) {
+      this.sendError(client, error instanceof WorkshopInputError ? error.message : "个人地图同步失败；本地缓存已保留，请稍后重试。");
+    }
+  }
+
+  private async migrateSubscriptions(client: Client, payload: unknown): Promise<void> {
+    const userId = this.userIds.get(client.sessionId);
+    if (!userId) return this.sendError(client, "工坊用户身份尚未就绪，请重新连接。");
+    if (!isRecord(payload) || !Array.isArray(payload.modIds) || payload.modIds.length > MAX_TERRAIN_MODS
+      || !payload.modIds.every((id) => typeof id === "string")) {
+      return this.sendError(client, "旧订阅迁移数据无效；本地记录尚未删除。");
+    }
+    try {
+      const subscribedModIds = await this.store.setUserSubscriptions(userId, payload.modIds as string[]);
+      client.send("workshop-migration-complete", { userId, subscribedModIds });
+    } catch {
+      this.sendError(client, "订阅同步失败；本地旧记录尚未删除，请稍后重试。");
+    }
   }
 
   private async sendList(client: Client): Promise<void> {
@@ -1118,6 +1543,14 @@ export async function initializeWorkshopStore(): Promise<void> {
   await sharedWorkshopStore.load();
 }
 
+/** Validate map dependencies against the current server-owned Mod catalog. */
+export async function unavailableTerrainModIds(modIds: readonly string[]): Promise<string[]> {
+  if (!modIds.length) return [];
+  const catalog = await sharedWorkshopStore.list();
+  const available = new Set(catalog.terrainMods.map((entry) => entry.modId));
+  return [...new Set(modIds)].filter((id) => !available.has(id));
+}
+
 /** Save an uploaded file immediately, then record a traceable database event for it. */
 export async function saveUploadedTerrainAsset(
   dataUrl: string,
@@ -1189,7 +1622,7 @@ async function insertPostgresTerrainAssetBindings(
   client: PoolClient,
   entry: StoredWorkshopTerrainModEntry
 ): Promise<void> {
-  const urls = [...new Set(Object.values(entry.visualAssetUrls ?? {}))];
+  const urls = collectTerrainVisualAssetUrls(entry);
   for (const assetUrl of urls) {
     await client.query(
       "INSERT INTO nl_workshop_asset_bindings (asset_url, mod_release_id, mod_id, bound_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
@@ -1202,13 +1635,20 @@ function insertSqliteTerrainAssetBindings(database: DatabaseSync, entry: StoredW
   const insert = database.prepare(
     "INSERT OR IGNORE INTO nl_workshop_asset_bindings (asset_url, mod_release_id, mod_id, bound_at) VALUES (?, ?, ?, ?)"
   );
-  for (const assetUrl of new Set(Object.values(entry.visualAssetUrls ?? {}))) {
+  for (const assetUrl of collectTerrainVisualAssetUrls(entry)) {
     insert.run(assetUrl, entry.id, entry.modId, entry.createdAt);
   }
 }
 
 function collectBoundTerrainAssetUrls(entries: readonly StoredWorkshopTerrainModEntry[]): Set<string> {
-  return new Set(entries.flatMap((entry) => Object.values(entry.visualAssetUrls ?? {})));
+  return new Set(entries.flatMap(collectTerrainVisualAssetUrls));
+}
+
+function collectTerrainVisualAssetUrls(entry: StoredWorkshopTerrainModEntry): string[] {
+  return [...new Set([
+    ...Object.values(entry.terrainVisualLayerUrls ?? {}),
+    ...Object.values(entry.visualAssetUrls ?? {})
+  ].filter((url): url is string => typeof url === "string"))];
 }
 
 async function removeUnboundTerrainAssetFiles(
@@ -1271,6 +1711,84 @@ async function materializeTerrainModAssetReferences(input: unknown): Promise<unk
     return { id: rawAsset.id, dataUrl: `data:${contentType};base64,${bytes.toString("base64")}` };
   }));
   return { ...input, definition: { ...input.definition, visualAssets } };
+}
+
+function validatePersonalMapSyncRequest(input: unknown): WorkshopPersonalMapSyncRequest {
+  if (!isRecord(input) || !Array.isArray(input.cachedMaps) || !Array.isArray(input.operations)
+    || input.cachedMaps.length > MAX_PERSONAL_MAPS || input.operations.length > MAX_PERSONAL_MAPS) {
+    throw new WorkshopInputError("个人地图同步请求无效。");
+  }
+  const cachedIds = new Set<string>();
+  const cachedMaps = input.cachedMaps.map((value): { mapId: string; code: string } => {
+    if (!isRecord(value) || typeof value.mapId !== "string" || value.mapId.length > 100 || typeof value.code !== "string") {
+      throw new WorkshopInputError("个人地图缓存数据无效。");
+    }
+    const map = normalizePersonalMap(value.mapId, value.code);
+    if (cachedIds.has(map.mapId)) throw new WorkshopInputError("个人地图缓存中包含重复地图。");
+    cachedIds.add(map.mapId);
+    return map;
+  });
+  const operationIds = new Set<string>();
+  const operations = input.operations.map((value): WorkshopPersonalMapOperation => {
+    if (!isRecord(value) || typeof value.operationId !== "string" || !value.operationId || value.operationId.length > 100
+      || typeof value.mapId !== "string" || value.mapId.length > 100 || (value.type !== "delete" && value.type !== "upsert")) {
+      throw new WorkshopInputError("个人地图待同步操作无效。");
+    }
+    if (operationIds.has(value.operationId)) throw new WorkshopInputError("个人地图同步操作 ID 重复。");
+    operationIds.add(value.operationId);
+    if (value.type === "delete") return { operationId: value.operationId, type: "delete", mapId: value.mapId };
+    if (typeof value.code !== "string") throw new WorkshopInputError("个人地图保存操作缺少地图码。");
+    const map = normalizePersonalMap(value.mapId, value.code);
+    return { operationId: value.operationId, type: "upsert", ...map };
+  });
+  return { cachedMaps, operations };
+}
+
+function normalizePersonalMap(mapId: string, code: string): { mapId: string; code: string } {
+  if (!mapId || Buffer.byteLength(code, "utf8") > MAX_MAP_CODE_BYTES) throw new WorkshopInputError("个人地图码无效或过长。");
+  try {
+    const definition = parseMapCode(code, { allowUnknownTerrainMods: true });
+    if (definition.id !== mapId) throw new WorkshopInputError("个人地图 ID 与地图码不一致。");
+    return { mapId, code: serializeMapCode(definition, { allowUnknownTerrainMods: true }) };
+  } catch (error) {
+    if (error instanceof WorkshopInputError) throw error;
+    throw new WorkshopInputError(error instanceof Error ? error.message : "个人地图码无效。");
+  }
+}
+
+function applyPersonalMapOperations(
+  rows: StoredWorkshopPersonalMap[],
+  userId: string,
+  operations: readonly WorkshopPersonalMapOperation[]
+): void {
+  for (const operation of operations) {
+    const index = rows.findIndex((entry) => entry.userId === userId && entry.mapId === operation.mapId);
+    if (operation.type === "delete") {
+      if (index >= 0) rows.splice(index, 1);
+    } else {
+      const entry: StoredWorkshopPersonalMap = {
+        userId,
+        mapId: operation.mapId,
+        code: operation.code,
+        updatedAt: new Date().toISOString()
+      };
+      if (index >= 0) rows.splice(index, 1, entry);
+      else rows.push(entry);
+    }
+  }
+}
+
+function personalMapSyncPayload(
+  userId: string,
+  maps: readonly StoredWorkshopPersonalMap[],
+  acknowledgedOperationIds: readonly string[]
+): WorkshopPersonalMapsPayload {
+  return {
+    userId,
+    maps: maps.toSorted((left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.mapId.localeCompare(right.mapId))
+      .map(({ mapId, code, updatedAt }) => ({ mapId, code, updatedAt })),
+    acknowledgedOperationIds
+  };
 }
 
 function validateMapRequest(input: unknown): PublishMapRequest {
@@ -1397,6 +1915,30 @@ function normalizeAuthorName(value: unknown): string {
   return typeof value === "string" && value.trim() ? value.trim().slice(0, 40) : "匿名玩家";
 }
 
+function normalizeAccountName(value: unknown): string {
+  if (typeof value !== "string") throw new WorkshopInputError("请输入玩家名称后再连接创意工坊。");
+  const displayName = value.normalize("NFKC").trim();
+  if (!displayName || [...displayName].length > 40) {
+    throw new WorkshopInputError("玩家名称不能为空，且不能超过 40 个字符。");
+  }
+  return displayName;
+}
+
+function accountNameKey(displayName: string): string {
+  return displayName.toLowerCase();
+}
+
+function isTerrainModId(value: unknown): value is string {
+  return typeof value === "string" && /^mod-[a-z0-9][a-z0-9._-]{0,63}$/.test(value);
+}
+
+function normalizeSubscriptionIds(value: readonly string[]): string[] {
+  if (value.length > MAX_TERRAIN_MODS || value.some((id) => !isTerrainModId(id))) {
+    throw new WorkshopInputError("订阅中的地块 Mod ID 无效。");
+  }
+  return [...new Set(value)];
+}
+
 function byteLength(value: string): number {
   return Buffer.byteLength(value, "utf8");
 }
@@ -1414,10 +1956,13 @@ function stripStoredAssetReferences(entry: WorkshopTerrainModEntry | StoredWorks
   const {
     sourceFiles: _legacySourceFiles,
     visualAssetUrls: _visualAssetUrls,
+    terrainVisualLayerUrls: _terrainVisualLayerUrls,
+    previewArtworkUrls: _previewArtworkUrls,
     ...dataOnlyEntry
   } = entry as (WorkshopTerrainModEntry | StoredWorkshopTerrainModEntry) & {
     readonly sourceFiles?: unknown;
     readonly visualAssetUrls?: Readonly<Record<string, string>>;
+    readonly terrainVisualLayerUrls?: StoredTerrainVisualLayerUrls;
     readonly previewArtworkUrls?: Readonly<Record<string, string>>;
   };
   return dataOnlyEntry as WorkshopTerrainModEntry;
@@ -1432,6 +1977,7 @@ function terrainModSummary(entry: WorkshopTerrainModEntry | StoredWorkshopTerrai
     definition,
     sourceFiles: _legacySourceFiles,
     visualAssetUrls: _visualAssetUrls,
+    terrainVisualLayerUrls: _terrainVisualLayerUrls,
     previewArtworkUrls: _previewArtworkUrls,
     terrainIds: _legacyTerrainIds,
     terrainId: _terrainId,
@@ -1439,6 +1985,7 @@ function terrainModSummary(entry: WorkshopTerrainModEntry | StoredWorkshopTerrai
   } = entry as (WorkshopTerrainModEntry | StoredWorkshopTerrainModEntry) & {
     readonly sourceFiles?: unknown;
     readonly visualAssetUrls?: Readonly<Record<string, string>>;
+    readonly terrainVisualLayerUrls?: StoredTerrainVisualLayerUrls;
     readonly previewArtworkUrls?: Readonly<Record<string, string>>;
     readonly terrainIds?: readonly string[];
   };
@@ -1447,22 +1994,71 @@ function terrainModSummary(entry: WorkshopTerrainModEntry | StoredWorkshopTerrai
     : _legacyTerrainIds?.[0] ?? terrainIdForModId(entry.modId);
   const currentDefinition = isCurrentTerrainModDefinition(definition) ? definition : undefined;
   const contentHash = entry.contentHash ?? (currentDefinition ? hashModContent(terrainModContent(currentDefinition)) : undefined);
-  return { ...summary, terrainId, ...(contentHash ? { contentHash } : {}) };
+  const preview = terrainModVisualPreview(entry);
+  return {
+    ...summary,
+    terrainId,
+    ...(contentHash ? { contentHash } : {}),
+    ...(preview ? { preview } : {})
+  };
 }
 
 function terrainModVisualPreview(entry: WorkshopTerrainModEntry | StoredWorkshopTerrainModEntry): WorkshopTerrainModPreview["preview"] | undefined {
   if (!isCurrentTerrainModDefinition(entry.definition)) return undefined;
-  const storedAssetUrls = (entry as StoredWorkshopTerrainModEntry).visualAssetUrls ?? {};
+  const storedAssetUrls = storedTerrainVisualAssetUrls(entry as StoredWorkshopTerrainModEntry, entry.definition);
   const terrain = entry.definition.terrain;
   const referencedAssetIds = referencedTerrainVisualAssetIds(terrain);
   const visualAssets = Object.entries(storedAssetUrls)
     .filter(([id]) => referencedAssetIds.has(id))
     .map(([id, url]) => ({ id, url }));
+  const visualUrls = (entry as StoredWorkshopTerrainModEntry).terrainVisualLayerUrls;
+  const baseAssetId = terrain.visuals?.baseAssetId;
+  const overlayAssetId = terrain.visuals?.overlay?.assetId;
+  const missingBaseImage = Boolean(baseAssetId && !visualUrls?.bottomImageUrl && !storedAssetUrls[baseAssetId]);
+  const missingTopImage = Boolean(overlayAssetId && !visualUrls?.topImageUrl && !storedAssetUrls[overlayAssetId]);
+  const visuals = terrain.visuals ?? { baseColor: "#638f67" };
+  let previewVisuals = visuals;
+  if (missingBaseImage) {
+    const { baseAssetId: _missingBaseAssetId, ...withoutBaseAsset } = previewVisuals;
+    previewVisuals = { ...withoutBaseAsset, baseColor: visuals.baseColor ?? "#638f67" };
+  }
+  if (missingTopImage) {
+    const { overlay: _missingOverlay, ...withoutTopAsset } = previewVisuals;
+    previewVisuals = withoutTopAsset;
+  }
   return {
     terrainId: terrainIdForModId(entry.modId),
     displayName: entry.name,
-    ...(terrain.visuals ? { visuals: terrain.visuals } : {}),
+    visuals: previewVisuals,
     visualAssets
+  };
+}
+
+function storedTerrainVisualAssetUrls(
+  entry: StoredWorkshopTerrainModEntry,
+  definition: TerrainModDefinition
+): Readonly<Record<string, string>> {
+  const urls: Record<string, string> = { ...(entry.visualAssetUrls ?? {}) };
+  const layers = entry.terrainVisualLayerUrls;
+  const bottomAssetId = definition.terrain.visuals?.baseAssetId;
+  const topAssetId = definition.terrain.visuals?.overlay?.assetId;
+  if (bottomAssetId && layers?.bottomImageUrl) urls[bottomAssetId] = layers.bottomImageUrl;
+  if (topAssetId && layers?.topImageUrl) urls[topAssetId] = layers.topImageUrl;
+  return urls;
+}
+
+function terrainVisualLayerUrls(
+  definition: TerrainModDefinition,
+  assetUrls: Readonly<Record<string, string>>
+): StoredTerrainVisualLayerUrls | undefined {
+  const baseAssetId = definition.terrain.visuals?.baseAssetId;
+  const topAssetId = definition.terrain.visuals?.overlay?.assetId;
+  const bottomImageUrl = baseAssetId ? assetUrls[baseAssetId] : undefined;
+  const topImageUrl = topAssetId ? assetUrls[topAssetId] : undefined;
+  if (!bottomImageUrl && !topImageUrl) return undefined;
+  return {
+    ...(bottomImageUrl ? { bottomImageUrl } : {}),
+    ...(topImageUrl ? { topImageUrl } : {})
   };
 }
 
@@ -1477,36 +2073,34 @@ async function storeTerrainModAssets(
   entry: WorkshopTerrainModEntry | StoredWorkshopTerrainModEntry,
   dataDirectory: string
 ): Promise<StoredWorkshopTerrainModEntry> {
-  const { visualAssetUrls: previousUrls, ...withoutPreviousUrls } = entry as StoredWorkshopTerrainModEntry;
-  if (!entry.definition) return stripStoredAssetReferences(withoutPreviousUrls) as StoredWorkshopTerrainModEntry;
-
-  const definitionWithAssets = entry.definition as TerrainModDefinition;
-  const assets = definitionWithAssets.visualAssets;
-  const contentHash = entry.contentHash ?? hashModContent(terrainModContent(definitionWithAssets));
-  if (!assets?.length) {
-    if (previousUrls) return {
-      ...stripStoredAssetReferences(withoutPreviousUrls),
-      visualAssetUrls: previousUrls,
-      contentHash
-    } as StoredWorkshopTerrainModEntry;
-    const { visualAssets: _visualAssets, ...definition } = definitionWithAssets;
-    return { ...stripStoredAssetReferences(withoutPreviousUrls), definition, contentHash } as StoredWorkshopTerrainModEntry;
+  const definitionWithAssets = entry.definition as TerrainModDefinition | undefined;
+  const previousUrls = definitionWithAssets && isCurrentTerrainModDefinition(definitionWithAssets)
+    ? storedTerrainVisualAssetUrls(entry as StoredWorkshopTerrainModEntry, definitionWithAssets)
+    : {};
+  const cleanEntry = stripStoredAssetReferences(entry);
+  if (!definitionWithAssets || !isCurrentTerrainModDefinition(definitionWithAssets)) {
+    return cleanEntry as StoredWorkshopTerrainModEntry;
   }
 
-  const storedAssets = await persistTerrainVisualAssets(assets, dataDirectory);
   const { visualAssets: _visualAssets, ...definition } = definitionWithAssets;
+  const assets = definitionWithAssets.visualAssets;
+  const contentHash = entry.contentHash ?? hashModContent(terrainModContent(definitionWithAssets));
+  const assetUrlsById = assets?.length
+    ? Object.fromEntries((await persistTerrainVisualAssets(assets, dataDirectory)).map(({ id, url }) => [id, url]))
+    : previousUrls;
+  const layerUrls = terrainVisualLayerUrls(definitionWithAssets, assetUrlsById);
   return {
-    ...stripStoredAssetReferences(withoutPreviousUrls),
+    ...cleanEntry,
     definition,
     contentHash,
-    visualAssetUrls: Object.fromEntries(storedAssets.map(({ id, url }) => [id, url]))
+    ...(layerUrls ? { terrainVisualLayerUrls: layerUrls } : {})
   } as StoredWorkshopTerrainModEntry;
 }
 
 function terrainModDetail(entry: StoredWorkshopTerrainModEntry): WorkshopDetail {
   const storedDefinition: unknown = entry.definition;
   const definition = isCurrentTerrainModDefinition(storedDefinition) ? storedDefinition : undefined;
-  const visualAssetUrls = entry.visualAssetUrls;
+  const visualAssetUrls = definition ? storedTerrainVisualAssetUrls(entry, definition) : {};
   const referencedAssetIds = definition ? referencedTerrainVisualAssetIds(definition.terrain) : new Set<string>();
   const visualAssets: readonly StoredVisualAsset[] = Object.entries(visualAssetUrls ?? {})
     .filter(([id]) => referencedAssetIds.has(id))

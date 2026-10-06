@@ -1,18 +1,18 @@
 <script setup lang="ts">
-import { Application, Assets, Container, Graphics, Rectangle, Sprite, Text, Texture, type FederatedPointerEvent } from "pixi.js";
+import { Application, Assets, BitmapFont, BitmapText, Container, Graphics, Rectangle, Sprite, Texture, type FederatedPointerEvent } from "pixi.js";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { CellId, GameState, PlayerId, TerrainCatalog, TerrainVisualSpec, UnitId } from "@numeral-lord/game-core";
 import { getBoardWheelZoomFactor, MAX_BOARD_ZOOM, MIN_BOARD_ZOOM, zoomBoardCameraAtPoint } from "../board/board-camera.js";
 import { shouldCreateCellHitTarget } from "../board/board-cell-hit-target.js";
 import { findBoardCellAtPoint } from "../board/board-hit-test.js";
 import { getMovementHintCellIds } from "../board/board-interaction.js";
-import { boardLayoutChanged, type BoardLayoutSnapshot } from "../board/board-layout.js";
+import { boardLayoutChanged, GAME_BOARD_HEX_RADIUS, getBoardHexRadius, type BoardLayoutSnapshot } from "../board/board-layout.js";
 import { BOARD_RENDER_Z_INDEX } from "../board/board-render-order.js";
 import { getTerrainArtPlacement, getTerrainHexCoordinates, TERRAIN_ART_FOOTPRINT_SCALE, type TerrainArtPlacement } from "../board/terrain-art-geometry.js";
 import { loadTerrainImageTexture } from "../board/terrain-image-texture.js";
 import { resolveTerrainArtwork } from "../board/terrain-render-model.js";
 import { replaceTerrainScene } from "../board/terrain-scene.js";
-import { getUnitRenderScale, UNIT_BODY_ALPHA, UNIT_DETAIL_ALPHA } from "../board/unit-render-style.js";
+import { getUnitRenderScale, getUnitStrengthFontSize, UNIT_BODY_ALPHA, UNIT_DETAIL_ALPHA } from "../board/unit-render-style.js";
 
 const props = withDefaults(defineProps<{
   state: GameState;
@@ -104,12 +104,15 @@ const pointers = new Map<number, { x: number; y: number }>();
 const pressedCellIds = new Map<number, CellId>();
 let cameraZoom = 1;
 let cameraPan = { x: 0, y: 0 };
+let previewRenderFrame: number | undefined;
 let dragOrigin: { x: number; y: number; panX: number; panY: number } | undefined;
 let pinchOrigin: { distance: number; zoom: number; x: number; y: number; panX: number; panY: number } | undefined;
 let cameraMovedAt = 0;
 const cellLayouts = new Map<CellId, { x: number; y: number; radius: number }>();
 const powered = computed(() => new Set(props.poweredUnitIds));
 const actionableUnits = computed(() => new Set(props.actionableUnitIds));
+const UNIT_STRENGTH_BITMAP_FONT = "NumeralLordUnitStrength";
+let unitStrengthBitmapFontInstalled = false;
 
 interface ActionPulse {
   readonly graphic: Graphics;
@@ -194,7 +197,10 @@ onMounted(async () => {
       width: initialWidth,
       height: initialHeight,
       resolution,
-      autoDensity: true
+      autoDensity: true,
+      // Editor and preview boards are static until data or the camera changes.
+      // Avoid redrawing thousands of cells on every idle animation frame.
+      autoStart: !props.preview
     });
   } catch (error) {
     if (app === instance) app = undefined;
@@ -274,6 +280,16 @@ onMounted(async () => {
     console.warn("Legacy board artwork could not be loaded; using base fills.", error);
   }
   if (app !== instance || !canvasHost.value) return;
+  if (props.showUnitLabels !== false && !unitStrengthBitmapFontInstalled) {
+    BitmapFont.install({
+      name: UNIT_STRENGTH_BITMAP_FONT,
+      style: { fontFamily: "Arial, sans-serif", fontWeight: "900", fontSize: 128, fill: "#ffffff" },
+      chars: "0123456789",
+      resolution: Math.min(window.devicePixelRatio || 1, 2),
+      skipKerning: true
+    });
+    unitStrengthBitmapFontInstalled = true;
+  }
   observer = new ResizeObserver(() => {
     const width = Math.max(1, host.clientWidth);
     const height = Math.max(1, host.clientHeight);
@@ -299,6 +315,8 @@ onBeforeUnmount(() => {
   const instance = app;
   app = undefined;
   if (!instance) return;
+  if (previewRenderFrame !== undefined) cancelAnimationFrame(previewRenderFrame);
+  previewRenderFrame = undefined;
   if (pulseTick) instance.ticker.remove(pulseTick);
   pulseTick = undefined;
   window.removeEventListener("keydown", onBoardZoomShortcut, true);
@@ -399,11 +417,8 @@ function draw(): void {
   app.stage.hitArea = new Rectangle(0, 0, width, height);
   const horizontalUnit = Math.sqrt(3);
   const padding = props.preview ? 14 : 44;
-  // 不强制棋盘的最小游戏尺寸，否则窄屏手机上的棋盘会超出画布并裁掉边缘列。
-  const radius = Math.max(1, Math.min(
-    (width - padding) / (horizontalUnit * (columns + 0.5)),
-    (height - padding) / (1.5 * (rows - 1) + 2)
-  ));
+  // 对局保持固定世界格子尺寸；预览和编辑器先适配画布，再由各自的相机缩放。
+  const radius = getBoardHexRadius(width, height, columns, rows, padding, props.preview ?? false, GAME_BOARD_HEX_RADIUS);
   const boardWidth = horizontalUnit * radius * (columns + 0.5);
   const boardHeight = 2 * radius + 1.5 * radius * (rows - 1);
   const offsetX = (width - boardWidth) / 2 + horizontalUnit * radius / 2;
@@ -604,6 +619,7 @@ function draw(): void {
     unitCellsReused,
     pulsesRebuilt
   });
+  requestPreviewRender();
 }
 
 function getTerrainVisualRevision(): string {
@@ -779,6 +795,16 @@ function applyCamera(width?: number, height?: number): void {
     camera.scale.set(zoom);
     camera.position.set(offsetX, offsetY);
   }
+  requestPreviewRender();
+}
+
+function requestPreviewRender(): void {
+  if (!props.preview || !app || previewRenderFrame !== undefined) return;
+  const instance = app;
+  previewRenderFrame = requestAnimationFrame(() => {
+    previewRenderFrame = undefined;
+    if (app === instance) instance.render();
+  });
 }
 
 /** 兵力数字独立成层，始终显示在地形与棋子图像上方。 */
@@ -797,18 +823,19 @@ function drawUnitStrengthLabels(): void {
     const layout = cellLayouts.get(cell.id);
     if (!unit || !layout) continue;
     const highlighted = props.preview || props.editable || highlightedIds.has(unit.id);
-    const text = new Text({
+    const text = new BitmapText({
       text: String(unit.strength),
       style: {
-        fontFamily: "Arial, sans-serif",
+        fontFamily: UNIT_STRENGTH_BITMAP_FONT,
         fontWeight: "900",
-        fontSize: Math.max(props.preview ? 9 : 10, Math.round(layout.radius * (props.preview
-          ? (poweredUnitIds.has(unit.id) ? 0.52 : 0.46)
-          : (poweredUnitIds.has(unit.id) ? 0.54 : 0.42)))),
-        fill: highlighted ? "#ffffff" : "rgba(255,255,255,.46)",
+        // Keep labels at a stable world size. The shared 128px bitmap atlas is
+        // large enough for camera scaling, so zooming never rebuilds label objects.
+        fontSize: getUnitStrengthFontSize(layout.radius, poweredUnitIds.has(unit.id), props.preview && !props.editable),
+        fill: "#ffffff",
         align: "center"
       }
     });
+    text.alpha = highlighted ? 1 : 0.46;
     text.anchor.set(0.5);
     text.position.set(layout.x, layout.y + layout.radius * 0.02);
     text.eventMode = "none";

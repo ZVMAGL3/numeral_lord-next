@@ -24,6 +24,7 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{ "preview-requested": [id: string] }>();
 const previewElement = ref<HTMLElement>();
+const failedAssetUrls = ref<ReadonlySet<string>>(new Set());
 let previewObserver: IntersectionObserver | undefined;
 let requestedPublicationId: string | undefined;
 
@@ -57,6 +58,7 @@ function observePreviewRequest(): void {
 
 onMounted(observePreviewRequest);
 watch(() => [props.publicationId, props.preview, props.definition], observePreviewRequest);
+watch(() => [props.preview, props.definition], () => { failedAssetUrls.value = new Set(); });
 onBeforeUnmount(() => previewObserver?.disconnect());
 
 const clipPrefix = `workshop-mod-preview-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
@@ -76,7 +78,22 @@ function artworkFor(tile: PreviewTile) {
   const assets = Object.fromEntries(tile.visualAssets.map((asset) => [asset.id, "url" in asset ? asset.url : asset.dataUrl]));
   // Workshop cards showcase the occupied-state appearance, including a
   // whenOccupied frame. The board still resolves this against real occupancy.
-  return resolveTerrainArtwork(tile.visuals, assets, true);
+  const resolved = resolveTerrainArtwork(tile.visuals, assets, true);
+  const baseFailed = resolved.base !== undefined && failedAssetUrls.value.has(resolved.base.src);
+  const overlayFailed = resolved.overlay !== undefined && failedAssetUrls.value.has(resolved.overlay.src);
+  const { base: _base, overlay: _overlay, ...withoutLayers } = resolved;
+  return {
+    ...withoutLayers,
+    ...(!baseFailed && resolved.base ? { base: resolved.base } : {}),
+    ...(!overlayFailed && resolved.overlay ? { overlay: resolved.overlay } : {}),
+    useColorFallback: resolved.useColorFallback || (baseFailed && !tile.visuals?.baseTransparent),
+    fallbackColor: tile.visuals?.baseColor ?? "#475569"
+  };
+}
+
+function markAssetFailed(url: string): void {
+  if (failedAssetUrls.value.has(url)) return;
+  failedAssetUrls.value = new Set([...failedAssetUrls.value, url]);
 }
 
 function layersFor(tile: PreviewTile): readonly PreviewArtLayer[] {
@@ -99,12 +116,12 @@ function layersFor(tile: PreviewTile): readonly PreviewArtLayer[] {
             <polygon :points="artClipPoints" />
           </clipPath>
         </defs>
-        <polygon v-if="artworkFor(terrainPreview).useColorFallback" :points="fallbackHexPoints" :fill="terrainPreview.visuals.baseColor" :fill-opacity="terrainPreview.visuals.baseOpacity ?? (terrainPreview.visuals.baseTransparent ? 0 : 1)" />
+        <polygon v-if="artworkFor(terrainPreview).useColorFallback" :points="fallbackHexPoints" :fill="artworkFor(terrainPreview).fallbackColor" :fill-opacity="terrainPreview.visuals.baseOpacity ?? (terrainPreview.visuals.baseTransparent ? 0 : 1)" />
         <g :clip-path="`url(#${terrainClipId})`">
           <image v-for="(layer, layerIndex) in layersFor(terrainPreview)" :key="`${terrainPreview.terrainId}-${layerIndex}`" :href="layer.src"
             :x="layer.placement.x - layer.placement.width / 2" :y="layer.placement.y - layer.placement.height / 2"
             :width="layer.placement.width" :height="layer.placement.height"
-            :opacity="layer.opacity" preserveAspectRatio="none" />
+            :opacity="layer.opacity" preserveAspectRatio="none" @error="markAssetFailed(layer.src)" />
         </g>
         <polygon v-if="artworkFor(terrainPreview).useColorFallback" :points="fallbackHexPoints"
           fill="none" stroke="#26384c" stroke-width="1.4" stroke-linejoin="round" opacity=".9" />

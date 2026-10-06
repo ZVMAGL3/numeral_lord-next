@@ -9,8 +9,7 @@ export interface TerrainModEntry {
   readonly contentHash?: string;
   readonly description: string;
   readonly terrainId: string;
-  readonly installed: boolean;
-  readonly cached?: boolean;
+  readonly subscribed: boolean;
   readonly author?: string;
   readonly authorName?: string;
   readonly createdAt?: string;

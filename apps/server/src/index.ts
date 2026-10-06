@@ -15,7 +15,6 @@ import type {
   LobbySettings,
   MatchStartPayload,
   MatchConditionCatalog,
-  ModContentLock,
   TerrainCatalog,
   UnitCatalog
 } from "@numeral-lord/game-core/node";
@@ -30,15 +29,16 @@ import {
   saveUploadedTerrainAsset,
   startWorkshopAssetCleanupScheduler,
   WorkshopInputError,
-  WorkshopRoom
+  WorkshopRoom,
+  unavailableTerrainModIds
 } from "./workshop.js";
 import { defaultWorkshopDataDirectory, getTerrainAssetContentType, workshopTerrainAssetDirectory } from "./workshop-assets.js";
 
-/** The relay validates map structure but never installs or executes terrain Mods. */
+/** The relay validates map structure but never bundles or executes terrain Mods. */
 const relayMapCatalogs = {
   terrains: coreTerrainCatalog,
   // Unknown Mod IDs/settings may be transported safely; clients that actually
-  // start a match must have the exact installed releases selected by the host.
+  // start a match load current definitions directly from the Workshop DB.
   allowUnknownTerrainMods: true
 };
 
@@ -64,9 +64,6 @@ interface MutableLobbyMember {
   participating: boolean;
   playerColorId: string | null;
   ready: boolean;
-  installedModIds: readonly string[];
-  installedModVersions: Readonly<Record<string, string>>;
-  installedModContentHashes: Readonly<Record<string, string>>;
   joinOrder: number;
 }
 
@@ -100,10 +97,10 @@ export class PvpRelayRoom extends RelayRoom {
   private mapCode = "";
   private mapName = "";
   private requiredTerrainModIds: readonly string[] = [];
-  private effectiveTerrainModReleases: readonly ModContentLock[] = [];
   private roomModSettings: LobbyModSettings = {};
   private settings: LobbySettings = DEFAULT_LOBBY_SETTINGS;
   private matchStartedAtEpochMs: number | null = null;
+  private startingMatch = false;
   private nextJoinOrder = 0;
   private lastLobbyListingSignature = "";
   private roomCreationMetadata: Record<string, unknown> = {};
@@ -264,46 +261,9 @@ export class PvpRelayRoom extends RelayRoom {
     this.onMessage("lobby-ready", (client, payload: Record<string, unknown> = {}) => {
       const member = this.members.get(client.sessionId);
       if (this.phase !== "lobby" || !member?.participating) return;
-      if (payload.ready === true && this.missingModIds(member).length > 0) {
-        this.sendError(client, `请先安装地图需要的地块 Mod：${this.missingModIds(member).join("、")}`);
-        return;
-      }
-      if (payload.ready === true && this.modVersionMismatchIds().length > 0) {
-        this.sendError(client, `参战玩家的地块 Mod 版本或内容不一致：${this.modVersionMismatchIds().join("、")}。请更新后重新准备。`);
-        return;
-      }
       member.ready = payload.ready === true;
       this.broadcastRoomState();
       this.startWhenReady();
-    });
-    this.onMessage("lobby-installed-mods", (client, payload: Record<string, unknown> = {}) => {
-      if (this.phase !== "lobby") return;
-      const member = this.members.get(client.sessionId);
-      if (!member) return;
-      const ids = parseInstalledModIds(payload.installedModIds);
-      if (!ids) {
-        this.sendError(client, "已安装 Mod 列表格式不正确。");
-        return;
-      }
-      const versions = parseInstalledModVersions(payload.installedModVersions, ids);
-      if (!versions) {
-        this.sendError(client, "已安装地块 Mod 版本列表格式不正确。");
-        return;
-      }
-      const contentHashes = parseInstalledModContentHashes(payload.installedModContentHashes, ids);
-      if (!contentHashes) {
-        this.sendError(client, "已安装地块 Mod 内容指纹格式不正确。");
-        return;
-      }
-      if (sameStringRecord(member.installedModVersions, versions)
-        && sameStringRecord(member.installedModContentHashes, contentHashes)
-        && sameModIds(member.installedModIds, ids)) return;
-      member.installedModIds = ids;
-      member.installedModVersions = versions;
-      member.installedModContentHashes = contentHashes;
-      this.refreshEffectiveTerrainModReleases();
-      this.resetReady();
-      this.broadcastRoomState();
     });
     this.onMessage("lobby-settings", (client, payload: Record<string, unknown> = {}) => {
       if (this.phase !== "lobby" || client.sessionId !== this.hostSessionId) return;
@@ -453,11 +413,7 @@ export class PvpRelayRoom extends RelayRoom {
         seat: member.seat,
         participating: member.participating,
         playerColorId: member.playerColorId,
-        ready: member.ready,
-        installedModIds: member.installedModIds,
-        installedModVersions: member.installedModVersions,
-        installedModContentHashes: member.installedModContentHashes,
-        missingModIds: this.missingModIds(member)
+        ready: member.ready
       }));
     return {
       phase: this.phase,
@@ -465,8 +421,6 @@ export class PvpRelayRoom extends RelayRoom {
       mapName: this.mapName,
       mapPlayerCount: this.mapPlayerCount,
       requiredTerrainModIds: this.requiredTerrainModIds,
-      effectiveTerrainModReleases: this.effectiveTerrainModReleases,
-      modVersionMismatchIds: this.modVersionMismatchIds(),
       roomModSettings: this.roomModSettings,
       settings: this.settings,
       members,
@@ -507,11 +461,7 @@ export class PvpRelayRoom extends RelayRoom {
       seat: member.seat,
       participating: member.participating,
       playerColorId: member.playerColorId,
-      ready: member.ready,
-      installedModIds: member.installedModIds,
-      installedModVersions: member.installedModVersions,
-      installedModContentHashes: member.installedModContentHashes,
-      missingModIds: this.missingModIds(member)
+      ready: member.ready
     };
   }
 
@@ -541,45 +491,10 @@ export class PvpRelayRoom extends RelayRoom {
     void this.setPrivate(noConnectedClients);
   }
 
-  private missingModIds(member: MutableLobbyMember): string[] {
-    const installed = new Set(member.installedModIds);
-    return this.requiredTerrainModIds.filter((id) => !installed.has(id));
-  }
-
-  /** Maps declare dependency IDs only; the elected host supplies their active release. */
-  private refreshEffectiveTerrainModReleases(): void {
-    if (this.phase !== "lobby") return;
-    const host = this.hostSessionId ? this.members.get(this.hostSessionId) : undefined;
-    this.effectiveTerrainModReleases = host
-      ? this.requiredTerrainModIds.flatMap((id) => {
-        const version = host.installedModVersions[id];
-        const contentHash = host.installedModContentHashes[id];
-        return version && contentHash ? [{ id, version, contentHash }] : [];
-      })
-      : [];
-  }
-
-  private modVersionMismatchIds(): string[] {
-    const participants = [...this.members.values()].filter((member) => member.participating);
-    return this.requiredTerrainModIds.filter((modId) => {
-      if (participants.some((member) => !member.installedModIds.includes(modId))) return false;
-      if (participants.some((member) => !member.installedModVersions[modId] || !member.installedModContentHashes[modId])) return true;
-      const hostRelease = this.effectiveTerrainModReleases.find((candidate) => candidate.id === modId);
-      if (hostRelease) return participants.some((member) => member.installedModVersions[modId] !== hostRelease.version
-        || member.installedModContentHashes[modId] !== hostRelease.contentHash);
-      const versions = participants.map((member) => member.installedModVersions[modId]);
-      const hashes = participants.map((member) => member.installedModContentHashes[modId]);
-      return new Set(versions).size > 1 || new Set(hashes).size > 1;
-    });
-  }
-
   override onJoin(client: Client, options: Record<string, unknown> = {}): void {
     super.onJoin(client, options);
     const requestedAccountId = typeof options.accountId === "string" ? options.accountId.trim() : "";
     const requestedName = typeof options.name === "string" ? options.name.trim() : "";
-    const installedModIds = parseInstalledModIds(options.installedModIds) ?? [];
-    const installedModVersions = parseInstalledModVersions(options.installedModVersions, installedModIds) ?? {};
-    const installedModContentHashes = parseInstalledModContentHashes(options.installedModContentHashes, installedModIds) ?? {};
     const previous = requestedAccountId
       ? [...this.members.values()].find((member) => member.accountId === requestedAccountId)
       : undefined;
@@ -600,9 +515,6 @@ export class PvpRelayRoom extends RelayRoom {
       previous.sessionId = client.sessionId;
       previous.displayName = requestedName || previous.displayName;
       previous.connected = true;
-      previous.installedModIds = installedModIds;
-      previous.installedModVersions = installedModVersions;
-      previous.installedModContentHashes = installedModContentHashes;
       if (this.phase === "lobby") this.resetReady();
       this.members.set(client.sessionId, previous);
       // Match-start is retained so a replacement host can rebuild the opening
@@ -634,7 +546,6 @@ export class PvpRelayRoom extends RelayRoom {
         // Until then it cannot submit a new authoritative snapshot.
         this.authoritativeHostSessionId = this.phase === "playing" ? undefined : client.sessionId;
       }
-      this.refreshEffectiveTerrainModReleases();
       this.broadcastRoomState();
       this.broadcast("room-host", { sessionId: this.hostSessionId });
       return;
@@ -655,9 +566,6 @@ export class PvpRelayRoom extends RelayRoom {
       participating: canParticipate,
       playerColorId: canParticipate ? this.firstAvailablePlayerColor() : null,
       ready: false,
-      installedModIds,
-      installedModVersions,
-      installedModContentHashes,
       joinOrder: this.nextJoinOrder++
     };
     console.info("PvP new room member joined", {
@@ -670,7 +578,6 @@ export class PvpRelayRoom extends RelayRoom {
     });
     this.members.set(client.sessionId, member);
     if (!this.hostSessionId) this.hostSessionId = client.sessionId;
-    this.refreshEffectiveTerrainModReleases();
     this.broadcastRoomState();
     this.broadcast("room-host", { sessionId: this.hostSessionId });
   }
@@ -722,7 +629,6 @@ export class PvpRelayRoom extends RelayRoom {
         || left.joinOrder - right.joinOrder)[0];
     this.hostSessionId = successor?.sessionId;
     if (this.phase === "lobby") {
-      this.refreshEffectiveTerrainModReleases();
       this.resetReady();
     }
     this.authoritativeHostSessionId = undefined;
@@ -776,7 +682,6 @@ export class PvpRelayRoom extends RelayRoom {
     this.mapName = selectedMap.name;
     this.mapPlayerCount = selectedMap.players;
     this.requiredTerrainModIds = selectedMap.requiredTerrainModIds;
-    this.refreshEffectiveTerrainModReleases();
     this.roomModSettings = {};
     if (this.settings.randomizePositions) {
       const participants = [...this.members.values()]
@@ -805,7 +710,7 @@ export class PvpRelayRoom extends RelayRoom {
     try {
       // The message replaces the entire room override. This relay has no
       // bundled Mod schemas, so it checks declared IDs and safe JSON values;
-      // each client validates settings against its installed release.
+      // clients load the current definition from the Workshop DB to validate settings.
       this.roomModSettings = validateModSettings(
         rawSettings,
         this.requiredTerrainModIds,
@@ -936,46 +841,70 @@ export class PvpRelayRoom extends RelayRoom {
     this.broadcastRoomState();
   }
 
-  private startWhenReady(): void {
-    if (this.phase !== "lobby") return;
-    let participants = [...this.members.values()]
-      .filter((member) => member.participating);
-    if (participants.length === 0 || participants.length > this.mapPlayerCount
-      || new Set(participants.map((member) => member.playerColorId)).size !== participants.length
-      || this.modVersionMismatchIds().length > 0
-      || participants.some((member) => !member.connected || !member.ready || !member.playerColorId || this.missingModIds(member).length > 0)) return;
+  private async startWhenReady(): Promise<void> {
+    if (this.phase !== "lobby" || this.startingMatch) return;
+    const isReady = (participants: readonly MutableLobbyMember[]): boolean => participants.length > 0
+      && participants.length <= this.mapPlayerCount
+      && new Set(participants.map((member) => member.playerColorId)).size === participants.length
+      && participants.every((member) => member.connected && member.ready && Boolean(member.playerColorId))
+      && (this.settings.randomizePositions || (new Set(participants.map((member) => member.seat)).size === participants.length
+        && participants.every((member) => member.seat !== null)));
+    const initialParticipants = [...this.members.values()].filter((member) => member.participating);
+    if (!isReady(initialParticipants)) return;
+    this.startingMatch = true;
+    try {
+      const availability = this.requiredTerrainModIds.length
+        ? this.getUnavailableServerTerrainModIds(this.requiredTerrainModIds)
+        : [];
+      const missing = Array.isArray(availability) ? availability : await availability;
+      if (this.phase !== "lobby") return;
+      if (missing.length) {
+        const host = this.clients.find((client) => client.sessionId === this.hostSessionId);
+        if (host) this.sendError(host, `服务器数据库中找不到地图需要的地块 Mod：${missing.join("、")}`);
+        return;
+      }
+      let participants = [...this.members.values()].filter((member) => member.participating);
+      if (!isReady(participants)) return;
+      if (this.settings.randomizePositions) {
+        participants = shuffle(participants);
+        const randomizedSeats = shuffle(Array.from({ length: this.mapPlayerCount }, (_, index) => index + 1));
+        participants.forEach((member, index) => { member.seat = randomizedSeats[index]!; });
+      } else {
+        participants.sort((left, right) => (left.seat ?? 0) - (right.seat ?? 0));
+      }
 
-    if (this.settings.randomizePositions) {
-      participants = shuffle(participants);
-      const randomizedSeats = shuffle(Array.from({ length: this.mapPlayerCount }, (_, index) => index + 1));
-      participants.forEach((member, index) => { member.seat = randomizedSeats[index]!; });
-    } else {
-      const seats = new Set(participants.map((member) => member.seat));
-      if (seats.size !== participants.length || [...seats].some((seat) => seat === null)) return;
-      participants.sort((left, right) => (left.seat ?? 0) - (right.seat ?? 0));
+      this.phase = "playing";
+      this.matchStartedAtEpochMs = Date.now();
+      this.authoritativeHostSessionId = this.hostSessionId;
+      this.latestHostSnapshot = undefined;
+      const payload: MatchStartPayload = {
+        mapCode: this.mapCode,
+        settings: this.settings,
+        roomModSettings: this.roomModSettings,
+        startedAtEpochMs: this.matchStartedAtEpochMs,
+        assignments: participants.map((member) => ({
+          sessionId: member.sessionId,
+          seat: member.seat!,
+          playerId: playerIdForSeat(member.seat!),
+          displayName: member.displayName,
+          ...(member.playerColorId ? { playerColorId: member.playerColorId } : {})
+        }))
+      };
+      this.matchStartPayload = payload;
+      this.broadcastRoomState();
+      this.broadcast("match-start", payload);
+    } catch (error) {
+      const host = this.clients.find((client) => client.sessionId === this.hostSessionId);
+      if (host) this.sendError(host, error instanceof Error ? `读取服务器地块 Mod 失败：${error.message}` : "读取服务器地块 Mod 失败。");
+    } finally {
+      this.startingMatch = false;
     }
+  }
 
-    this.phase = "playing";
-    this.matchStartedAtEpochMs = Date.now();
-    this.authoritativeHostSessionId = this.hostSessionId;
-    this.latestHostSnapshot = undefined;
-    const payload: MatchStartPayload = {
-      mapCode: this.mapCode,
-      effectiveTerrainModReleases: this.effectiveTerrainModReleases,
-      settings: this.settings,
-      roomModSettings: this.roomModSettings,
-      startedAtEpochMs: this.matchStartedAtEpochMs,
-      assignments: participants.map((member) => ({
-        sessionId: member.sessionId,
-        seat: member.seat!,
-        playerId: playerIdForSeat(member.seat!),
-        displayName: member.displayName,
-        ...(member.playerColorId ? { playerColorId: member.playerColorId } : {})
-      }))
-    };
-    this.matchStartPayload = payload;
-    this.broadcastRoomState();
-    this.broadcast("match-start", payload);
+  protected getUnavailableServerTerrainModIds(
+    modIds: readonly string[]
+  ): Promise<readonly string[]> | readonly string[] {
+    return unavailableTerrainModIds(modIds);
   }
 
   /** End the current online match for every member, not just the host's local board. */
@@ -985,7 +914,6 @@ export class PvpRelayRoom extends RelayRoom {
     this.latestHostSnapshot = undefined;
     this.matchStartPayload = undefined;
     this.authoritativeHostSessionId = this.hostSessionId;
-    this.refreshEffectiveTerrainModReleases();
     this.lastRoomSyncAtBySession.clear();
     this.resetReady();
     // Random seats were only assigned for the finished match. Participants
@@ -1246,51 +1174,6 @@ function sanitizeRelayedCommand(input: unknown, actorId: string): Record<string,
     default:
       return undefined;
   }
-}
-
-/** Bound and sanitize the client capability declaration used for lobby checks. */
-function parseInstalledModIds(value: unknown): readonly string[] | undefined {
-  if (!Array.isArray(value) || value.length > 64) return undefined;
-  if (!value.every((id) => typeof id === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,79}$/.test(id))) return undefined;
-  return [...new Set(value as string[])];
-}
-
-/** Versions are bounded, inert labels. Missing labels are kept absent so an old client cannot silently pass compatibility checks. */
-function parseInstalledModVersions(value: unknown, installedModIds: readonly string[]): Readonly<Record<string, string>> | undefined {
-  if (value === undefined) return {};
-  if (!isRecord(value) || Object.keys(value).length > 64) return undefined;
-  const installed = new Set(installedModIds);
-  const versions: Record<string, string> = {};
-  for (const [modId, version] of Object.entries(value)) {
-    if (!installed.has(modId) || !/^mod-[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/.test(modId)
-      || typeof version !== "string" || version.length < 1 || version.length > 48
-      || !/^[a-zA-Z0-9][a-zA-Z0-9.+_-]*$/.test(version)) return undefined;
-    versions[modId] = version;
-  }
-  return versions;
-}
-
-function parseInstalledModContentHashes(value: unknown, installedModIds: readonly string[]): Readonly<Record<string, string>> | undefined {
-  if (value === undefined) return {};
-  if (!isRecord(value) || Object.keys(value).length > 64) return undefined;
-  const installed = new Set(installedModIds);
-  const hashes: Record<string, string> = {};
-  for (const [modId, hash] of Object.entries(value)) {
-    if (!installed.has(modId) || !/^mod-[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/.test(modId)
-      || typeof hash !== "string" || !/^sha256:[a-f0-9]{64}$/.test(hash)) return undefined;
-    hashes[modId] = hash;
-  }
-  return hashes;
-}
-
-function sameModIds(left: readonly string[], right: readonly string[]): boolean {
-  return left.length === right.length && left.every((id) => right.includes(id));
-}
-
-function sameStringRecord(left: Readonly<Record<string, string>>, right: Readonly<Record<string, string>>): boolean {
-  const leftEntries = Object.entries(left);
-  return leftEntries.length === Object.keys(right).length
-    && leftEntries.every(([id, version]) => right[id] === version);
 }
 
 /** Keep the cached clock in server time; each delivery receives a fresh stamp. */

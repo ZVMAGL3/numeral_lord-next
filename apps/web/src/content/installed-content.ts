@@ -1,28 +1,27 @@
 import { coreTerrainCatalog, type MapCatalogs } from "@numeral-lord/core-content";
 import { validateTerrainModDefinition, type TerrainModDefinition } from "@numeral-lord/content-schema";
 import type { ModDefinition } from "@numeral-lord/game-sdk";
-import type { ModContentLock, TerrainCatalog } from "@numeral-lord/game-core";
-import { reactive } from "vue";
-import { compareModVersions } from "../workshop/workshop-terrain-catalog.js";
-import { loadInstalledTerrainModObjects, loadInstalledTerrainModReleases, persistInstalledTerrainModObject, terrainModContentHash, type CachedTerrainModRelease } from "./mod-installation";
+import type { TerrainCatalog } from "@numeral-lord/game-core";
+import { reactive, ref } from "vue";
 
-/** Mods are external content: only explicit local installs enter the active catalog. */
-export const installedTerrainMods = reactive<ModDefinition[]>([]);
-/** Immutable cached releases are separate from the active subscription version. */
-export const cachedTerrainModReleases = reactive<CachedTerrainModRelease[]>([]);
+/** Current Mod definitions fetched from the server, kept only in runtime memory. */
+export const loadedTerrainMods = reactive<ModDefinition[]>([]);
 
-export const installedTerrainCatalog = reactive<Record<string, (typeof coreTerrainCatalog)[string]>>({ ...coreTerrainCatalog });
+/** Explicit invalidation token for async Mod definition consumers and map previews. */
+export const loadedTerrainCatalogRevision = ref(0);
 
-export const installedTerrainModIds = reactive<Record<string, string>>({});
+export const loadedTerrainCatalog = reactive<Record<string, (typeof coreTerrainCatalog)[string]>>({ ...coreTerrainCatalog });
 
-const installedModCatalog = reactive<Record<string, ModDefinition>>(
-  Object.fromEntries(installedTerrainMods.map((mod) => [mod.id, mod]))
+export const loadedTerrainModIds = reactive<Record<string, string>>({});
+
+const loadedModCatalog = reactive<Record<string, ModDefinition>>(
+  Object.fromEntries(loadedTerrainMods.map((mod) => [mod.id, mod]))
 );
 
-export const installedMapCatalogs = {
-  terrains: installedTerrainCatalog,
-  terrainModIds: installedTerrainModIds,
-  mods: installedModCatalog
+export const runtimeMapCatalogs = {
+  terrains: loadedTerrainCatalog,
+  terrainModIds: loadedTerrainModIds,
+  mods: loadedModCatalog
 };
 
 export function terrainModDefinitionObject(mod: ModDefinition): TerrainModDefinition {
@@ -48,13 +47,6 @@ export function terrainModDefinitionObject(mod: ModDefinition): TerrainModDefini
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-export function installedTerrainModContentHashes(): Readonly<Record<string, string>> {
-  return Object.fromEntries(installedTerrainMods.map((mod) => [
-    mod.id,
-    terrainModContentHash(terrainModDefinitionObject(mod))
-  ]));
 }
 
 export function terrainVisualAssetsForCatalogs(catalogs: Pick<MapCatalogs, "mods"> | null | undefined): Readonly<Record<string, Readonly<Record<string, string>>>> {
@@ -89,77 +81,34 @@ function runtimeTerrainMod(definition: TerrainModDefinition, name: string): ModD
 }
 
 function registerTerrainModObject(definition: TerrainModDefinition, name: string): void {
-  cacheTerrainModDefinition(definition, name);
-  const current = installedTerrainMods.find((mod) => mod.id === definition.id);
-  if (current) {
-    const versionOrder = compareModVersions(current.version, definition.version);
-    if (versionOrder > 0) return;
-  }
   const runtimeMod = runtimeTerrainMod(definition, name);
-  const previousIndex = installedTerrainMods.findIndex((mod) => mod.id === definition.id);
+  const previousIndex = loadedTerrainMods.findIndex((mod) => mod.id === definition.id);
   if (previousIndex >= 0) {
-    const previousTerrain = installedTerrainMods[previousIndex]!.terrain;
+    const previousTerrain = loadedTerrainMods[previousIndex]!.terrain;
     if (previousTerrain) {
       const terrain = previousTerrain;
-      if (installedTerrainModIds[terrain.id] === definition.id) {
-        delete installedTerrainModIds[terrain.id];
-        delete installedTerrainCatalog[terrain.id];
+      if (loadedTerrainModIds[terrain.id] === definition.id) {
+        delete loadedTerrainModIds[terrain.id];
+        delete loadedTerrainCatalog[terrain.id];
       }
     }
-    installedTerrainMods.splice(previousIndex, 1, runtimeMod);
+    loadedTerrainMods.splice(previousIndex, 1, runtimeMod);
   } else {
-    installedTerrainMods.push(runtimeMod);
+    loadedTerrainMods.push(runtimeMod);
   }
   if (runtimeMod.terrain) {
     const terrain = runtimeMod.terrain;
-    installedTerrainCatalog[terrain.id] = terrain;
-    installedTerrainModIds[terrain.id] = runtimeMod.id;
+    loadedTerrainCatalog[terrain.id] = terrain;
+    loadedTerrainModIds[terrain.id] = runtimeMod.id;
   }
-  installedModCatalog[runtimeMod.id] = runtimeMod;
-}
-
-function cacheTerrainModDefinition(definition: TerrainModDefinition, name: string): void {
-  const hash = terrainModContentHash(definition);
-  const releaseKey = `${definition.id}\u0000${definition.version}\u0000${hash}`;
-  const index = cachedTerrainModReleases.findIndex((candidate) => candidate.releaseKey === releaseKey);
-  const record = { releaseKey, id: definition.id, version: definition.version, contentHash: hash, name, definition };
-  if (index >= 0) cachedTerrainModReleases.splice(index, 1, record);
-  else cachedTerrainModReleases.push(record);
-}
-
-export async function hydrateInstalledTerrainMods(): Promise<void> {
-  const [definitions, releases] = await Promise.all([loadInstalledTerrainModObjects(), loadInstalledTerrainModReleases()]);
-  for (const release of releases) {
-    try {
-      validateTerrainModObject(release.definition);
-      if (release.contentHash !== terrainModContentHash(release.definition)) throw new Error("缓存版本指纹不一致。");
-      cacheTerrainModDefinition(release.definition, release.name);
-    } catch (error) {
-      console.warn("Skipping invalid cached terrain Mod release", release.id, release.version, error);
-    }
-  }
-  for (const { definition, name } of definitions) {
-    try {
-      validateTerrainModObject(definition);
-      registerTerrainModObject(definition, name);
-    } catch (error) {
-      // One damaged record must not prevent the rest of the game/catalog from starting.
-      console.warn("Skipping invalid installed terrain Mod", definition?.id, error);
-    }
-  }
-}
-
-export function cacheInstalledTerrainModRelease(definition: TerrainModDefinition, name: string): void {
-  validateTerrainModObject(definition);
-  cacheTerrainModDefinition(definition, name);
+  loadedModCatalog[runtimeMod.id] = runtimeMod;
+  loadedTerrainCatalogRevision.value += 1;
 }
 
 /**
- * Resolve a map's Mod IDs to active local releases, or to the room host's
- * selected releases when provided. Version identities belong to the room,
- * never to the map code itself.
+ * Resolve a map's Mod IDs to the current server definitions loaded in memory.
  */
-export function resolveMapCatalogs(code: string, roomReleases: readonly ModContentLock[] = []): MapCatalogs | null {
+export function resolveMapCatalogs(code: string): MapCatalogs | null {
   let data: Record<string, unknown>;
   try {
     const decoded: unknown = JSON.parse(code);
@@ -169,10 +118,8 @@ export function resolveMapCatalogs(code: string, roomReleases: readonly ModConte
 
   const declaredIds = Array.isArray(data.requiredTerrainModIds)
     ? data.requiredTerrainModIds.filter((id): id is string => typeof id === "string") : [];
-  const cached = [...cachedTerrainModReleases.map((release) => release.definition),
-    ...installedTerrainMods.map((mod) => terrainModDefinitionObject(mod))];
-  const active = installedTerrainMods.map((mod) => terrainModDefinitionObject(mod));
-  const ownerByTerrain = new Map(cached.map((definition) => [terrainIdForModId(definition.id), definition.id] as const));
+  const active = loadedTerrainMods.map((mod) => terrainModDefinitionObject(mod));
+  const ownerByTerrain = new Map(active.map((definition) => [terrainIdForModId(definition.id), definition.id] as const));
   const legend = typeof data.terrainLegend === "object" && data.terrainLegend !== null && !Array.isArray(data.terrainLegend)
     ? Object.values(data.terrainLegend as Record<string, unknown>).filter((id): id is string => typeof id === "string") : [];
   const inferredIds = legend.flatMap((terrainId) => {
@@ -181,19 +128,9 @@ export function resolveMapCatalogs(code: string, roomReleases: readonly ModConte
     return owner ? [owner.startsWith("mod-") ? owner : `mod-${owner}`] : [];
   });
   const requiredIds = [...new Set([...declaredIds, ...inferredIds])];
-  const selectedRoomReleases = new Map(roomReleases.map((release) => [release.id, release]));
   const selectedMods: TerrainModDefinition[] = [];
   for (const id of requiredIds) {
-    const roomRelease = selectedRoomReleases.get(id);
-    const source = roomRelease ? cached : active;
-    const matching = source.filter((definition) => definition.id === id
-      && (!roomRelease || (definition.version === roomRelease.version
-        && terrainModContentHash(definition) === roomRelease.contentHash)));
-    // Room members must use the host's exact release. Outside a room, maps
-    // follow the browser's active installation and ignore legacy map locks.
-    if (roomRelease && matching.length === 0) continue;
-    matching.sort((left, right) => compareModVersions(right.version, left.version));
-    const selected = matching[0];
+    const selected = active.find((definition) => definition.id === id);
     if (selected) selectedMods.push(selected);
   }
 
@@ -201,10 +138,8 @@ export function resolveMapCatalogs(code: string, roomReleases: readonly ModConte
   const terrainModIds: Record<string, string> = {};
   const mods: Record<string, ModDefinition> = {};
   for (const definition of selectedMods) {
-    const cachedName = cachedTerrainModReleases.find((release) => release.id === definition.id
-      && release.version === definition.version && release.contentHash === terrainModContentHash(definition))?.name;
-    const name = installedTerrainMods.find((mod) => mod.id === definition.id && mod.version === definition.version)?.terrain?.displayName
-      ?? cachedName ?? defaultTerrainDisplayName(definition.id);
+    const name = loadedTerrainMods.find((mod) => mod.id === definition.id)?.terrain?.displayName
+      ?? defaultTerrainDisplayName(definition.id);
     const runtime = runtimeTerrainMod(definition, name);
     mods[definition.id] = runtime;
     if (runtime.terrain) {
@@ -220,29 +155,24 @@ export function validateTerrainModObject(definition: TerrainModDefinition): void
   validateTerrainModDefinition(definition);
 }
 
-/** Register an already-persisted definition without writing IndexedDB a second time. */
-export function registerInstalledTerrainModObject(definition: TerrainModDefinition, name: string): void {
+/** Register a server-fetched definition in memory for current map/game use. */
+export function registerServerTerrainModDefinition(definition: TerrainModDefinition, name: string): void {
   validateTerrainModObject(definition);
   registerTerrainModObject(definition, name);
 }
 
-export async function installTerrainModObject(definition: TerrainModDefinition, name: string): Promise<void> {
-  validateTerrainModObject(definition);
-  await persistInstalledTerrainModObject(definition, name);
-  registerTerrainModObject(definition, name);
-}
-
-export function uninstallTerrainModObject(modId: string): void {
-  const index = installedTerrainMods.findIndex((mod) => mod.id === modId);
+export function unloadServerTerrainMod(modId: string): void {
+  const index = loadedTerrainMods.findIndex((mod) => mod.id === modId);
   if (index < 0) return;
-  const [removed] = installedTerrainMods.splice(index, 1);
+  const [removed] = loadedTerrainMods.splice(index, 1);
   if (!removed) return;
   const terrain = removed.terrain;
   if (terrain) {
-    if (installedTerrainModIds[terrain.id] === modId) {
-      delete installedTerrainModIds[terrain.id];
-      delete installedTerrainCatalog[terrain.id];
+    if (loadedTerrainModIds[terrain.id] === modId) {
+      delete loadedTerrainModIds[terrain.id];
+      delete loadedTerrainCatalog[terrain.id];
     }
   }
-  delete installedModCatalog[modId];
+  delete loadedModCatalog[modId];
+  loadedTerrainCatalogRevision.value += 1;
 }

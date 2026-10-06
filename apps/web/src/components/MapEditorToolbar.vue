@@ -100,10 +100,10 @@ onBeforeUnmount(() => {
     </div>
 
     <template v-else>
-      <div v-if="mode === 'unit'" class="toolbar-choice unit-choice">
-        <button class="choice-trigger" type="button" aria-label="选择单位位置或类型" aria-haspopup="listbox" :aria-expanded="unitPickerOpen" @click="unitPickerOpen = !unitPickerOpen">
+      <div class="toolbar-choice unit-choice">
+        <button class="choice-trigger" :class="{ 'player-choice-trigger': !!selectedPlayer }" type="button" :aria-label="`选择单位，当前：${selectedUnitName}`" :title="selectedUnitName" aria-haspopup="listbox" :aria-expanded="unitPickerOpen" @click="unitPickerOpen = !unitPickerOpen">
           <MapEditorUnitIcon :kind="selectedUnitKind" :color="selectedPlayer?.color ?? '#668fb8'" :size="22" />
-          <span class="choice-name">{{ selectedUnitName }}</span><span class="picker-chevron">⌃</span>
+          <span v-if="!selectedPlayer" class="choice-name">{{ selectedUnitName }}</span><span v-if="!selectedPlayer" class="picker-chevron" aria-hidden="true">⌃</span>
         </button>
         <div v-if="unitPickerOpen" class="choice-popover unit-popover" role="listbox" aria-label="玩家位置和单位类型">
           <button v-for="option in playerOptions" :key="option.seat" type="button" role="option" :aria-selected="unitPreset === `player:${option.seat}`" @click="selectUnit(`player:${option.seat}`)">
@@ -118,9 +118,8 @@ onBeforeUnmount(() => {
         aria-label="擦除单位" title="擦除单位" @click="toggleErase">×</button>
     </template>
 
-    <label v-if="mode !== 'erase'" class="range-control" aria-label="填充范围">
-      <span>范围</span>
-      <select :value="fillRadius" @change="emit('update:fillRadius', Number(($event.target as HTMLSelectElement).value))">
+    <label v-if="mode !== 'terrain'" class="range-control">
+      <select aria-label="填充范围" :value="fillRadius" @change="emit('update:fillRadius', Number(($event.target as HTMLSelectElement).value))">
         <option :value="0">1 格</option>
         <option :value="1">7 格</option>
         <option :value="2">19 格</option>
@@ -128,7 +127,7 @@ onBeforeUnmount(() => {
       </select>
     </label>
 
-    <div v-if="mode === 'unit'" class="strength-control" aria-label="单位点数">
+    <div v-if="mode !== 'terrain'" class="strength-control" aria-label="单位点数">
       <NumberStepper :model-value="strength" :min="1" :max="65535" aria-label="放置点数" size="compact" @update:model-value="emit('update:strength', $event)" />
     </div>
   </div>
@@ -160,6 +159,9 @@ onBeforeUnmount(() => {
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 @media(max-width:720px){.map-editor-toolbar{right:8px;bottom:8px;left:8px;flex-wrap:wrap;justify-content:center;width:auto;max-width:none;gap:5px;padding:6px;transform:none}.map-editor-toolbar select{min-height:33px;max-width:130px;padding:5px 20px 5px 7px;font-size:11px}.mode-control select{min-width:64px}.choice-control i{width:16px;height:16px}.terrain-control select{min-width:86px;max-width:115px}.unit-control select{min-width:96px;max-width:120px}.range-control{gap:3px;padding-left:4px}.range-control select{min-width:56px}.strength-control{gap:2px;padding-left:4px}.strength-control .number-stepper{width:98px}.erase-button{width:33px;min-height:33px}}
 @media(max-width:720px){.terrain-trigger{min-width:100px;padding:3px 6px!important}.terrain-options{width:min(190px,calc(100vw - 20px));max-height:min(45dvh,320px)}.terrain-options button{min-height:36px}}
-.toolbar-choice{position:relative;display:flex;align-items:center}.choice-trigger{display:flex;align-items:center;justify-content:flex-start;gap:8px;min-width:118px;height:36px;margin:0;padding:4px 8px;border:1px solid rgba(143,188,206,.25);border-radius:7px;color:#e4edf4;background:#090d13;font-size:12px;white-space:nowrap}.choice-name{flex:1;min-width:0;max-width:132px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.choice-popover{position:absolute;z-index:10;bottom:calc(100% + 9px);left:0;display:grid;gap:3px;width:220px;max-height:min(48dvh,390px);box-sizing:border-box;overflow:auto;padding:6px;border:1px solid rgba(143,188,206,.28);border-radius:9px;background:#0a121d;box-shadow:0 12px 32px rgba(0,0,0,.55)}.choice-popover button{display:flex;align-items:center;gap:9px;min-height:39px;margin:0;padding:4px 8px;border:0;border-radius:5px;color:#dbe8f0;background:transparent;text-align:left;font-size:11px}.choice-popover button:hover,.choice-popover button[aria-selected="true"]{background:#17364a;color:#fff}.choice-popover button>span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.choice-popover small{margin-left:auto;color:#80c9c5;font-size:9px}.choice-divider{height:1px;margin:3px 5px;background:rgba(143,188,206,.16)}
+.toolbar-choice{position:relative;display:flex;align-items:center}.choice-trigger{display:flex;align-items:center;justify-content:flex-start;gap:8px;min-width:64px;height:36px;margin:0;padding:4px 8px;border:1px solid rgba(143,188,206,.25);border-radius:7px;color:#e4edf4;background:#090d13;font-size:12px;white-space:nowrap}.choice-trigger:not(.player-choice-trigger){min-width:118px}.choice-name{flex:1;min-width:0;max-width:132px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.choice-popover{position:absolute;z-index:10;bottom:calc(100% + 9px);left:0;display:grid;gap:3px;width:220px;max-height:min(48dvh,390px);box-sizing:border-box;overflow:auto;padding:6px;border:1px solid rgba(143,188,206,.28);border-radius:9px;background:#0a121d;box-shadow:0 12px 32px rgba(0,0,0,.55)}.choice-popover button{display:flex;align-items:center;gap:9px;min-height:39px;margin:0;padding:4px 8px;border:0;border-radius:5px;color:#dbe8f0;background:transparent;text-align:left;font-size:11px}.choice-popover button:hover,.choice-popover button[aria-selected="true"]{background:#17364a;color:#fff}.choice-popover button>span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.choice-popover small{margin-left:auto;color:#80c9c5;font-size:9px}.choice-divider{height:1px;margin:3px 5px;background:rgba(143,188,206,.16)}
 @media(max-width:720px){.choice-trigger{min-width:92px;height:33px;padding:4px 6px;font-size:10px}.choice-popover{width:min(220px,calc(100vw - 24px));max-height:min(42dvh,320px)}}
+.choice-trigger.player-choice-trigger{width:max-content;min-width:0;gap:0}
+@media(max-width:720px){.map-editor-toolbar{flex-wrap:nowrap;justify-content:flex-start}.map-editor-toolbar>*{flex:0 0 auto}.choice-trigger.player-choice-trigger{min-width:0;gap:0;padding-right:5px;padding-left:5px}.range-control{gap:0;padding-left:4px}.range-control select{min-width:56px}.strength-control .number-stepper{width:88px}}
+@media(max-width:380px){.map-editor-toolbar{gap:4px;padding:5px}.mode-control select{min-width:56px}.choice-trigger:not(.player-choice-trigger){min-width:72px}.choice-trigger.player-choice-trigger{min-width:0;gap:0;padding-right:4px;padding-left:4px}.erase-button{width:30px;min-height:32px}.range-control select{min-width:50px;padding-right:16px;padding-left:5px}.strength-control .number-stepper{width:78px}}
 </style>

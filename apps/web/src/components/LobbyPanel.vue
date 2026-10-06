@@ -3,9 +3,8 @@ import { computed, nextTick, ref } from "vue";
 import type { GameState, LobbyMember, LobbyModSettings, LobbyRoomState, TerrainCatalog, UnitId } from "@numeral-lord/game-core";
 import { getPlayerColorSprite, getPoweredUnitIds, PLAYER_COLOR_OPTIONS } from "@numeral-lord/game-core";
 import { createMatchFromMapCode, parseMapCode } from "@numeral-lord/core-content";
-import { compareModVersions } from "../workshop/workshop-terrain-catalog";
 import { missingTerrainMods, type ConfiguredMap } from "../maps/map-library";
-import { installedMapCatalogs, installedTerrainCatalog, installedTerrainMods, resolveMapCatalogs, terrainVisualAssetsForCatalogs } from "../content/installed-content";
+import { runtimeMapCatalogs, loadedTerrainCatalog, loadedTerrainCatalogRevision, loadedTerrainMods, resolveMapCatalogs, terrainVisualAssetsForCatalogs } from "../content/installed-content";
 import HexBoard from "./HexBoard.vue";
 import NumberStepper from "./NumberStepper.vue";
 
@@ -57,39 +56,40 @@ const emit = defineEmits<{
 const me = computed(() => props.room.members.find((member) => member.sessionId === props.selfSessionId));
 const amHost = computed(() => Boolean(me.value?.isHost));
 const participants = computed(() => props.room.members.filter((member) => member.participating));
-const hasModVersionMismatch = computed(() => props.room.modVersionMismatchIds.length > 0);
 const mapOptions = computed(() => {
   if (props.availableMaps.some((map) => map.code === props.room.mapCode)) return props.availableMaps;
   try {
-    return [{ code: props.room.mapCode, definition: parseMapCode(props.room.mapCode, { ...installedMapCatalogs, allowUnknownTerrainMods: true }), isDefault: false }, ...props.availableMaps];
+    return [{ code: props.room.mapCode, definition: parseMapCode(props.room.mapCode, { ...runtimeMapCatalogs, allowUnknownTerrainMods: true }), isDefault: false }, ...props.availableMaps];
   } catch {
     return props.availableMaps;
   }
 });
 const selectedMapIndex = computed(() => mapOptions.value.findIndex((map) => map.code === props.room.mapCode));
 const selectedMapDefinition = computed(() => mapOptions.value[selectedMapIndex.value]?.definition);
-const mapOptionPreviews = computed(() => new Map(mapOptions.value.flatMap((map) => {
-  try {
-    const catalogs = resolveMapCatalogs(map.code);
-    if (!catalogs) return [];
-    const state = createMatchFromMapCode(map.code, catalogs);
-    const terrainCatalog = catalogs.terrains ?? installedTerrainCatalog;
-    return [[map.code, {
-      state,
-      poweredUnitIds: [...getPoweredUnitIds(state, terrainCatalog)],
-      terrainCatalog,
-      terrainVisualAssets: terrainVisualAssetsForCatalogs(catalogs)
-    }] as const];
-  } catch {
-    return [];
-  }
-})));
+const mapOptionPreviews = computed(() => {
+  void loadedTerrainCatalogRevision.value;
+  return new Map(mapOptions.value.flatMap((map) => {
+    try {
+      const catalogs = resolveMapCatalogs(map.code);
+      if (!catalogs) return [];
+      const state = createMatchFromMapCode(map.code, catalogs);
+      const terrainCatalog = catalogs.terrains ?? loadedTerrainCatalog;
+      return [[map.code, {
+        state,
+        poweredUnitIds: [...getPoweredUnitIds(state, terrainCatalog)],
+        terrainCatalog,
+        terrainVisualAssets: terrainVisualAssetsForCatalogs(catalogs)
+      }] as const];
+    } catch {
+      return [];
+    }
+  }));
+});
 const requiredMods = computed(() => props.room.requiredTerrainModIds.map((id) => ({
   id,
-  definition: (installedTerrainMods as readonly InstalledMod[]).find((mod) => mod.id === id)
+  definition: (loadedTerrainMods as readonly InstalledMod[]).find((mod) => mod.id === id)
 })));
-const myMissingModIds = computed(() => me.value?.missingModIds ?? []);
-const cannotPrepare = computed(() => myMissingModIds.value.length > 0 || hasModVersionMismatch.value || props.subscribedUpdatesPending);
+const cannotPrepare = computed(() => props.subscribedUpdatesPending);
 const maximumTurnSeconds = computed(() => props.room.settings.matchTimeMinutes === 0
   ? 300
   : Math.min(300, props.room.settings.matchTimeMinutes * 60));
@@ -101,13 +101,9 @@ const mapPreviewModalOpen = ref(false);
 const openColorPickerSessionId = ref<string | null>(null);
 const openSeatPickerSessionId = ref<string | null>(null);
 const activeTab = ref<"players" | "settings" | "mods">("players");
-const readyActionLabel = computed(() => myMissingModIds.value.length
-  ? "缺少地块 Mod，暂不能准备"
-  : hasModVersionMismatch.value
-    ? "Mod 内容不一致，暂不能准备"
-    : props.subscribedUpdatesPending
-      ? "正在同步已订阅的 Mod…"
-      : me.value?.ready ? "取消准备" : "准备");
+const readyActionLabel = computed(() => props.subscribedUpdatesPending
+  ? "正在从服务器加载地块…"
+  : me.value?.ready ? "取消准备" : "准备");
 const openSeats = computed(() => {
   const totalSeats = Math.max(0, Math.floor(props.room.mapPlayerCount));
   if (props.room.settings.randomizePositions) {
@@ -216,8 +212,6 @@ function seatLabel(member: LobbyMember): string {
 function memberStatusLabel(member: LobbyMember): string {
   if (!member.connected) return "离线";
   if (!member.participating) return "观战";
-  if (member.missingModIds.length > 0) return "缺少 Mod";
-  if (mismatchedModIdsFor(member).length > 0) return "Mod 内容不一致";
   return member.ready ? "已准备" : "未准备";
 }
 
@@ -246,27 +240,6 @@ function memberRoleOptions(member: LobbyMember): { value: string; label: string;
 
 function memberRoleLabel(member: LobbyMember): string {
   return memberRoleOptions(member).find((option) => option.value === memberRoleValue(member))?.label ?? seatLabel(member);
-}
-
-function newestParticipantModVersion(modId: string): string | undefined {
-  return participants.value
-    .map((member) => member.installedModVersions?.[modId])
-    .filter((version): version is string => Boolean(version))
-    .reduce<string | undefined>((newest, version) => !newest || compareModVersions(version, newest) > 0 ? version : newest, undefined);
-}
-
-function mismatchedModIdsFor(member: LobbyMember): string[] {
-  if (!member.participating) return [];
-  return props.room.modVersionMismatchIds.filter((modId) => {
-    if (member.missingModIds.includes(modId)) return false;
-    const version = member.installedModVersions?.[modId];
-    const newest = newestParticipantModVersion(modId);
-    return !version || !newest || compareModVersions(version, newest) < 0;
-  });
-}
-
-function displayedModVersion(member: LobbyMember, modId: string): string {
-  return member.installedModVersions?.[modId] ? `v${member.installedModVersions[modId]}` : "版本未知";
 }
 
 function colorIsOccupied(playerColorId: string, exceptSessionId: string): boolean {
@@ -439,25 +412,6 @@ function onModIntegerSettingChange(modId: string, setting: ModSetting, value: nu
               <div>
                 <strong>{{ member.displayName }}</strong>
                 <small><b v-if="member.isHost">房主 · </b>{{ seatLabel(member) }}</small>
-                <div v-if="member.missingModIds.length" class="member-missing-mods">
-                  <small class="missing-mod-note">缺少地块 Mod</small>
-                  <template v-for="modId in member.missingModIds" :key="modId">
-                    <button v-if="member.sessionId === selfSessionId" type="button" class="install-missing-mod" :title="`在当前设备打开「${modId}」的安装页`" @click="emit('open-workshop-mod', modId)">安装 {{ modId }}</button>
-                    <small v-else class="peer-mod-status">{{ modId }}</small>
-                  </template>
-                </div>
-                <div v-if="mismatchedModIdsFor(member).length" class="member-version-mismatch">
-                  <small v-for="modId in mismatchedModIdsFor(member)" :key="modId" class="version-mismatch-note">{{ modId }} · {{ displayedModVersion(member, modId) }}</small>
-                  <template v-for="modId in mismatchedModIdsFor(member)" :key="`update-${modId}`">
-                    <button
-                      v-if="member.sessionId === selfSessionId"
-                      type="button"
-                      class="quick-update-mod"
-                      :disabled="updatingModId === modId"
-                      @click="emit('update-mod', modId)"
-                    >{{ updatingModId === modId ? "更新中…" : "快速更新" }}</button>
-                  </template>
-                </div>
               </div>
             </div>
 
@@ -529,7 +483,7 @@ function onModIntegerSettingChange(modId: string, setting: ModSetting, value: nu
 
             <span
               class="ready-state"
-              :class="{ ready: member.ready, warning: member.missingModIds.length > 0 || mismatchedModIdsFor(member).length > 0, offline: !member.connected, spectator: !member.participating }"
+              :class="{ ready: member.ready, offline: !member.connected, spectator: !member.participating }"
               role="img"
               :aria-label="memberStatusLabel(member)"
               :title="memberStatusLabel(member)"
@@ -541,10 +495,8 @@ function onModIntegerSettingChange(modId: string, setting: ModSetting, value: nu
             <span class="open-seat-state">可加入</span>
           </article>
         </div>
-        <p class="dependency-scope-note">工坊安装只作用于当前设备；其他成员需要在自己的设备安装对应 Mod。</p>
-        <p v-if="me?.participating && myMissingModIds.length" class="dependency-warning">此设备缺少 {{ myMissingModIds.join("、") }}。安装所需地块 Mod 并重新进入房间后才能参战。</p>
-        <p v-else-if="me?.participating && hasModVersionMismatch" class="dependency-warning">参战玩家使用的 {{ room.modVersionMismatchIds.join("、") }} 版本或内容不一致。请更新后重试；一致后全体玩家需要重新准备。</p>
-        <p v-if="subscribedUpdatesPending" class="dependency-warning">正在检查并下载已订阅 Mod 的更新，完成后再准备，避免新旧地块外观不一致。</p>
+        <p class="dependency-scope-note">地图所需地块由服务器数据库统一提供；是否订阅不影响开局或加入房间。</p>
+        <p v-if="subscribedUpdatesPending" class="dependency-warning">正在从服务器加载对局所需地块…</p>
         <p v-if="modUpdateMessage" class="mod-update-message" role="status">{{ modUpdateMessage }}</p>
         <p v-if="!me?.participating" class="spectator-note">你当前在观战位。切换到可用玩家位（随机模式为“参战”）后才能准备。</p>
         <div v-if="me?.participating" class="member-actions">
@@ -591,9 +543,9 @@ function onModIntegerSettingChange(modId: string, setting: ModSetting, value: nu
         <div v-for="item in requiredMods" :key="item.id" class="mod-group">
           <div class="mod-group-heading">
             <div><strong>{{ modDisplayName(item.definition, item.id) }}</strong><code>{{ item.id }}</code></div>
-            <span :class="item.definition ? 'mod-installed' : 'mod-missing'">{{ item.definition ? "本机已安装" : "本机缺失" }}</span>
+            <span :class="item.definition ? 'mod-installed' : 'mod-missing'">{{ item.definition ? "服务器已加载" : "等待服务器加载" }}</span>
           </div>
-          <p v-if="!item.definition" class="mod-description">此浏览器无法运行这个地块 Mod；参战成员必须安装后才能准备。</p>
+          <p v-if="!item.definition" class="mod-description">正在按地图中的 Mod ID 从服务器数据库读取当前定义。</p>
           <p v-else-if="!item.definition.settings?.length" class="mod-description">该 Mod 没有可调整的公开参数。</p>
           <div v-for="setting in item.definition?.settings ?? []" :key="setting.id" class="mod-setting-row">
             <div class="mod-setting-copy">
@@ -689,7 +641,7 @@ function onModIntegerSettingChange(modId: string, setting: ModSetting, value: nu
                       :terrain-catalog="mapOptionPreview(map)!.terrainCatalog"
                       :terrain-visual-assets="mapOptionPreview(map)!.terrainVisualAssets"
                     />
-                    <span v-else class="map-picker-no-preview">安装所需 Mod 后可预览</span>
+                    <span v-else class="map-picker-no-preview">正在从服务器加载地图地块</span>
                   </span>
                   <span class="map-picker-option-copy">
                     <strong>{{ map.definition.name }}</strong>

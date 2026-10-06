@@ -107,6 +107,8 @@ export interface WorkshopTerrainModSummary {
   readonly terrainId: string;
   /** Hash of the immutable, playable release content. */
   readonly contentHash?: string;
+  /** URLs and color fallback are included in the catalog so artwork is available on first render. */
+  readonly preview?: TerrainModVisualPreview;
 }
 
 export interface TerrainModVisualPreview {
@@ -161,4 +163,27 @@ export interface WorkshopPublished {
 
 export interface WorkshopError {
   readonly message: string;
+}
+
+/** A player's private map, stored by server-side workshop user ID. */
+export interface WorkshopPersonalMap {
+  readonly mapId: string;
+  readonly code: string;
+  readonly updatedAt: string;
+}
+
+export type WorkshopPersonalMapOperation =
+  | { readonly operationId: string; readonly type: "upsert"; readonly mapId: string; readonly code: string }
+  | { readonly operationId: string; readonly type: "delete"; readonly mapId: string };
+
+/** Local cache is imported only when the account has not synced before; queued edits always apply. */
+export interface WorkshopPersonalMapSyncRequest {
+  readonly cachedMaps: readonly Pick<WorkshopPersonalMap, "mapId" | "code">[];
+  readonly operations: readonly WorkshopPersonalMapOperation[];
+}
+
+export interface WorkshopPersonalMapsPayload {
+  readonly userId: string;
+  readonly maps: readonly WorkshopPersonalMap[];
+  readonly acknowledgedOperationIds: readonly string[];
 }

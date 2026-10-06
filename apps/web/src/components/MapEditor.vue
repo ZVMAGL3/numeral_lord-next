@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import type { MapDefinition } from "@numeral-lord/core-content";
 import { getPoweredUnitIds, fromCellId, PLAYER_COLOR_OPTIONS, type CellId } from "@numeral-lord/game-core";
 import { createMatchFromMapDefinition } from "@numeral-lord/core-content";
@@ -7,7 +7,7 @@ import HexBoard from "./HexBoard.vue";
 import MapEditorToolbar from "./MapEditorToolbar.vue";
 import NumberStepper from "./NumberStepper.vue";
 import { getMapCellRangeIndices } from "../maps/map-cell-range";
-import { clampMapEditorPan, clampMapEditorZoom, getMapEditorMaxZoom } from "../maps/map-editor-pan";
+import { clampMapEditorPan, clampMapEditorZoom, getMapEditorMaxZoom, zoomMapEditorCameraAtPoints } from "../maps/map-editor-pan";
 import { getBoardHexRadius } from "../board/board-layout.js";
 import { changeSeatColor } from "../maps/map-player-colors";
 import { runtimeMapCatalogs, loadedTerrainMods, resolveMapCatalogs, terrainVisualAssetsForCatalogs } from "../content/installed-content";
@@ -153,6 +153,8 @@ onMounted(() => {
   constrainEditorPan();
 });
 onBeforeUnmount(() => {
+  if (previewStateFrame !== undefined) cancelAnimationFrame(previewStateFrame);
+  previewStateFrame = undefined;
   workspaceResizeObserver?.disconnect();
   editorViewportMetrics = undefined;
 });
@@ -281,7 +283,15 @@ const editorCatalogs = computed(() => {
   return { terrains, terrainModIds, mods };
 });
 const editorTerrainVisualAssets = computed(() => terrainVisualAssetsForCatalogs(editorCatalogs.value));
-const previewState = computed(() => createMatchFromMapDefinition(previewDefinition.value, editorCatalogs.value));
+const previewState = shallowRef(createMatchFromMapDefinition(previewDefinition.value, editorCatalogs.value));
+let previewStateFrame: number | undefined;
+watch([previewDefinition, editorCatalogs], () => {
+  if (previewStateFrame !== undefined) cancelAnimationFrame(previewStateFrame);
+  previewStateFrame = requestAnimationFrame(() => {
+    previewStateFrame = undefined;
+    previewState.value = createMatchFromMapDefinition(previewDefinition.value, editorCatalogs.value);
+  });
+}, { flush: "post" });
 const playerOptions = computed(() => Array.from({ length: players.value }, (_, index) => ({
   seat: index + 1,
   name: playerNames.value[index]?.trim() || `玩家 ${index + 1}`,
@@ -362,8 +372,10 @@ function onEditorPointerDown(event: PointerEvent): void {
   if (editorPointers.size === 1) editorDrag = { x: event.clientX, y: event.clientY, panX: editorPan.value.x, panY: editorPan.value.y };
   else if (editorPointers.size === 2) {
     const [a, b] = [...editorPointers.values()];
-    if (a && b) editorPinch = { distance: Math.hypot(a.x - b.x, a.y - b.y), zoom: editorZoom.value,
-      x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, panX: editorPan.value.x, panY: editorPan.value.y };
+    const bounds = editorBoard.value?.getBoundingClientRect();
+    if (a && b && bounds) editorPinch = { distance: Math.hypot(a.x - b.x, a.y - b.y), zoom: editorZoom.value,
+      x: (a.x + b.x) / 2 - bounds.left, y: (a.y + b.y) / 2 - bounds.top,
+      panX: editorPan.value.x, panY: editorPan.value.y };
     editorDrag = undefined;
   }
 }
@@ -377,9 +389,21 @@ function onEditorPointerMove(event: PointerEvent): void {
   const points = [...editorPointers.values()];
   if (points.length > 1 && editorPinch) {
     const [a, b] = points;
-    if (a && b) {
-      if (editorPinch.distance > 0) editorZoom.value = clampMapEditorZoom(editorPinch.zoom * Math.hypot(a.x - b.x, a.y - b.y) / editorPinch.distance, editorZoomLimit.value);
-      editorPan.value = { x: editorPinch.panX + (a.x + b.x) / 2 - editorPinch.x, y: editorPinch.panY + (a.y + b.y) / 2 - editorPinch.y };
+    const host = editorBoard.value;
+    const bounds = host?.getBoundingClientRect();
+    if (a && b && bounds && bounds.width > 0 && bounds.height > 0) {
+      const midpoint = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      const anchorBefore = { x: editorPinch.x, y: editorPinch.y };
+      const anchorAfter = { x: midpoint.x - bounds.left, y: midpoint.y - bounds.top };
+      const zoom = editorPinch.distance > 0
+        ? clampMapEditorZoom(editorPinch.zoom * Math.hypot(a.x - b.x, a.y - b.y) / editorPinch.distance, editorZoomLimit.value)
+        : editorPinch.zoom;
+      const camera = zoomMapEditorCameraAtPoints(
+        { zoom: editorPinch.zoom, pan: { x: editorPinch.panX, y: editorPinch.panY } },
+        { width: bounds.width, height: bounds.height }, anchorBefore, anchorAfter, zoom
+      );
+      editorZoom.value = camera.zoom;
+      editorPan.value = camera.pan;
       constrainEditorPan();
     }
     editorDraggingAt = performance.now();
@@ -405,7 +429,17 @@ function onEditorPointerUp(event: PointerEvent): void {
   editorDrag = point ? { x: point.x, y: point.y, panX: editorPan.value.x, panY: editorPan.value.y } : undefined;
 }
 function onEditorWheel(event: WheelEvent): void {
-  editorZoom.value = clampMapEditorZoom(editorZoom.value * (event.deltaY < 0 ? 1.1 : .91), editorZoomLimit.value);
+  const host = editorBoard.value;
+  const bounds = host?.getBoundingClientRect();
+  if (!bounds || bounds.width < 1 || bounds.height < 1) return;
+  const anchor = { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+  const zoom = clampMapEditorZoom(editorZoom.value * (event.deltaY < 0 ? 1.1 : .91), editorZoomLimit.value);
+  const camera = zoomMapEditorCameraAtPoints(
+    { zoom: editorZoom.value, pan: editorPan.value },
+    { width: bounds.width, height: bounds.height }, anchor, anchor, zoom
+  );
+  editorZoom.value = camera.zoom;
+  editorPan.value = camera.pan;
   constrainEditorPan();
 }
 function saveMap(): void {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { getPoweredUnitIds, type GameState, type UnitId } from "@numeral-lord/game-core";
 import { createMatchFromMapCode, parseMapCode, type MapDefinition } from "@numeral-lord/core-content";
@@ -27,6 +27,8 @@ const editingDefinition = ref<MapDefinition | null>(null);
 const newDraftAvailable = ref(false);
 const EDITOR_DRAFT_KEY = "numeral-lord.map-editor-draft.v1";
 const draftCatalogs = { ...runtimeMapCatalogs, allowUnknownTerrainMods: true };
+let pendingEditorDraft: { readonly mapId: string; readonly definition: MapDefinition } | undefined;
+let editorDraftFlushTimer: number | undefined;
 const selected = computed(() => props.maps.find((map) => map.definition.id === props.selectedId) ?? props.maps[0]);
 const MAP_PAGE_SIZE = 12;
 const mapPage = ref(1);
@@ -51,6 +53,11 @@ function readEditorDraft(mapId: string): MapDefinition | null {
   }
 }
 function clearEditorDraft(mapId: string): void {
+  if (pendingEditorDraft?.mapId === mapId) {
+    pendingEditorDraft = undefined;
+    if (editorDraftFlushTimer !== undefined) clearTimeout(editorDraftFlushTimer);
+    editorDraftFlushTimer = undefined;
+  }
   try { clearMapEditorDraft(localStorage, mapId, EDITOR_DRAFT_KEY); }
   catch { /* Storage may be disabled; cancellation must still navigate away. */ }
   newDraftAvailable.value = Boolean(readEditorDraft("new"));
@@ -138,13 +145,28 @@ function startEdit(): void {
 function saveEditorDraft(definition: MapDefinition): void {
   const mapId = typeof route.params.mapId === "string" ? route.params.mapId : "";
   if (!mapId) return;
+  pendingEditorDraft = { mapId, definition };
+  if (editorDraftFlushTimer !== undefined) return;
+  editorDraftFlushTimer = window.setTimeout(flushEditorDraft, 400);
+}
+function flushEditorDraft(): void {
+  if (editorDraftFlushTimer !== undefined) clearTimeout(editorDraftFlushTimer);
+  editorDraftFlushTimer = undefined;
+  const pending = pendingEditorDraft;
+  pendingEditorDraft = undefined;
+  if (!pending) return;
   try {
-    localStorage.setItem(EDITOR_DRAFT_KEY, JSON.stringify({ mapId, definition, updatedAt: Date.now() }));
-    if (mapId === "new") newDraftAvailable.value = true;
+    localStorage.setItem(EDITOR_DRAFT_KEY, JSON.stringify({ mapId: pending.mapId, definition: pending.definition, updatedAt: Date.now() }));
+    if (pending.mapId === "new") newDraftAvailable.value = true;
   } catch {
     // The editor remains usable if local storage is disabled or full.
   }
 }
+window.addEventListener("pagehide", flushEditorDraft);
+onBeforeUnmount(() => {
+  flushEditorDraft();
+  window.removeEventListener("pagehide", flushEditorDraft);
+});
 function saveDefinition(definition: MapDefinition): void {
   const mapId = typeof route.params.mapId === "string" ? route.params.mapId : "";
   emit("save", definition);

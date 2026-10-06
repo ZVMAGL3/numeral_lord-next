@@ -74,6 +74,8 @@ const renderedUnitCells = new Map<CellId, {
   readonly key: string;
   readonly layers: readonly { readonly layer: Container; readonly container: Container }[];
 }>();
+const renderedTerrainCells = new Map<CellId, { readonly base: Container; readonly top: Container }>();
+const renderedUnitLabels = new Map<CellId, { readonly key: string; readonly text: BitmapText }>();
 let interactionLayers: { legal: Container; counterattack: Container; selection: Container } | undefined;
 let terrainLayer: Container | undefined;
 let unitLayer: Container | undefined;
@@ -99,6 +101,10 @@ let lastInteractionOverlayDraw: {
   readonly noCounterattackCellIds: readonly CellId[];
   readonly layoutRevision: number;
 } | undefined;
+let terrainVisualRevisionCache: string | undefined;
+let terrainVisualCatalogCache: TerrainCatalog | undefined;
+let terrainVisualAssetsCache: Readonly<Record<string, Readonly<Record<string, string>>>> | undefined;
+let terrainVisualTextureRevisionCache = -1;
 const emptyCellIds: readonly CellId[] = [];
 const pointers = new Map<number, { x: number; y: number }>();
 const pressedCellIds = new Map<number, CellId>();
@@ -335,6 +341,8 @@ onBeforeUnmount(() => {
   pressedCellIds.clear();
   actionPulses.clear();
   renderedUnitCells.clear();
+  renderedTerrainCells.clear();
+  renderedUnitLabels.clear();
   interactionLayers = undefined;
   terrainLayer = undefined;
   unitLayer = undefined;
@@ -364,12 +372,15 @@ onBeforeUnmount(() => {
   }
 });
 // 规则会整体替换不可变的 GameState 快照；无需深度遍历，选择单位也不应重建地形、文字或命中区域。
-watch(() => [props.state, props.actionableUnitIds, props.highlightedUnitIds, props.poweredUnitIds], draw);
-watch(() => [props.terrainCatalog, props.terrainVisualAssets], draw, { deep: true });
+watch([() => props.state, () => props.actionableUnitIds, () => props.highlightedUnitIds, () => props.poweredUnitIds], draw);
+watch([() => props.terrainCatalog, () => props.terrainVisualAssets], () => {
+  terrainVisualRevisionCache = undefined;
+  draw();
+}, { deep: true });
 watch(() => props.highlightedPlayerId, draw);
-watch(() => [props.selectedUnitId, props.legalActionCellIds, props.counterattackCellIds,
-  props.noCounterattackCellIds], drawInteractionOverlay);
-watch(() => [props.viewZoom, props.viewPan], () => applyCamera());
+watch([() => props.selectedUnitId, () => props.legalActionCellIds, () => props.counterattackCellIds,
+  () => props.noCounterattackCellIds], drawInteractionOverlay);
+watch([() => props.viewZoom, () => props.viewPan], () => applyCamera());
 
 function draw(): void {
   if (!app || !canvasHost.value || !terrainLayer || !unitLayer || !terrainOverlayLayer || !unitStrengthLayer
@@ -383,6 +394,7 @@ function draw(): void {
   const { columns, rows } = props.state.board;
   const cells = Object.values(props.state.cells);
   const nextTerrainVisualRevision = getTerrainVisualRevision();
+  const terrainVisualsChanged = nextTerrainVisualRevision !== terrainVisualRevision;
   const layoutStartedAt = performance.now();
   const layoutChanged = boardLayoutChanged({
     columns: layoutColumns,
@@ -391,14 +403,18 @@ function draw(): void {
     height: layoutHeight,
     coordinates: cellCoordinates
   } satisfies BoardLayoutSnapshot, { columns, rows, width, height, cells });
-  let terrainChanged = layoutChanged || nextTerrainVisualRevision !== terrainVisualRevision;
-  let occupiedOverlayChanged = false;
+  let terrainChanged = layoutChanged || terrainVisualsChanged;
+  const changedTerrainCells: typeof cells = [];
+  const changedOccupiedOverlayCells: typeof cells = [];
   for (const cell of cells) {
-    if (!layoutChanged && terrainByCell.get(cell.id) !== cell.terrainId) terrainChanged = true;
+    if (!layoutChanged && terrainByCell.get(cell.id) !== cell.terrainId) {
+      terrainChanged = true;
+      changedTerrainCells.push(cell);
+    }
     const occupied = Boolean(cell.unitId && props.state.units[cell.unitId]);
     if (!layoutChanged && occupiedByCell.get(cell.id) !== occupied
       && props.terrainCatalog?.[cell.terrainId]?.visuals?.overlay?.whenOccupied) {
-      occupiedOverlayChanged = true;
+      changedOccupiedOverlayCells.push(cell);
     }
     if (!layoutChanged) occupiedByCell.set(cell.id, occupied);
   }
@@ -434,48 +450,24 @@ function draw(): void {
       terrainByCell.set(cell.id, cell.terrainId);
       occupiedByCell.set(cell.id, Boolean(cell.unitId && props.state.units[cell.unitId]));
     }
-  } else if (terrainChanged) {
-    for (const cell of cells) {
-      terrainByCell.set(cell.id, cell.terrainId);
-      occupiedByCell.set(cell.id, Boolean(cell.unitId && props.state.units[cell.unitId]));
-    }
+  } else {
+    for (const cell of changedTerrainCells) terrainByCell.set(cell.id, cell.terrainId);
   }
 
   const layoutMs = performance.now() - layoutStartedAt;
   const terrainStartedAt = performance.now();
-  if (terrainChanged) {
+  if (layoutChanged || terrainVisualsChanged) {
     replaceTerrainScene(baseTerrainLayer, topTerrainLayer, () => {
-      for (const cell of cells) {
-        const layout = cellLayouts.get(cell.id);
-        if (!layout || !shouldCreateCellHitTarget(cell.terrainId, props.editable ?? false)) continue;
-        const { x, y } = layout;
-        if (cell.terrainId !== "core/void") drawTerrainLayer(baseTerrainLayer, topTerrainLayer, cell.terrainId, x, y, radius,
-          props.terrainCatalog?.[cell.terrainId]?.visuals, props.terrainVisualAssets?.[cell.terrainId] ?? {},
-          Boolean(cell.unitId && props.state.units[cell.unitId]));
-        // 地形点击区域与画面同步重建，但不参与可见绘制。
-        const tile = new Graphics().poly(getTerrainHexCoordinates(x, y, radius * TERRAIN_ART_FOOTPRINT_SCALE))
-          .fill({ color: 0xffffff, alpha: 0.001 });
-        if (props.preview && !props.editable) tile.eventMode = "none";
-        else if (props.editable) {
-          tile.eventMode = "static";
-          tile.cursor = "pointer";
-          tile.on("pointertap", () => emit("cellClick", cell.id));
-          tile.on("pointerover", () => emit("cellPointerEnter", cell.id));
-          tile.on("pointerdown", () => emit("cellPressStart", cell.id));
-        } else tile.eventMode = "none";
-        baseTerrainLayer.addChild(tile);
-      }
+      renderedTerrainCells.clear();
+      for (const cell of cells) drawTerrainCell(cell, baseTerrainLayer, topTerrainLayer);
     });
-  } else if (occupiedOverlayChanged) {
-    for (const child of topTerrainLayer.removeChildren()) child.destroy({ children: true });
-    for (const cell of cells) {
-      const layout = cellLayouts.get(cell.id);
-      if (!layout || cell.terrainId === "core/void") continue;
-      const definition = getTerrainVisualDefinition(cell.terrainId,
-        props.terrainCatalog?.[cell.terrainId]?.visuals,
-        props.terrainVisualAssets?.[cell.terrainId] ?? {});
-      drawTerrainOverlayVisual(topTerrainLayer, layout.x, layout.y, layout.radius,
-        definition.visuals, definition.assets, Boolean(cell.unitId && props.state.units[cell.unitId]));
+  } else if (terrainChanged || changedOccupiedOverlayCells.length) {
+    const cellsToRedraw = new Map<CellId, (typeof cells)[number]>();
+    for (const cell of changedTerrainCells) cellsToRedraw.set(cell.id, cell);
+    for (const cell of changedOccupiedOverlayCells) cellsToRedraw.set(cell.id, cell);
+    for (const cell of cellsToRedraw.values()) {
+      clearRenderedTerrainCell(cell.id);
+      drawTerrainCell(cell, baseTerrainLayer, topTerrainLayer);
     }
   }
   const terrainDrawMs = performance.now() - terrainStartedAt;
@@ -622,12 +614,70 @@ function draw(): void {
   requestPreviewRender();
 }
 
+function clearRenderedTerrainCell(cellId: CellId): void {
+  const rendered = renderedTerrainCells.get(cellId);
+  if (!rendered) return;
+  for (const layer of [rendered.base, rendered.top]) {
+    for (const child of layer.removeChildren()) {
+      child.destroy({ children: true });
+    }
+  }
+}
+
+/** Build one tile's artwork and hit target so edits only replace the touched cells. */
+function drawTerrainCell(cell: GameState["cells"][CellId], baseLayer: Container, topLayer: Container): void {
+  let rendered = renderedTerrainCells.get(cell.id);
+  if (!rendered) {
+    const base = new Container();
+    const top = new Container();
+    base.label = `terrain-base:${cell.id}`;
+    top.label = `terrain-top:${cell.id}`;
+    baseLayer.addChild(base);
+    topLayer.addChild(top);
+    rendered = { base, top };
+    renderedTerrainCells.set(cell.id, rendered);
+  }
+  const layout = cellLayouts.get(cell.id);
+  if (!layout) return;
+  const { x, y, radius } = layout;
+  // 地形画在此格固定顺序的子容器里；局部重绘不会把它挪到整层末尾。
+  if (cell.terrainId !== "core/void") {
+    drawTerrainLayer(rendered.base, rendered.top, cell.terrainId, x, y, radius,
+      props.terrainCatalog?.[cell.terrainId]?.visuals, props.terrainVisualAssets?.[cell.terrainId] ?? {},
+      Boolean(cell.unitId && props.state.units[cell.unitId]));
+  }
+  // 地形点击区域与画面同步绘制，但不参与可见绘制；复用既有命中测试语义。
+  if (shouldCreateCellHitTarget(cell.terrainId, props.editable ?? false)) {
+    const tile = new Graphics().poly(getTerrainHexCoordinates(x, y, radius * TERRAIN_ART_FOOTPRINT_SCALE))
+      .fill({ color: 0xffffff, alpha: 0.001 });
+    if (props.preview && !props.editable) tile.eventMode = "none";
+    else if (props.editable) {
+      tile.eventMode = "static";
+      tile.cursor = "pointer";
+      tile.on("pointertap", () => emit("cellClick", cell.id));
+      tile.on("pointerover", () => emit("cellPointerEnter", cell.id));
+      tile.on("pointerdown", () => emit("cellPressStart", cell.id));
+    } else tile.eventMode = "none";
+    rendered.base.addChild(tile);
+  }
+}
+
 function getTerrainVisualRevision(): string {
+  if (terrainVisualRevisionCache !== undefined
+    && terrainVisualCatalogCache === props.terrainCatalog
+    && terrainVisualAssetsCache === props.terrainVisualAssets
+    && terrainVisualTextureRevisionCache === loadedTerrainTextureRevision) {
+    return terrainVisualRevisionCache;
+  }
   const terrainVisuals = Object.entries(props.terrainCatalog ?? {})
     .flatMap(([id, terrain]) => terrain.visuals ? [`${id}:${JSON.stringify(terrain.visuals)}`] : []);
   const assets = Object.entries(props.terrainVisualAssets ?? {}).flatMap(([terrainId, terrainAssets]) =>
     Object.entries(terrainAssets).map(([id, dataUrl]) => `${terrainId}/${id}:${dataUrl.length}:${dataUrl.slice(0, 20)}:${dataUrl.slice(-12)}`));
-  return `${loadedTerrainTextureRevision}#${terrainVisuals.join("|")}#${assets.join("|")}`;
+  terrainVisualCatalogCache = props.terrainCatalog;
+  terrainVisualAssetsCache = props.terrainVisualAssets;
+  terrainVisualTextureRevisionCache = loadedTerrainTextureRevision;
+  terrainVisualRevisionCache = `${loadedTerrainTextureRevision}#${terrainVisuals.join("|")}#${assets.join("|")}`;
+  return terrainVisualRevisionCache;
 }
 
 function removeRenderedCellVisual(rendered: {
@@ -810,19 +860,34 @@ function requestPreviewRender(): void {
 /** 兵力数字独立成层，始终显示在地形与棋子图像上方。 */
 function drawUnitStrengthLabels(): void {
   if (!unitStrengthLayer) return;
-  unitStrengthLayer.removeChildren().forEach((child) => child.destroy());
   if (props.showUnitLabels === false) {
+    for (const { text } of renderedUnitLabels.values()) {
+      unitStrengthLayer.removeChild(text);
+      text.destroy();
+    }
+    renderedUnitLabels.clear();
     return;
   }
   const highlightedIds = props.highlightedUnitIds === undefined
     ? actionableUnits.value
     : new Set(props.highlightedUnitIds);
   const poweredUnitIds = powered.value;
+  const visibleLabels = new Set<CellId>();
   for (const cell of Object.values(props.state.cells)) {
     const unit = cell.unitId ? props.state.units[cell.unitId] : undefined;
     const layout = cellLayouts.get(cell.id);
     if (!unit || !layout) continue;
     const highlighted = props.preview || props.editable || highlightedIds.has(unit.id);
+    const isPowered = poweredUnitIds.has(unit.id);
+    const fontSize = getUnitStrengthFontSize(layout.radius, isPowered, props.preview && !props.editable);
+    const key = [unit.id, unit.strength, isPowered, highlighted, fontSize, layout.x, layout.y, layout.radius].join("\u0000");
+    visibleLabels.add(cell.id);
+    const previous = renderedUnitLabels.get(cell.id);
+    if (previous?.key === key) continue;
+    if (previous) {
+      unitStrengthLayer.removeChild(previous.text);
+      previous.text.destroy();
+    }
     const text = new BitmapText({
       text: String(unit.strength),
       style: {
@@ -830,7 +895,7 @@ function drawUnitStrengthLabels(): void {
         fontWeight: "900",
         // Keep labels at a stable world size. The shared 128px bitmap atlas is
         // large enough for camera scaling, so zooming never rebuilds label objects.
-        fontSize: getUnitStrengthFontSize(layout.radius, poweredUnitIds.has(unit.id), props.preview && !props.editable),
+        fontSize,
         fill: "#ffffff",
         align: "center"
       }
@@ -840,6 +905,13 @@ function drawUnitStrengthLabels(): void {
     text.position.set(layout.x, layout.y + layout.radius * 0.02);
     text.eventMode = "none";
     unitStrengthLayer.addChild(text);
+    renderedUnitLabels.set(cell.id, { key, text });
+  }
+  for (const [cellId, label] of renderedUnitLabels) {
+    if (visibleLabels.has(cellId)) continue;
+    unitStrengthLayer.removeChild(label.text);
+    label.text.destroy();
+    renderedUnitLabels.delete(cellId);
   }
 }
 

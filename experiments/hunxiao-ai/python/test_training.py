@@ -7,7 +7,8 @@ from pathlib import Path
 import torch
 from model import PolicyValueNet, position_batch, load_checkpoint
 from train import game_sample_weight, losses, read_samples, seat_balance_weights
-from train_v2 import seat_adjusted_weights, stratified_probe
+from train_v2 import (reset_saturated_value_head, seat_adjusted_weights, stratified_probe,
+                      weighted_losses)
 
 
 def sample(count=3, value=None, source="unlabelled", seat=1, game_weight=1.0):
@@ -89,6 +90,40 @@ class TrainingContracts(unittest.TestCase):
         self.assertAlmostEqual(seat_adjusted_weights(batch, "cpu", seat2_weight=1.0)[:3].sum().item(),
                                seat_adjusted_weights(batch, "cpu", seat2_weight=1.0)[3].item(), places=6)
 
+    def test_v3_resets_only_a_saturated_value_head_and_restores_value_gradients(self):
+        model = PolicyValueNet()
+        encoder_before = {key: value.detach().clone() for key, value in model.encoder.state_dict().items()}
+        policy_before = {key: value.detach().clone() for key, value in model.policy_head.state_dict().items()}
+        with torch.no_grad():
+            model.value_head[2].weight.zero_()
+            model.value_head[2].bias.fill_(12.0)
+
+        diagnostics = reset_saturated_value_head(model, [sample()], "cpu", seed=71)
+        self.assertTrue(diagnostics["reset"])
+        self.assertEqual(diagnostics["before"]["fractionAtTanhLimit"], 1.0)
+        self.assertLess(diagnostics["after"]["fractionAtTanhLimit"], 0.95)
+        self.assertEqual(diagnostics["after"]["minimum"], 0.0)
+        self.assertEqual(diagnostics["after"]["maximum"], 0.0)
+        self.assertTrue(all(torch.equal(value, model.encoder.state_dict()[key])
+                            for key, value in encoder_before.items()))
+        self.assertTrue(all(torch.equal(value, model.policy_head.state_dict()[key])
+                            for key, value in policy_before.items()))
+
+        _, _, value_loss = weighted_losses(model, [sample(value=1.0, source="terminal")], "cpu", 0.2)
+        value_loss.backward()
+        self.assertGreater(model.value_head[2].bias.grad.abs().item(), 0.0)
+
+    def test_v3_leaves_a_healthy_value_head_unchanged(self):
+        model = PolicyValueNet()
+        with torch.no_grad():
+            model.value_head[2].weight.zero_()
+            model.value_head[2].bias.fill_(0.25)
+        before = {key: value.detach().clone() for key, value in model.value_head.state_dict().items()}
+        diagnostics = reset_saturated_value_head(model, [sample()], "cpu", seed=72)
+        self.assertFalse(diagnostics["reset"])
+        self.assertTrue(all(torch.equal(value, model.value_head.state_dict()[key])
+                            for key, value in before.items()))
+
     def test_v2_trainer_saves_the_best_held_out_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -97,23 +132,37 @@ class TrainingContracts(unittest.TestCase):
             metadata.write_text(json.dumps({"fingerprint": "rules"}), encoding="utf-8")
             rows = []
             for game_id in range(2):
+                winner = "team-1" if game_id == 0 else "team-2"
+                (root / f"game-{game_id}.json").write_text(
+                    json.dumps({"finished": True, "rounds": 5, "winningTeamIds": [winner]}),
+                    encoding="utf-8")
                 for ply in range(6):
-                    item = sample(seat=ply % 2 + 1)
+                    item = sample(value=0.0, source="terminal", seat=ply % 2 + 1)
                     item["gameId"] = game_id
                     item["ply"] = ply
                     rows.append(item)
             data.write_text("\n".join(json.dumps(item) for item in rows), encoding="utf-8")
+            resume = root / "resume.pt"
+            saturated = PolicyValueNet()
+            with torch.no_grad():
+                saturated.value_head[2].weight.zero_()
+                saturated.value_head[2].bias.fill_(12.0)
+            torch.save({"schemaVersion": 1, "width": saturated.width, "metadata": {"fingerprint": "rules"},
+                        "model": saturated.state_dict()}, resume)
             checkpoint = root / "model.pt"
             trainer = Path(__file__).with_name("train_v2.py")
             result = subprocess.run([sys.executable, str(trainer), "--data", str(data), "--metadata", str(metadata),
-                                     "--output", str(checkpoint), "--device", "cpu", "--steps", "2",
+                                     "--output", str(checkpoint), "--resume", str(resume), "--device", "cpu", "--steps", "2",
                                      "--batch-size", "4", "--eval-interval", "1", "--patience", "2", "--seed", "42"],
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             report = json.loads(checkpoint.with_suffix(".metrics.json").read_text(encoding="utf-8"))
             self.assertTrue(checkpoint.exists())
-            self.assertEqual(report["trainerVersion"], 2)
+            self.assertEqual(report["trainerVersion"], 3)
             self.assertEqual(report["seat2SampleWeight"], 1.10)
+            self.assertTrue(report["valueHeadDiagnostics"]["reset"])
+            self.assertEqual(report["valueHeadDiagnostics"]["before"]["fractionAtTanhLimit"], 1.0)
+            self.assertEqual(report["valueHeadDiagnostics"]["after"]["fractionAtTanhLimit"], 0.0)
             self.assertLessEqual(report["finalProbeLoss"][0], report["initialProbeLoss"][0] + 1e-7)
 
     def test_policy_loss_uses_game_weights(self):

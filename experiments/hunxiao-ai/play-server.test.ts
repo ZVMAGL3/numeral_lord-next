@@ -67,7 +67,7 @@ test("training history lists terminal scores and only serves replays from the ac
     const directory = join(runsDirectory, name);
     mkdirSync(directory);
     writeFileSync(join(directory, "metadata.json"), JSON.stringify({ fingerprint }));
-    writeFileSync(join(directory, "summary.json"), JSON.stringify({ fingerprint }));
+    writeFileSync(join(directory, "summary.json"), JSON.stringify({ fingerprint, games: 9000 }));
     writeFileSync(join(directory, "game-0.json"), JSON.stringify({ id: 0, policies: ["search", "random"], candidateSeat: 2,
       selfPlay: false, actions: 40,
       opponentModel: "snapshot-2/iteration-2",
@@ -119,7 +119,8 @@ test("training history lists terminal scores and only serves replays from the ac
     for (let id = 0; id < 205; id += 1) writeFileSync(join(bulkDirectory, `game-${id}.json`), JSON.stringify({ id }));
     const capped = await (await fetch(url + "/api/training/games")).json() as { totalGames: number; games: Record<string, unknown>[] };
     assert.equal(capped.totalGames, 208);
-    assert.equal(capped.games.length, 200);
+    assert.equal(capped.games.length, 100);
+    assert.ok(capped.games.some((game) => game.id === 204));
   } finally {
     await new Promise<void>((resolveRun) => server.close(() => resolveRun()));
     rmSync(runsDirectory, { recursive: true, force: true });

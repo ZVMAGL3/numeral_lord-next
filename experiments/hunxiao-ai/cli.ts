@@ -45,15 +45,17 @@ function policy(value: string | undefined): PolicyKind {
   return value as PolicyKind;
 }
 
-type ModelFamily = "mlp" | "hex-graph-v1";
+type ModelFamily = "mlp" | "hex-graph-v1" | "phase-head-v1";
 
 function modelFamily(value: string | undefined, option: string): ModelFamily {
-  if (value === "mlp" || value === "hex-graph-v1") return value;
-  throw new Error(`${option} must be mlp or hex-graph-v1`);
+  if (value === "mlp" || value === "hex-graph-v1" || value === "phase-head-v1") return value;
+  throw new Error(`${option} must be mlp, hex-graph-v1 or phase-head-v1`);
 }
 
-function inferenceScript(family: ModelFamily): "serve.py" | "serve_hex.py" {
-  return family === "hex-graph-v1" ? "serve_hex.py" : "serve.py";
+function inferenceScript(family: ModelFamily): "serve.py" | "serve_hex.py" | "serve_phase.py" {
+  if (family === "hex-graph-v1") return "serve_hex.py";
+  if (family === "phase-head-v1") return "serve_phase.py";
+  return "serve.py";
 }
 
 function runName(prefix: string): string {
@@ -92,7 +94,8 @@ function consecutivePromotionFailures(name: string): number {
 function metadata() {
   const files = ["environment.ts", "search.ts", "worker.ts", "training-policy.ts", "protocol.ts", "runtime.ts", "cli.ts", "tsconfig.json", "launch.mjs", "worker-bootstrap.mjs",
     "python/model.py", "python/train.py", "python/train_v2.py", "python/serve.py",
-    "python/hex_model.py", "python/train_hex.py", "python/compare_hex.py", "python/serve_hex.py", "python/requirements-xpu.txt"];
+    "python/hex_model.py", "python/train_hex.py", "python/compare_hex.py", "python/serve_hex.py",
+    "python/phase_model.py", "python/train_phase.py", "python/serve_phase.py", "python/requirements-xpu.txt"];
   const implementationHashes = Object.fromEntries(files.map((path) => ["experiments/hunxiao-ai/" + path,
     createHash("sha256").update(readFileSync(join(experimentRoot, path))).digest("hex")]));
   return { schemaVersion: 1, fingerprint: env.fingerprint, featureSchema: env.featureSchema,
@@ -372,7 +375,7 @@ async function selectContinuousChampion(output: string, resume: string): Promise
       const secondModel = models[second]!;
       const arena: RunSettings = {
         name: `${nodeName}-promotion-pair-${first + 1}-vs-${second + 1}`,
-        games: 48, workers: 8, simulations: 16, minimumSimulations: 4,
+        games: 48, workers: 16, simulations: 16, minimumSimulations: 4,
         searchMultiplier: 1, consecutiveNonPromotions: 0,
         maxActions: 10000, maxLearningRounds: 0, maxSamples: 0,
         seed: (integer(flags.seed, "seed", 0, 0xffffffff) + 80000 + pair * 1000) >>> 0,
@@ -464,7 +467,7 @@ function settings(name: string, collect: boolean): RunSettings {
     thinkMs: integer(flags["think-ms"], "think-ms", 0, 60000)
   }, consecutiveNonPromotions);
   return { name, games: integer(flags.games, "games", 1, 10000),
-    workers: effectiveWorkerCount(name, integer(flags.workers, "workers", 1, 20)),
+    workers: effectiveWorkerCount(name, integer(flags.workers, "workers", 1, 32)),
     simulations: searchBudget.simulations, minimumSimulations: searchBudget.minimumSimulations,
     searchMultiplier: searchBudget.multiplier, consecutiveNonPromotions,
     maxActions: integer(flags["max-actions"], "max-actions", 1, 100000),
@@ -483,8 +486,8 @@ async function main() {
   const command = positionals[0] ?? "help";
   const candidateFamily = modelFamily(flags["model-family"], "model-family");
   const opponentFamily = modelFamily(flags["opponent-model-family"], "opponent-model-family");
-  if (command !== "arena" && (candidateFamily !== "mlp" || opponentFamily !== "mlp")) {
-    throw new Error("alternate model families are currently supported only by arena comparisons");
+  if (command !== "arena" && command !== "selfplay" && (candidateFamily !== "mlp" || opponentFamily !== "mlp")) {
+    throw new Error("alternate model families are currently supported only by arena comparisons and self-play");
   }
   if (command !== "arena" && (flags["stochastic-arena"] || flags["paired-seat-seeds"])) {
     throw new Error("stochastic-arena and paired-seat-seeds are arena-only options");
@@ -496,6 +499,8 @@ async function main() {
   pnpm ai sample --bootstrap teacher --games 4 --workers 4 --name teacher-seed
   pnpm ai train --data <samples.jsonl> --metadata <metadata.json> --output <model.pt>
   pnpm ai selfplay --checkpoint <model.pt> --bootstrap network
+  pnpm ai selfplay --checkpoint <hex.pt> --model-family hex-graph-v1 --games 16 --workers 2
+  pnpm ai arena --checkpoint <phase.pt> --model-family phase-head-v1 --opponent-model-family mlp --opponent-checkpoint <mlp.pt>
   pnpm ai arena --policy network --checkpoint <model.pt> --opponent search --think-ms 100 --simulations 256
   pnpm ai arena --policy network --checkpoint <hex.pt> --model-family hex-graph-v1 --opponent network --opponent-checkpoint <mlp.pt>
   pnpm ai arena --stochastic-arena --paired-seat-seeds (vary openings and reuse each opening after swapping seats)
@@ -503,7 +508,7 @@ async function main() {
   pnpm ai pilot --seed-data <samples.jsonl> --seed-metadata <metadata.json> (reuse a completed teacher-data run)
   pnpm ai play --checkpoint <model.pt> --device cpu
   pnpm ai:test
-Options: --device auto/cpu/xpu --model-family mlp/hex-graph-v1 --opponent-model-family mlp/hex-graph-v1 --stochastic-arena --paired-seat-seeds --max-actions 10000 --max-learning-rounds 0 (unlimited) --max-samples 256 --seed 20261005 --replay
+Options: --device auto/cpu/xpu --model-family mlp/hex-graph-v1/phase-head-v1 --opponent-model-family mlp/hex-graph-v1/phase-head-v1 --stochastic-arena --paired-seat-seeds --max-actions 10000 --max-learning-rounds 0 (unlimited) --max-samples 256 --seed 20261005 --replay
 Self-play leagues accept --opponent-pool <checkpoint1|checkpoint2> and --league-ratio auto/0..1; continuous iterations use a 40% historical-opponent mix once snapshots are available.
 Truncation defaults to no value label. Bootstrap labels are explicitly marked, never claimed as wins.`);
   } else if (command === "inspect") {

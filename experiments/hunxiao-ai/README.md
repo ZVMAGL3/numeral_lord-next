@@ -1,5 +1,7 @@
 # 昏晓 AI 本地训练
 
+跨设备恢复使用的当前权重保存在 [`checkpoints/hunxiao-iteration-20.pt`](checkpoints/hunxiao-iteration-20.pt)，通过 Git LFS 管理。新设备的完整拉取与启动步骤见仓库根目录 [`AI_START_CHECKLIST.md`](../../AI_START_CHECKLIST.md)。连续训练脚本默认使用 16 个 worker，可按机器资源用 `-Workers` 调整。
+
 本实验固定使用用户确认的“昏晓”9×9地图、初始摆子和双人两队。训练和本地试玩都从仓库中的 `packages/game-core`、`packages/core-content` 读取本地共享 TypeScript 规则；不会调用线上内核，也不会改写正式地图。地图文件仍保存 `matchConditionIds: []`，实验加载时只挂载游戏核心默认条件：失去全部据点淘汰、最后存活队伍获胜。
 
 ## 当前训练规则
@@ -99,6 +101,20 @@ experiments/hunxiao-ai/.venv/Scripts/python.exe experiments/hunxiao-ai/python/co
 ```
 
 `compare_hex.py` 会让旧 MLP 和六邻接网络使用相同棋谱、训练/验证对局切分、训练批次、损失权重和更新步数，并输出匹配对照指标。此对照只检查对棋谱策略/价值目标的拟合，不代表棋力已经提升；最终晋级仍需固定预算、先后手互换的实战评测。
+
+Hex 模型也可以单独做自博弈，再从自己的上一版权重续训；不会接入默认 MLP 连续训练脚本。示例先生成 16 局新棋谱，再以已有 Hex checkpoint 为起点小步续训：
+
+```powershell
+pnpm ai selfplay --name hunxiao-hex-graph-v1-selfplay-16 --checkpoint experiments/hunxiao-ai/runs/hunxiao-hex-graph-v1-20261007/matched-hex-graph.pt --model-family hex-graph-v1 --games 16 --workers 2 --simulations 4 --min-simulations 1 --think-ms 0 --device cpu --seed 20261009 --league-ratio 0 --max-actions 10000 --max-learning-rounds 0 --max-samples 256 --replay
+experiments/hunxiao-ai/.venv/Scripts/python.exe experiments/hunxiao-ai/python/train_hex.py `
+  --data experiments/hunxiao-ai/runs/hunxiao-hex-graph-v1-selfplay-16/samples.jsonl `
+  --metadata experiments/hunxiao-ai/runs/hunxiao-hex-graph-v1-selfplay-16/metadata.json `
+  --resume experiments/hunxiao-ai/runs/hunxiao-hex-graph-v1-20261007/matched-hex-graph.pt `
+  --output experiments/hunxiao-ai/runs/hunxiao-hex-graph-v1-selfplay-16/iteration-1.pt `
+  --device cpu --max-samples 4096 --steps 100 --batch-size 16 --seed 20261010
+```
+
+`--resume` 校验棋规/地图 fingerprint，并沿用检查点中的网络宽度和图层数；每次续训会重新建立优化器。先只做小批量试验，之后仍需用双方交换先后手、足够多配对开局的对局来判断强度；训练损失下降或少量自战胜率都不等于棋力已提升。
 
 ## 历史记录说明
 

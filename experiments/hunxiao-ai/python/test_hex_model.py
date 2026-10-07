@@ -16,6 +16,7 @@ from hex_model import (
     load_checkpoint,
     position_batch,
 )
+from train_hex import split_games
 
 
 def make_candidate(source: tuple[int, int] | None, target: tuple[int, int] | None):
@@ -38,6 +39,15 @@ def make_position(candidate_count: int):
 
 
 class HexModelTests(unittest.TestCase):
+    def test_two_game_split_keeps_validation_game_out_of_training(self):
+        samples = [{"gameId": 10, "seat": 1}, {"gameId": 11, "seat": 2}]
+        training, validation, validation_games = split_games(samples, seed=3)
+        self.assertEqual(len(training), 1)
+        self.assertEqual(len(validation), 1)
+        self.assertEqual(len(validation_games), 1)
+        self.assertEqual(validation_games[0], validation[0]["gameId"])
+        self.assertNotEqual(training[0]["gameId"], validation[0]["gameId"])
+
     def test_neighbour_table_matches_even_and_odd_row_hex_layout(self):
         even_center = 4 * 9 + 4
         odd_center = 3 * 9 + 4

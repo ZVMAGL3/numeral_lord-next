@@ -9,6 +9,10 @@ import { getPoweredUnitIds, type GameIntent, type GameState } from "../../packag
 import { coreTerrainCatalog } from "../../packages/core-content/src/index.js";
 import type { GameReport } from "./protocol.js";
 
+const RECENT_RUN_LIMIT = 5;
+const RECENT_FILES_PER_RUN = 250;
+const TRAINING_GAME_LIST_LIMIT = 100;
+
 export async function startPlayServer(options: { checkpoint?: string | undefined; port: number; simulations: number; device: string; thinkMs: number; runsDirectory?: string }) {
   const env = createEnvironment();
   const runsDirectory = options.runsDirectory ?? fileURLToPath(new URL("./runs/", import.meta.url));
@@ -85,41 +89,36 @@ export async function startPlayServer(options: { checkpoint?: string | undefined
 
   function listTrainingGames() {
     if (!existsSync(runsDirectory)) return { totalGames: 0, games: [] as Record<string, unknown>[] };
-    const runs: { name: string; directory: string; summary?: Record<string, unknown>; fingerprint: string | null; updatedAt: number }[] = [];
+    const runs: { name: string; directory: string; gameFiles: string[]; runComplete: boolean; fingerprint: string | null; updatedAt: number }[] = [];
     let totalGames = 0;
     for (const entry of readdirSync(runsDirectory, { withFileTypes: true })) {
       if (!entry.isDirectory() || !/^[a-zA-Z0-9_-]+$/.test(entry.name)) continue;
       const runDirectory = join(runsDirectory, entry.name);
       const metadata = readJson(join(runDirectory, "metadata.json"));
-      const summary = readJson(join(runDirectory, "summary.json"));
-      const fingerprint = typeof summary?.fingerprint === "string" ? summary.fingerprint
-        : typeof metadata?.fingerprint === "string" ? metadata.fingerprint : null;
-      let gameFileCount = 0;
-      const summaryGames = summary?.games;
-      if (typeof summaryGames === "number" && Number.isSafeInteger(summaryGames) && summaryGames >= 0) gameFileCount = summaryGames;
-      else {
-        try { gameFileCount = readdirSync(runDirectory).filter((file) => /^game-\d+\.json$/.test(file)).length; }
-        catch { continue; }
-      }
-      totalGames += gameFileCount;
-      runs.push({ name: entry.name, directory: runDirectory, ...(summary ? { summary } : {}), fingerprint,
+      let gameFiles: string[];
+      try { gameFiles = readdirSync(runDirectory).filter((file) => /^game-\d+\.json$/.test(file)); }
+      catch { continue; }
+      totalGames += gameFiles.length;
+      runs.push({ name: entry.name, directory: runDirectory, gameFiles, runComplete: existsSync(join(runDirectory, "summary.json")),
+        fingerprint: typeof metadata?.fingerprint === "string" ? metadata.fingerprint : null,
         updatedAt: statSync(runDirectory).mtimeMs });
     }
     runs.sort((a, b) => b.updatedAt - a.updatedAt);
     const candidates: { run: typeof runs[number]; file: string; id: number; updatedAt: number }[] = [];
-    for (const run of runs.slice(0, 5)) {
-      let files: string[];
-      try { files = readdirSync(run.directory); } catch { continue; }
-      for (const file of files) {
-        const match = /^game-(\d+)\.json$/.exec(file);
-        if (!match) continue;
+    for (const run of runs.slice(0, RECENT_RUN_LIMIT)) {
+      const recentFiles = run.gameFiles
+        .map((file) => ({ file, match: /^game-(\d+)\.json$/.exec(file) }))
+        .filter((item): item is { file: string; match: RegExpExecArray } => item.match !== null)
+        .sort((a, b) => Number(b.match[1]) - Number(a.match[1]))
+        .slice(0, RECENT_FILES_PER_RUN);
+      for (const { file, match } of recentFiles) {
         const gamePath = join(run.directory, file);
         candidates.push({ run, file, id: Number(match[1]), updatedAt: statSync(gamePath).mtimeMs });
       }
     }
     candidates.sort((a, b) => b.updatedAt - a.updatedAt);
     const games: Record<string, unknown>[] = [];
-    for (const candidate of candidates.slice(0, 200)) {
+    for (const candidate of candidates.slice(0, TRAINING_GAME_LIST_LIMIT)) {
       const gamePath = join(candidate.run.directory, candidate.file);
         const game = readJson(gamePath) as Partial<GameReport> | undefined;
         if (!game || typeof game.id !== "number" || !Number.isSafeInteger(game.id)) continue;
@@ -147,8 +146,8 @@ export async function startPlayServer(options: { checkpoint?: string | undefined
           resultMessage: game.resultMessage ?? "",
           elapsedMs: game.elapsedMs ?? 0,
           replayAvailable: candidate.run.fingerprint === env.fingerprint && existsSync(replayFile),
-          runComplete: candidate.run.summary !== undefined,
-          updatedAt: statSync(gamePath).mtime.toISOString()
+          runComplete: candidate.run.runComplete,
+          updatedAt: new Date(candidate.updatedAt).toISOString()
         });
     }
     return { totalGames, games };

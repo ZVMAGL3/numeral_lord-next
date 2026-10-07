@@ -11,7 +11,7 @@ export function effectiveLearningRoundLimit(runName: string, requestedLimit: num
   return continuousIteration && Number(continuousIteration[1]) >= 6 ? 0 : requestedLimit;
 }
 
-/** Allow the requested full parallelism now that the local demo has been closed. */
+/** Cap continuous self-play at the user's 16-worker setting to bound host memory use. */
 export function effectiveWorkerCount(runName: string, requestedWorkers: number): number {
   if (!Number.isSafeInteger(requestedWorkers) || requestedWorkers < 1) throw new RangeError("requestedWorkers must be a positive integer");
   const continuousIteration = runName.match(/^hunxiao-selfplay-1000-iteration-(\d+)-\d{8}$/);

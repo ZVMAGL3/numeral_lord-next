@@ -55,6 +55,49 @@ def evaluate(model, samples, device, bootstrap_weight: float, batch_size: int = 
     return [value / count for value in sums]
 
 
+def value_saturation_stats(model, samples, device, batch_size: int = 256, threshold: float = 0.999):
+    """Measure whether the tanh value head is pinned at either output limit."""
+    if not samples:
+        raise ValueError("value saturation probe is empty")
+    model.eval()
+    predictions = []
+    with torch.no_grad():
+        for start in range(0, len(samples), batch_size):
+            tensors = position_batch(samples[start:start + batch_size], device)
+            _, values = model(*tensors)
+            predictions.append(values.detach().float().cpu())
+    values = torch.cat(predictions)
+    return {
+        "fractionAtTanhLimit": float((values.abs() >= threshold).float().mean()),
+        "minimum": float(values.min()),
+        "maximum": float(values.max()),
+        "threshold": threshold,
+    }
+
+
+def reset_saturated_value_head(model, probe, device, seed: int, threshold: float = 0.999,
+                               minimum_fraction: float = 0.95):
+    """Reset only the value head when tanh saturation blocks outcome learning."""
+    before = value_saturation_stats(model, probe, device, threshold=threshold)
+    if before["fractionAtTanhLimit"] < minimum_fraction:
+        return {"reset": False, "reason": "value predictions are not saturated", "before": before}
+
+    # Keep the encoder and policy head warm-started. A fresh value head restores
+    # outcome learning while preserving all learned move preferences. Zeroing
+    # its final affine layer guarantees the first values are centered at zero;
+    # random initialization alone can still saturate tanh on large board states.
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed + 0x5A17)
+        fresh = PolicyValueNet(model.width)
+    model.value_head.load_state_dict(fresh.value_head.state_dict())
+    with torch.no_grad():
+        model.value_head[2].weight.zero_()
+        model.value_head[2].bias.zero_()
+    after = value_saturation_stats(model, probe, device, threshold=threshold)
+    return {"reset": True, "reason": "at least 95% of probe values were saturated",
+            "before": before, "after": after}
+
+
 def seat_adjusted_weights(batch, device, seat2_weight: float = 1.10):
     """Keep seat balancing, then give seat 2 a small relative training tilt."""
     if seat2_weight <= 0:
@@ -126,6 +169,7 @@ def main():
     if not training:
         raise ValueError("empty training split")
     probe = stratified_probe(validation or training)
+    value_head_diagnostics = reset_saturated_value_head(model, probe, device, args.seed)
     initial = evaluate(model, probe, device, args.bootstrap_weight, seat2_weight=args.seat2_weight)
     best_loss = initial[0]
     best_step = 0
@@ -175,15 +219,16 @@ def main():
     temporary = output.with_suffix(output.suffix + ".tmp")
     torch.save({"schemaVersion": 1, "width": model.width, "metadata": metadata,
                 "model": {key: tensor.detach().cpu() for key, tensor in model.state_dict().items()},
-                "training": {"trainerVersion": 2, "stepsRequested": args.steps,
+                "training": {"trainerVersion": 3, "stepsRequested": args.steps,
                              "stepsCompleted": completed_steps, "bestStep": best_step,
-                             "learningRate": args.lr, "seed": args.seed, "resume": args.resume or ""}}, temporary)
+                             "learningRate": args.lr, "seed": args.seed, "resume": args.resume or "",
+                             "valueHeadDiagnostics": value_head_diagnostics}}, temporary)
     temporary.replace(output)
 
     source_hash = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     sources = {source: sum(sample["valueSource"] == source for sample in samples)
                for source in sorted({sample["valueSource"] for sample in samples})}
-    report = {"trainerVersion": 2, "trainerSha256": source_hash, "device": str(device), "torch": torch.__version__,
+    report = {"trainerVersion": 3, "trainerSha256": source_hash, "device": str(device), "torch": torch.__version__,
               "parameters": sum(parameter.numel() for parameter in model.parameters()),
               "samples": len(samples), "trainingSamples": len(training), "validationSamples": len(validation),
               "validationProbeSamples": len(probe),
@@ -194,6 +239,7 @@ def main():
               "patience": args.patience, "seat2SampleWeight": args.seat2_weight,
               "elapsedSeconds": elapsed, "initialProbeLoss": initial,
               "finalProbeLoss": final, "validationHistory": history, "probeIsHeldOut": bool(validation),
+              "valueHeadDiagnostics": value_head_diagnostics,
               "checkpoint": str(output), "fingerprint": metadata["fingerprint"],
               "bootstrapWeight": args.bootstrap_weight}
     atomic_json(output.with_suffix(".metrics.json"), report)

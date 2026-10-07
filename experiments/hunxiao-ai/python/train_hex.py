@@ -15,6 +15,7 @@ from hex_model import (
     ARCHITECTURE_ID,
     CHECKPOINT_SCHEMA_VERSION,
     HexPolicyValueNet,
+    load_checkpoint,
     position_batch,
 )
 from model import select_device
@@ -82,7 +83,7 @@ def read_bounded_samples(path: Path, fingerprint: str, maximum: int, seed: int):
 def split_games(samples: list[dict], seed: int):
     game_ids = sorted({sample["gameId"] for sample in samples})
     random.Random(seed).shuffle(game_ids)
-    validation_ids = set(game_ids[:max(1, len(game_ids) // 5)]) if len(game_ids) >= 3 else set()
+    validation_ids = set(game_ids[:max(1, len(game_ids) // 5)]) if len(game_ids) >= 2 else set()
     training = [sample for sample in samples if sample["gameId"] not in validation_ids]
     validation = [sample for sample in samples if sample["gameId"] in validation_ids]
     return training, validation or training, sorted(validation_ids)
@@ -155,6 +156,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--width", type=int, default=48)
     parser.add_argument("--blocks", type=int, default=3)
+    parser.add_argument("--resume", help="continue from a compatible hex-graph checkpoint")
     parser.add_argument("--lr", type=float, default=0.0003)
     parser.add_argument("--seed", type=int, default=20261007)
     parser.add_argument("--seat2-weight", type=float, default=1.10)
@@ -174,7 +176,14 @@ def main():
         Path(args.data), metadata["fingerprint"], args.max_samples, args.seed
     )
     training, validation, validation_games = split_games(samples, args.seed)
-    model = HexPolicyValueNet(args.width, args.blocks).to(device)
+    if args.resume:
+        model, _ = load_checkpoint(args.resume, device, metadata["fingerprint"])
+        # The checkpoint defines the architecture; CLI defaults must not
+        # silently create a mismatched model when resuming.
+        args.width = model.width
+        args.blocks = model.block_count
+    else:
+        model = HexPolicyValueNet(args.width, args.blocks).to(device)
     initial = evaluate(model, validation, device, args.seat2_weight, args.batch_size)
     best_loss = initial[0]
     best_step = 0
@@ -215,7 +224,8 @@ def main():
         "model": {key: tensor.detach().cpu() for key, tensor in model.state_dict().items()},
         "training": {"steps": args.steps, "bestStep": best_step, "seed": args.seed,
                      "learningRate": args.lr, "sourceSamples": total_source_samples,
-                     "sampleLimit": args.max_samples},
+                     "sampleLimit": args.max_samples,
+                     "resumedFrom": str(Path(args.resume).resolve()) if args.resume else None},
     }, temporary)
     temporary.replace(output)
     final = evaluate(model, validation, device, args.seat2_weight, args.batch_size)
@@ -231,6 +241,7 @@ def main():
         "trainingSamples": len(training),
         "validationSamples": len(validation),
         "validationGames": validation_games,
+        "validationMode": "held-out-games" if validation_games else "in-sample-no-holdout",
         "stepsRequested": args.steps,
         "bestStep": best_step,
         "initialProbeLoss": initial,

@@ -13,6 +13,8 @@
 
 详细边界见 [架构基线](docs/architecture-baseline.md)，公网目录、服务与子路径构建说明见 [部署说明](docs/deployment.md)。
 
+跨设备拉取代码与当前模型的步骤见[备份与恢复说明](BACKUP_AND_RESTORE.md)；可直接交给新设备 AI 执行的操作清单见[新设备启动清单](AI_START_CHECKLIST.md)。
+
 ## 本地运行
 
 先安装依赖，再分别启动中继和网页：

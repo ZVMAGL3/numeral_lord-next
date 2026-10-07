@@ -34,7 +34,7 @@ export class InferenceService {
   readonly stats = { calls: 0, positions: 0, maxBatch: 0, inferenceRoundtripMs: 0, device: "starting", torch: "" };
 
   constructor(checkpoint: string, fingerprint: string, device = "auto", private maxBatch = 32, private waitMs = 2,
-    serverScript: "serve.py" | "serve_hex.py" = "serve.py") {
+    serverScript: "serve.py" | "serve_hex.py" | "serve_phase.py" = "serve.py") {
     this.ready = new Promise<void>((resolve, reject) => { this.readyResolve = resolve; this.readyReject = reject; });
     // A rejected startup is also observed when no job has reached its first leaf yet.
     void this.ready.catch(() => {});

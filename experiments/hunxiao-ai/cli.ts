@@ -22,7 +22,9 @@ const { values: flags, positionals } = parseArgs({ allowPositionals: true, optio
   "max-learning-rounds": { type: "string", default: "0" },
   policy: { type: "string", default: "search" }, opponent: { type: "string", default: "search" },
   checkpoint: { type: "string" }, "opponent-checkpoint": { type: "string" },
+  "model-family": { type: "string", default: "mlp" }, "opponent-model-family": { type: "string", default: "mlp" },
   "opponent-pool": { type: "string" }, "league-ratio": { type: "string", default: "auto" },
+  "stochastic-arena": { type: "boolean", default: false }, "paired-seat-seeds": { type: "boolean", default: false },
   bootstrap: { type: "string", default: "none" }, device: { type: "string", default: "auto" },
   name: { type: "string" }, steps: { type: "string", default: "400" },
   "batch-size": { type: "string", default: "64" }, "think-ms": { type: "string", default: "0" },
@@ -41,6 +43,17 @@ function integer(value: string | undefined, name: string, minimum = 1, maximum =
 function policy(value: string | undefined): PolicyKind {
   if (!policyKinds.includes(value ?? "")) throw new Error(`policy must be ${policyKinds.join("/")}`);
   return value as PolicyKind;
+}
+
+type ModelFamily = "mlp" | "hex-graph-v1";
+
+function modelFamily(value: string | undefined, option: string): ModelFamily {
+  if (value === "mlp" || value === "hex-graph-v1") return value;
+  throw new Error(`${option} must be mlp or hex-graph-v1`);
+}
+
+function inferenceScript(family: ModelFamily): "serve.py" | "serve_hex.py" {
+  return family === "hex-graph-v1" ? "serve_hex.py" : "serve.py";
 }
 
 function runName(prefix: string): string {
@@ -78,7 +91,8 @@ function consecutivePromotionFailures(name: string): number {
 
 function metadata() {
   const files = ["environment.ts", "search.ts", "worker.ts", "training-policy.ts", "protocol.ts", "runtime.ts", "cli.ts", "tsconfig.json", "launch.mjs", "worker-bootstrap.mjs",
-    "python/model.py", "python/train.py", "python/train_v2.py", "python/serve.py", "python/requirements-xpu.txt"];
+    "python/model.py", "python/train.py", "python/train_v2.py", "python/serve.py",
+    "python/hex_model.py", "python/train_hex.py", "python/compare_hex.py", "python/serve_hex.py", "python/requirements-xpu.txt"];
   const implementationHashes = Object.fromEntries(files.map((path) => ["experiments/hunxiao-ai/" + path,
     createHash("sha256").update(readFileSync(join(experimentRoot, path))).digest("hex")]));
   return { schemaVersion: 1, fingerprint: env.fingerprint, featureSchema: env.featureSchema,
@@ -158,6 +172,10 @@ async function runGames(settings: RunSettings) {
   const metadataPath = join(directory, "metadata.json");
   const dataPath = join(directory, "samples.jsonl");
   const runMetadata = { ...metadata(), workerCount: settings.workers,
+    modelFamilies: { candidate: modelFamily(flags["model-family"], "model-family"),
+      opponent: modelFamily(flags["opponent-model-family"], "opponent-model-family") },
+    evaluation: { stochasticArena: settings.exploratory && !settings.collect,
+      pairedSeatSeeds: settings.pairedSeatSeeds ?? false },
     search: { simulations: settings.simulations, minimumSimulations: settings.minimumSimulations,
       thinkMs: settings.thinkMs, adaptiveMultiplier: settings.searchMultiplier,
       consecutiveNonPromotions: settings.consecutiveNonPromotions } };
@@ -181,14 +199,17 @@ async function runGames(settings: RunSettings) {
     if (settings.policy === "network" || settings.opponent === "network" || settings.bootstrap === "network"
       || (settings.opponentPool.length > 0 && settings.leagueRatio > 0)) {
       if (!settings.checkpoint) throw new Error("network policy/bootstrap requires --checkpoint");
-      services.candidate = new InferenceService(resolve(settings.checkpoint), env.fingerprint, flags.device);
+      services.candidate = new InferenceService(resolve(settings.checkpoint), env.fingerprint, flags.device,
+        32, 2, inferenceScript(modelFamily(flags["model-family"], "model-family")));
       await services.candidate.start();
       if (settings.opponentCheckpoint) {
-        services.opponent = new InferenceService(resolve(settings.opponentCheckpoint), env.fingerprint, flags.device);
+        services.opponent = new InferenceService(resolve(settings.opponentCheckpoint), env.fingerprint, flags.device,
+          32, 2, inferenceScript(modelFamily(flags["opponent-model-family"], "opponent-model-family")));
         await services.opponent.start();
       }
       for (let index = 0; index < settings.opponentPool.length && settings.leagueRatio > 0; index += 1) {
-        const service = new InferenceService(settings.opponentPool[index]!, env.fingerprint, flags.device);
+        const service = new InferenceService(settings.opponentPool[index]!, env.fingerprint, flags.device,
+          32, 2, inferenceScript(modelFamily(flags["opponent-model-family"], "opponent-model-family")));
         services[`opponent-${index}`] = service;
         await service.start();
       }
@@ -449,15 +470,25 @@ function settings(name: string, collect: boolean): RunSettings {
     maxActions: integer(flags["max-actions"], "max-actions", 1, 100000),
     maxLearningRounds: learningRoundLimit(name),
     maxSamples: integer(flags["max-samples"], "max-samples", 0, 10000), seed: integer(flags.seed, "seed", 0, 0xffffffff),
-    policy: policy(flags.policy), opponent: policy(flags.opponent), collect, bootstrap, exploratory: collect,
+    policy: policy(flags.policy), opponent: policy(flags.opponent), collect, bootstrap,
+    exploratory: collect || flags["stochastic-arena"]!,
     thinkMs: searchBudget.thinkMs, recordReplay: flags.replay!,
     opponentPool, leagueRatio: parsedRatio,
+    ...(flags["paired-seat-seeds"] ? { pairedSeatSeeds: true } : {}),
     ...(flags.checkpoint ? { checkpoint: flags.checkpoint } : {}),
     ...(flags["opponent-checkpoint"] ? { opponentCheckpoint: flags["opponent-checkpoint"] } : {}) };
 }
 
 async function main() {
   const command = positionals[0] ?? "help";
+  const candidateFamily = modelFamily(flags["model-family"], "model-family");
+  const opponentFamily = modelFamily(flags["opponent-model-family"], "opponent-model-family");
+  if (command !== "arena" && (candidateFamily !== "mlp" || opponentFamily !== "mlp")) {
+    throw new Error("alternate model families are currently supported only by arena comparisons");
+  }
+  if (command !== "arena" && (flags["stochastic-arena"] || flags["paired-seat-seeds"])) {
+    throw new Error("stochastic-arena and paired-seat-seeds are arena-only options");
+  }
   if (flags.help || command === "help") {
     console.log(`昏晓 AI 实验（本地共享规则；不会操作线上房间）
   pnpm ai inspect
@@ -466,11 +497,13 @@ async function main() {
   pnpm ai train --data <samples.jsonl> --metadata <metadata.json> --output <model.pt>
   pnpm ai selfplay --checkpoint <model.pt> --bootstrap network
   pnpm ai arena --policy network --checkpoint <model.pt> --opponent search --think-ms 100 --simulations 256
+  pnpm ai arena --policy network --checkpoint <hex.pt> --model-family hex-graph-v1 --opponent network --opponent-checkpoint <mlp.pt>
+  pnpm ai arena --stochastic-arena --paired-seat-seeds (vary openings and reuse each opening after swapping seats)
   pnpm ai pilot --iterations 1 --games 4 --workers 4 --simulations 16 --steps 300
   pnpm ai pilot --seed-data <samples.jsonl> --seed-metadata <metadata.json> (reuse a completed teacher-data run)
   pnpm ai play --checkpoint <model.pt> --device cpu
   pnpm ai:test
-Options: --device auto/cpu/xpu --max-actions 10000 --max-learning-rounds 0 (unlimited) --max-samples 256 --seed 20261005 --replay
+Options: --device auto/cpu/xpu --model-family mlp/hex-graph-v1 --opponent-model-family mlp/hex-graph-v1 --stochastic-arena --paired-seat-seeds --max-actions 10000 --max-learning-rounds 0 (unlimited) --max-samples 256 --seed 20261005 --replay
 Self-play leagues accept --opponent-pool <checkpoint1|checkpoint2> and --league-ratio auto/0..1; continuous iterations use a 40% historical-opponent mix once snapshots are available.
 Truncation defaults to no value label. Bootstrap labels are explicitly marked, never claimed as wins.`);
   } else if (command === "inspect") {

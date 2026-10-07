@@ -78,6 +78,28 @@ pnpm ai play --device xpu --simulations 16 --think-ms 100 --port 8060
 
 浏览器访问 `http://127.0.0.1:8060/`。训练模型仅保存在训练机器本地。未来接入线上系统时，需要将同 fingerprint 的模型和推理 runtime 部署到服务器或房主机器，再由现有房间规则内核校验并执行动作；本地训练结果不会自动出现在服务器上。
 
+## 六邻接网络实验
+
+`python/hex_model.py` 和 `python/train_hex.py` 是隔离实验，不会改变连续训练默认使用的模型或正在运行的训练进程。它把每格特征保留为 9×9 空间节点，以游戏内核相同的奇偶行六邻接做消息传递，并用全局池化加入整盘信息；可以从既有 MCTS 策略分布和终局标签蒸馏。新旧检查点格式不同，实验权重不应直接替换旧模型。
+
+先运行结构测试，再用已完成的普通规则老师数据做小规模蒸馏：
+
+```powershell
+experiments/hunxiao-ai/.venv/Scripts/python.exe experiments/hunxiao-ai/python/test_hex_model.py
+experiments/hunxiao-ai/.venv/Scripts/python.exe experiments/hunxiao-ai/python/train_hex.py `
+  --data experiments/hunxiao-ai/runs/hunxiao-100k-normal-window30-a10000-s32-20261006-teacher/samples.jsonl `
+  --metadata experiments/hunxiao-ai/runs/hunxiao-100k-normal-window30-a10000-s32-20261006-teacher/metadata.json `
+  --output experiments/hunxiao-ai/runs/hunxiao-hex-graph-v1-20261007/iteration-0.pt `
+  --device cpu --max-samples 4096 --steps 75 --batch-size 16 --width 32 --blocks 2
+experiments/hunxiao-ai/.venv/Scripts/python.exe experiments/hunxiao-ai/python/compare_hex.py `
+  --data experiments/hunxiao-ai/runs/hunxiao-100k-normal-window30-a10000-s32-20261006-teacher/samples.jsonl `
+  --metadata experiments/hunxiao-ai/runs/hunxiao-100k-normal-window30-a10000-s32-20261006-teacher/metadata.json `
+  --output-dir experiments/hunxiao-ai/runs/hunxiao-hex-graph-v1-20261007 `
+  --device cpu --max-samples 4096 --steps 75 --batch-size 16
+```
+
+`compare_hex.py` 会让旧 MLP 和六邻接网络使用相同棋谱、训练/验证对局切分、训练批次、损失权重和更新步数，并输出匹配对照指标。此对照只检查对棋谱策略/价值目标的拟合，不代表棋力已经提升；最终晋级仍需固定预算、先后手互换的实战评测。
+
 ## 历史记录说明
 
 早期 `hunxiao-round10-pilot`、`ratio-*`、`hunxiao-100k-territory-*` 以及 `hunxiao-100k-territory-r11-s32-20261006` 都曾使用临时终局条件或临时塑形目标，只保留查看，不混入当前规则训练。`hunxiao-100k-normal-r30-s32-20261006` 和 `hunxiao-100k-normal-window30-s32-20261006` 分别是整盘过滤、800 动作预算下的短烟测；数据保留供复盘，不混入当前 10,000 动作预算任务。

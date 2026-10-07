@@ -33,11 +33,12 @@ export class InferenceService {
   private readyTimer: NodeJS.Timeout;
   readonly stats = { calls: 0, positions: 0, maxBatch: 0, inferenceRoundtripMs: 0, device: "starting", torch: "" };
 
-  constructor(checkpoint: string, fingerprint: string, device = "auto", private maxBatch = 32, private waitMs = 2) {
+  constructor(checkpoint: string, fingerprint: string, device = "auto", private maxBatch = 32, private waitMs = 2,
+    serverScript: "serve.py" | "serve_hex.py" = "serve.py") {
     this.ready = new Promise<void>((resolve, reject) => { this.readyResolve = resolve; this.readyReject = reject; });
     // A rejected startup is also observed when no job has reached its first leaf yet.
     void this.ready.catch(() => {});
-    this.child = spawn(pythonExecutable(), ["-u", fileURLToPath(new URL("./python/serve.py", import.meta.url)),
+    this.child = spawn(pythonExecutable(), ["-u", fileURLToPath(new URL(`./python/${serverScript}`, import.meta.url)),
       "--checkpoint", checkpoint, "--fingerprint", fingerprint, "--device", device], { stdio: "pipe", windowsHide: true });
     this.readyTimer = setTimeout(() => this.fail(new Error("网络服务启动超过 90 秒")), 90_000);
     let stderr = "";

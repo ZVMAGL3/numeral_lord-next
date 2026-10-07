@@ -44,3 +44,38 @@ export function effectiveSearchBudget(
     multiplier
   };
 }
+
+export type SeatScoreStats = { games: number; points: number };
+export const PROMOTION_SEAT2_SCORE_WEIGHT = 0.55;
+
+/** Score models with a modest seat-2 emphasis while still reporting each seat independently. */
+export function weightedSeatScoreRate(
+  seats: Record<1 | 2, SeatScoreStats>,
+  seat2Weight = PROMOTION_SEAT2_SCORE_WEIGHT
+): number {
+  if (!Number.isFinite(seat2Weight) || seat2Weight < 0 || seat2Weight > 1) {
+    throw new RangeError("seat2Weight must be within [0, 1]");
+  }
+  for (const seat of [1, 2] as const) {
+    const result = seats[seat];
+    if (!Number.isSafeInteger(result.games) || result.games < 1) {
+      throw new RangeError(`seat ${seat} games must be a positive integer`);
+    }
+    if (!Number.isFinite(result.points) || result.points < 0 || result.points > result.games) {
+      throw new RangeError(`seat ${seat} points must be within [0, games]`);
+    }
+  }
+  return (1 - seat2Weight) * (seats[1].points / seats[1].games)
+    + seat2Weight * (seats[2].points / seats[2].games);
+}
+
+/** Give each seat-swapped pair the same deterministic game seed. */
+export function pairedSeatSeed(baseSeed: number, gameIndex: number): number {
+  if (!Number.isSafeInteger(baseSeed) || baseSeed < 0 || baseSeed > 0xffffffff) {
+    throw new RangeError("baseSeed must be an unsigned 32-bit integer");
+  }
+  if (!Number.isSafeInteger(gameIndex) || gameIndex < 0) {
+    throw new RangeError("gameIndex must be a non-negative integer");
+  }
+  return (baseSeed + Math.floor(gameIndex / 2)) >>> 0;
+}

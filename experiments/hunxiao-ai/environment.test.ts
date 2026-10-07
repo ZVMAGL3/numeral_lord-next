@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { calculateReinforcementIncome, hasTerrainCapability, selectSpatialPatternCells, type GameState } from "../../packages/game-core/src/index.js";
 import { coreTerrainCatalog } from "../../packages/core-content/src/index.js";
 import { CANDIDATE_SIZE, DEFAULT_MATCH_CONDITION_IDS, EXPERIMENT_MATCH_CONDITION_IDS, GLOBAL_SIZE, OBSERVATION_SIZE, SEARCH_HEURISTIC_WEIGHTS, TRAINING_WIN_SPEED_DISCOUNT, createEnvironment } from "./environment.js";
-import { effectiveLearningRoundLimit, effectiveSearchBudget, effectiveWorkerCount, isWithinLearningRoundWindow } from "./training-policy.js";
+import { effectiveLearningRoundLimit, effectiveSearchBudget, effectiveWorkerCount, isWithinLearningRoundWindow, pairedSeatSeed, weightedSeatScoreRate } from "./training-policy.js";
 import { occupiedCellsByTeam, totalStrengthByTeam } from "./temporary-rules.js";
 
 const env = createEnvironment(undefined, { includeTemporaryRoundLimit: true });
@@ -81,6 +81,23 @@ test("连续训练从第12轮起提高每步搜索预算", () => {
     { simulations: 24, minimumSimulations: 6, thinkMs: 75, multiplier: 1.5 });
   assert.deepEqual(effectiveSearchBudget("manual-selfplay-test", requested, 2),
     { ...requested, multiplier: 1 });
+});
+
+test("晋级赛先后手成对使用相同种子", () => {
+  assert.equal(pairedSeatSeed(1234, 0), pairedSeatSeed(1234, 1));
+  assert.equal(pairedSeatSeed(1234, 2), pairedSeatSeed(1234, 3));
+  assert.notEqual(pairedSeatSeed(1234, 1), pairedSeatSeed(1234, 2));
+  assert.equal(pairedSeatSeed(0xffffffff, 2), 0);
+  assert.throws(() => pairedSeatSeed(-1, 0), /unsigned 32-bit/);
+  assert.throws(() => pairedSeatSeed(1, -1), /non-negative integer/);
+});
+
+test("晋级评分单独计算先后手并给后手55%权重", () => {
+  assert.equal(weightedSeatScoreRate({ 1: { games: 24, points: 12 }, 2: { games: 24, points: 12 } }), 0.5);
+  assert.equal(weightedSeatScoreRate({ 1: { games: 24, points: 12 }, 2: { games: 24, points: 18 } }), 0.6375);
+  assert.throws(() => weightedSeatScoreRate({ 1: { games: 0, points: 0 }, 2: { games: 1, points: 0 } }), /games must be a positive integer/);
+  assert.throws(() => weightedSeatScoreRate({ 1: { games: 1, points: 0 }, 2: { games: 1, points: 2 } }), /points must be within/);
+  assert.throws(() => weightedSeatScoreRate({ 1: { games: 1, points: 0 }, 2: { games: 1, points: 0 } }, 1.1), /within \[0, 1\]/);
 });
 
 test("全体合法动作可用共享引擎执行且输入状态保持不可变", () => {

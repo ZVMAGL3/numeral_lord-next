@@ -7,7 +7,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createEnvironment, OBSERVATION_SIZE, GLOBAL_SIZE, CANDIDATE_SIZE } from "./environment.js";
 import { InferenceService, pythonExecutable, type NetworkResult } from "./runtime.js";
-import { effectiveLearningRoundLimit, effectiveSearchBudget, effectiveWorkerCount } from "./training-policy.js";
+import { effectiveLearningRoundLimit, effectiveSearchBudget, effectiveWorkerCount, pairedSeatSeed, PROMOTION_SEAT2_SCORE_WEIGHT, weightedSeatScoreRate } from "./training-policy.js";
 import type { GameOutput, GameReport, JobOptions, PolicyKind, PositionPayload } from "./protocol.js";
 
 const experimentRoot = fileURLToPath(new URL(".", import.meta.url));
@@ -111,6 +111,7 @@ interface RunSettings {
   opponentPool: string[];
   leagueRatio: number;
   recordReplay: boolean;
+  pairedSeatSeeds?: boolean;
 }
 
 function automaticOpponentPool(name: string, candidateCheckpoint: string): string[] {
@@ -207,7 +208,8 @@ async function runGames(settings: RunSettings) {
         const opponentPath = settings.opponentCheckpoint ?? (opponentIndex >= 0 ? settings.opponentPool[opponentIndex] : undefined);
         const policies: [PolicyKind, PolicyKind] = candidateSeat === 1
           ? [settings.policy, settings.opponent] : [settings.opponent, settings.policy];
-        const job: JobOptions = { id, seed: settings.seed + id, simulations: settings.simulations,
+        const job: JobOptions = { id, seed: settings.pairedSeatSeeds ? pairedSeatSeed(settings.seed, id) : settings.seed + id,
+          simulations: settings.simulations,
           minimumSimulations: settings.minimumSimulations, maxActions: settings.maxActions,
           maxLearningRounds: settings.maxLearningRounds,
           policies, collect: settings.collect, bootstrap: settings.bootstrap, exploratory: settings.exploratory,
@@ -333,7 +335,13 @@ async function selectContinuousChampion(output: string, resume: string): Promise
     if (previous) previous.incumbent ||= hash === resumeHash;
     else byContent.set(hash, { path: resolved, incumbent: hash === resumeHash });
   }
-  const models = [...byContent.entries()].map(([hash, value]) => ({ hash, ...value, label: modelLabel(value.path), games: 0, points: 0 }));
+  type Seat = 1 | 2;
+  type SeatResult = { games: number; wins: number; losses: number; draws: number; truncated: number; points: number };
+  type TournamentModel = { hash: string; path: string; incumbent: boolean; label: string; games: number; points: number;
+    seatResults: Record<Seat, SeatResult> };
+  const emptySeatResult = (): SeatResult => ({ games: 0, wins: 0, losses: 0, draws: 0, truncated: 0, points: 0 });
+  const models: TournamentModel[] = [...byContent.entries()].map(([hash, value]) => ({ hash, ...value, label: modelLabel(value.path),
+    games: 0, points: 0, seatResults: { 1: emptySeatResult(), 2: emptySeatResult() } }));
   if (models.length < 2) return;
 
   let pair = 0;
@@ -343,29 +351,42 @@ async function selectContinuousChampion(output: string, resume: string): Promise
       const secondModel = models[second]!;
       const arena: RunSettings = {
         name: `${nodeName}-promotion-pair-${first + 1}-vs-${second + 1}`,
-        games: 24, workers: 8, simulations: 16, minimumSimulations: 4,
+        games: 48, workers: 8, simulations: 16, minimumSimulations: 4,
         searchMultiplier: 1, consecutiveNonPromotions: 0,
         maxActions: 10000, maxLearningRounds: 0, maxSamples: 0,
         seed: (integer(flags.seed, "seed", 0, 0xffffffff) + 80000 + pair * 1000) >>> 0,
         policy: "network", opponent: "network", collect: false, bootstrap: "none", exploratory: false, thinkMs: 50,
-        checkpoint: firstModel.path, opponentCheckpoint: secondModel.path, opponentPool: [], leagueRatio: 0, recordReplay: true
+        checkpoint: firstModel.path, opponentCheckpoint: secondModel.path, opponentPool: [], leagueRatio: 0, recordReplay: true,
+        pairedSeatSeeds: true
       };
       const result = await runGames(arena);
       for (const report of result.summary.reports as GameReport[]) {
         const candidateWon = report.winningTeamIds.includes(`team-${report.candidateSeat}`);
         const drawOrTruncated = !report.finished || report.winningTeamIds.length === 0;
+        const firstSeat = report.candidateSeat as Seat;
+        const secondSeat: Seat = firstSeat === 1 ? 2 : 1;
         firstModel.games += 1;
         secondModel.games += 1;
         const firstPoints = drawOrTruncated ? 0.5 : candidateWon ? 1 : 0;
+        const secondPoints = 1 - firstPoints;
         firstModel.points += firstPoints;
-        secondModel.points += 1 - firstPoints;
+        secondModel.points += secondPoints;
+        for (const [model, seat, points] of [[firstModel, firstSeat, firstPoints], [secondModel, secondSeat, secondPoints]] as const) {
+          const result = model.seatResults[seat];
+          result.games += 1;
+          result.points += points;
+          if (report.truncated || !report.finished) result.truncated += 1;
+          else if (!report.winningTeamIds.length) result.draws += 1;
+          else if (points === 1) result.wins += 1;
+          else result.losses += 1;
+        }
       }
       pair += 1;
     }
   }
 
   const byScore = [...models].sort((a, b) => {
-    const scoreDifference = b.points / Math.max(1, b.games) - a.points / Math.max(1, a.games);
+    const scoreDifference = weightedSeatScoreRate(b.seatResults) - weightedSeatScoreRate(a.seatResults);
     return Math.abs(scoreDifference) > 1e-12 ? scoreDifference : Number(b.incumbent) - Number(a.incumbent);
   });
   const candidateHash = createHash("sha256").update(readFileSync(resolvedOutput)).digest("hex");
@@ -373,7 +394,7 @@ async function selectContinuousChampion(output: string, resume: string): Promise
   const incumbent = byScore.find((model) => model.hash === resumeHash);
   const bestLegacy = byScore.find((model) => model.hash !== candidateHash);
   const minimumClearImprovement = 0.05;
-  const scoreRate = (model: typeof byScore[number] | undefined) => model ? model.points / Math.max(1, model.games) : 0;
+  const scoreRate = (model: TournamentModel | undefined) => model ? weightedSeatScoreRate(model.seatResults) : 0;
   const candidateVsIncumbent = scoreRate(candidate) - scoreRate(incumbent);
   const candidateClearsPromotionGate = !!candidate && !!incumbent && !!bestLegacy
     && candidateVsIncumbent >= minimumClearImprovement
@@ -383,8 +404,11 @@ async function selectContinuousChampion(output: string, resume: string): Promise
   const selected = candidateClearsPromotionGate ? candidate! : incumbentSafeFallback ?? bestLegacy ?? byScore[0]!;
   if (selected.path !== resolvedOutput) copyFileSync(selected.path, resolvedOutput);
   const report = {
-    method: "balanced pairwise checkpoint tournament",
-    gamesPerPair: 24,
+    method: "paired seat-swapped checkpoint tournament",
+    gamesPerPair: 48,
+    gamesPerSeatPerPair: 24,
+    pairedSeatSeeds: true,
+    seat2ScoreWeight: PROMOTION_SEAT2_SCORE_WEIGHT,
     minimumClearImprovement,
     candidateVsIncumbentScoreRate: candidateVsIncumbent,
     candidateClearsPromotionGate,
@@ -392,11 +416,15 @@ async function selectContinuousChampion(output: string, resume: string): Promise
     selected: selected.label,
     newCheckpointPromoted: selected.hash === candidateHash && candidateHash !== resumeHash,
     models: models.map(({ hash: _hash, path: _path, ...model }) => ({ ...model,
-      scoreRate: model.points / Math.max(1, model.games) }))
+      overallScoreRate: model.points / Math.max(1, model.games),
+      scoreRateBySeat: { 1: model.seatResults[1].points / model.seatResults[1].games,
+        2: model.seatResults[2].points / model.seatResults[2].games },
+      scoreRate: weightedSeatScoreRate(model.seatResults) }))
   };
   writeFileSync(join(dirname(resolvedOutput), "promotion.json"), JSON.stringify(report, null, 2));
   console.log(JSON.stringify({ champion: report.selected, newCheckpointPromoted: report.newCheckpointPromoted,
-    models: report.models.map((model) => ({ label: model.label, scoreRate: model.scoreRate, games: model.games })) }));
+    models: report.models.map((model) => ({ label: model.label, scoreRate: model.scoreRate, scoreRateBySeat: model.scoreRateBySeat,
+      games: model.games })) }));
 }
 
 function settings(name: string, collect: boolean): RunSettings {

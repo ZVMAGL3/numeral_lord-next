@@ -11,8 +11,8 @@ from pathlib import Path
 
 import torch
 
-from model import PolicyValueNet, atomic_json, load_checkpoint, select_device
-from train import losses, read_samples
+from model import PolicyValueNet, atomic_json, load_checkpoint, position_batch, select_device
+from train import read_samples, seat_balance_weights
 
 
 def stratified_probe(samples, maximum: int = 4096):
@@ -37,7 +37,8 @@ def stratified_probe(samples, maximum: int = 4096):
     return probe
 
 
-def evaluate(model, samples, device, bootstrap_weight: float, batch_size: int = 256):
+def evaluate(model, samples, device, bootstrap_weight: float, batch_size: int = 256,
+             seat2_weight: float = 1.10):
     """Return sample-weighted total/policy/value losses without retaining graphs."""
     if not samples:
         raise ValueError("validation probe is empty")
@@ -47,11 +48,41 @@ def evaluate(model, samples, device, bootstrap_weight: float, batch_size: int = 
     with torch.no_grad():
         for start in range(0, len(samples), batch_size):
             batch = samples[start:start + batch_size]
-            values = losses(model, batch, device, bootstrap_weight)
+            values = weighted_losses(model, batch, device, bootstrap_weight, seat2_weight=seat2_weight)
             for index, value in enumerate(values):
                 sums[index] += float(value.detach().cpu()) * len(batch)
             count += len(batch)
     return [value / count for value in sums]
+
+
+def seat_adjusted_weights(batch, device, seat2_weight: float = 1.10):
+    """Keep seat balancing, then give seat 2 a small relative training tilt."""
+    if seat2_weight <= 0:
+        raise ValueError("seat2_weight must be positive")
+    balanced = seat_balance_weights(batch, device)
+    tilt = torch.tensor([seat2_weight if sample["seat"] == 2 else 1.0 for sample in batch],
+                        dtype=torch.float32, device=device)
+    return balanced * tilt
+
+
+def weighted_losses(model, batch, device, bootstrap_weight: float, seat2_weight: float = 1.10):
+    tensors = position_batch(batch, device)
+    logits, predicted_value = model(*tensors)
+    target = torch.zeros_like(logits)
+    values = []
+    value_weights = []
+    sample_weights = seat_adjusted_weights(batch, device, seat2_weight)
+    for index, sample in enumerate(batch):
+        target[index, :len(sample["policy"])] = torch.tensor(sample["policy"], device=device)
+        values.append(sample["value"] if sample["value"] is not None else 0.0)
+        value_weights.append(1.0 if sample["valueSource"] == "terminal"
+                             else bootstrap_weight if sample["value"] is not None else 0.0)
+    per_sample_policy = -(target * torch.log_softmax(logits, dim=-1)).sum(dim=-1)
+    policy_loss = (per_sample_policy * sample_weights).sum() / sample_weights.sum().clamp_min(1)
+    target_value = torch.tensor(values, dtype=torch.float32, device=device)
+    value_weight = torch.tensor(value_weights, dtype=torch.float32, device=device) * sample_weights
+    value_loss = ((predicted_value - target_value).square() * value_weight).sum() / value_weight.sum().clamp_min(1)
+    return policy_loss + value_loss, policy_loss, value_loss
 
 
 def main():
@@ -68,10 +99,11 @@ def main():
     parser.add_argument("--bootstrap-weight", type=float, default=0.2)
     parser.add_argument("--eval-interval", type=int, default=100)
     parser.add_argument("--patience", type=int, default=4)
+    parser.add_argument("--seat2-weight", type=float, default=1.10)
     args = parser.parse_args()
     if (args.steps < 1 or args.batch_size < 1 or args.lr <= 0 or args.eval_interval < 1
-            or args.patience < 1 or not 0 <= args.bootstrap_weight <= 1):
-        parser.error("steps, batch-size, lr, eval-interval and patience must be positive; bootstrap-weight must be in [0,1]")
+            or args.patience < 1 or args.seat2_weight <= 0 or not 0 <= args.bootstrap_weight <= 1):
+        parser.error("steps, batch-size, lr, eval-interval, patience and seat2-weight must be positive; bootstrap-weight must be in [0,1]")
 
     torch.set_num_threads(4)
     random.seed(args.seed)
@@ -94,7 +126,7 @@ def main():
     if not training:
         raise ValueError("empty training split")
     probe = stratified_probe(validation or training)
-    initial = evaluate(model, probe, device, args.bootstrap_weight)
+    initial = evaluate(model, probe, device, args.bootstrap_weight, seat2_weight=args.seat2_weight)
     best_loss = initial[0]
     best_step = 0
     best_state = {key: tensor.detach().cpu().clone() for key, tensor in model.state_dict().items()}
@@ -108,7 +140,8 @@ def main():
         model.train()
         batch = random.choices(training, k=min(args.batch_size, len(training)))
         optimizer.zero_grad(set_to_none=True)
-        loss, policy_loss, value_loss = losses(model, batch, device, args.bootstrap_weight)
+        loss, policy_loss, value_loss = weighted_losses(model, batch, device, args.bootstrap_weight,
+                                                         seat2_weight=args.seat2_weight)
         if not torch.isfinite(loss):
             raise RuntimeError("non-finite training loss")
         loss.backward()
@@ -117,7 +150,7 @@ def main():
         completed_steps = step
 
         if step % args.eval_interval == 0 or step == args.steps:
-            measured = evaluate(model, probe, device, args.bootstrap_weight)
+            measured = evaluate(model, probe, device, args.bootstrap_weight, seat2_weight=args.seat2_weight)
             history.append({"step": step, "total": measured[0], "policy": measured[1], "value": measured[2]})
             print(json.dumps({"step": step, "trainingLoss": float(loss.detach().cpu()),
                               "validationLoss": measured[0], "validationPolicy": measured[1],
@@ -136,7 +169,7 @@ def main():
         torch.xpu.synchronize()
     elapsed = time.perf_counter() - started
     model.load_state_dict(best_state)
-    final = evaluate(model, probe, device, args.bootstrap_weight)
+    final = evaluate(model, probe, device, args.bootstrap_weight, seat2_weight=args.seat2_weight)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(output.suffix + ".tmp")
@@ -158,7 +191,8 @@ def main():
               "validationGames": sorted(validation_ids), "valueSources": sources,
               "stepsRequested": args.steps, "stepsCompleted": completed_steps, "bestStep": best_step,
               "batchSize": args.batch_size, "learningRate": args.lr, "evalInterval": args.eval_interval,
-              "patience": args.patience, "elapsedSeconds": elapsed, "initialProbeLoss": initial,
+              "patience": args.patience, "seat2SampleWeight": args.seat2_weight,
+              "elapsedSeconds": elapsed, "initialProbeLoss": initial,
               "finalProbeLoss": final, "validationHistory": history, "probeIsHeldOut": bool(validation),
               "checkpoint": str(output), "fingerprint": metadata["fingerprint"],
               "bootstrapWeight": args.bootstrap_weight}

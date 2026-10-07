@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 from model import PolicyValueNet, position_batch, load_checkpoint
 from train import game_sample_weight, losses, read_samples, seat_balance_weights
-from train_v2 import stratified_probe
+from train_v2 import seat_adjusted_weights, stratified_probe
 
 
 def sample(count=3, value=None, source="unlabelled", seat=1, game_weight=1.0):
@@ -80,6 +80,15 @@ class TrainingContracts(unittest.TestCase):
                 self.assertGreaterEqual(max(selected), 8)
         self.assertLessEqual(len(stratified_probe(samples, maximum=5)), 5)
 
+    def test_v2_gives_seat_two_a_small_weight_increase_after_balancing(self):
+        batch = [sample(seat=1), sample(seat=1), sample(seat=1), sample(seat=2)]
+        weights = seat_adjusted_weights(batch, "cpu", seat2_weight=1.10)
+        seat_one = weights[:3].sum().item()
+        seat_two = weights[3].item()
+        self.assertAlmostEqual(seat_two / (seat_one + seat_two), 1.1 / 2.1, places=6)
+        self.assertAlmostEqual(seat_adjusted_weights(batch, "cpu", seat2_weight=1.0)[:3].sum().item(),
+                               seat_adjusted_weights(batch, "cpu", seat2_weight=1.0)[3].item(), places=6)
+
     def test_v2_trainer_saves_the_best_held_out_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -104,6 +113,7 @@ class TrainingContracts(unittest.TestCase):
             report = json.loads(checkpoint.with_suffix(".metrics.json").read_text(encoding="utf-8"))
             self.assertTrue(checkpoint.exists())
             self.assertEqual(report["trainerVersion"], 2)
+            self.assertEqual(report["seat2SampleWeight"], 1.10)
             self.assertLessEqual(report["finalProbeLoss"][0], report["initialProbeLoss"][0] + 1e-7)
 
     def test_policy_loss_uses_game_weights(self):

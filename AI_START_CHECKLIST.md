@@ -1,14 +1,15 @@
 # 昏晓 AI 训练：交给 AI 的执行清单
 
-本文件只用于用户明确要启动昏晓 AI 试玩或训练时。若要恢复并启动整个《数字领主》游戏项目，请先用仓库根目录的 [`PROJECT_START_CHECKLIST.md`](PROJECT_START_CHECKLIST.md)。这里的目标是恢复当前模型、先验证能运行，再从第 20 代权重重新开始第 21 代自博弈训练。
+本文件只用于用户明确要启动昏晓 AI 试玩或训练时。若要恢复并启动整个《数字领主》游戏项目，请先用仓库根目录的 [`PROJECT_START_CHECKLIST.md`](PROJECT_START_CHECKLIST.md)。2026-11-09 训练主线已切换到健康的 Hex 空间模型；旧第 20 代仅保留为对照，不再原样启动旧 MLP 连续训练。依据和实测见[重新评估](docs/ai-training-reassessment-2026-11-08.md)。
 
 ## 已知状态
 
 - 公开 Git 仓库：`https://github.com/ZVMAGL3/numeral_lord-next`
-- 当前可试玩、可续训权重：`experiments/hunxiao-ai/checkpoints/hunxiao-iteration-20.pt`
+- 当前空间模型训练 seed：`experiments/hunxiao-ai/checkpoints/hunxiao-hex-healthy-seed-20261109.pt`（健康初版，尚未证明高手棋力）。
+- 旧 MLP 试玩/评测基线：`experiments/hunxiao-ai/checkpoints/hunxiao-iteration-20.pt`。
 - 权重基于“昏晓”固定地图和核心默认胜负规则。
-- 旧设备当时正在采集第 21 代数据；这批未完成的局面、棋谱和所有历史训练数据都不随仓库迁移。新设备从第 20 代检查点重新采集第 21 代，不要尝试恢复旧设备的半成品目录。
-- 训练脚本会一直循环，每代采集 1,000 局后训练并保存新检查点。新设备的 `runs/` 是本地新目录。
+- 历史棋谱、未完成的旧第 21 代数据和本机新运行目录不随仓库迁移。新设备从 Hex seed 重新采集新节点，不冒充恢复旧机的半成品批次。
+- supervisor 默认每节点 100 局、训练、健康检查与换边评测；没有改善时转入复核，不自动无限增加弱样本。详见[自主训练说明](experiments/hunxiao-ai/AUTONOMOUS_TRAINING.md)。
 
 ## 给执行 AI 的任务
 
@@ -30,6 +31,7 @@
 
    ```powershell
    Get-Item .\experiments\hunxiao-ai\checkpoints\hunxiao-iteration-20.pt
+   Get-Item .\experiments\hunxiao-ai\checkpoints\hunxiao-hex-healthy-seed-20261109.pt
    git lfs ls-files
    ```
 
@@ -51,7 +53,7 @@
 
    其他 GPU 请先配置对应 PyTorch 后端，并确认训练脚本中的 `--device` 与该后端匹配。若没有可用 GPU，可用 CPU 做短测试；完整训练可能会很慢。
 
-6. 可先启动试玩页，让用户检查当前棋力：
+6. 可先启动旧第 20 代基线试玩页。此命令的 MLP 页面不是新 Hex 模型的棋力验证：
 
    ```powershell
    pnpm ai play `
@@ -61,17 +63,13 @@
 
    浏览器打开 `http://127.0.0.1:8060/`。CPU 试玩时将 `--device xpu` 改成 `--device cpu`。
 
-7. 确认第 2–5 步通过、训练设备正常后，从第 21 代开始连续训练。默认使用 16 个 worker；新机器内存紧张时可以传入 `-Workers 8` 或更低，内存充足且实测稳定后再提高：
+7. 确认第 2–5 步通过、XPU 正常且没有另一条训练任务后，从新 Hex seed 启动独立 supervisor；默认 8 个 worker，不再启动旧 `train-continuous.ps1`：
 
    ```powershell
-   powershell.exe -NoProfile -ExecutionPolicy Bypass `
-     -File .\experiments\hunxiao-ai\train-continuous.ps1 `
-     -StartIteration 21 `
-     -CheckpointPath experiments/hunxiao-ai/checkpoints/hunxiao-iteration-20.pt `
-     -Workers 16
+   experiments/hunxiao-ai/.venv/Scripts/python.exe -u experiments/hunxiao-ai/python/train_autonomous.py --run-root experiments/hunxiao-ai/runs/spatial-autonomous-local --checkpoint experiments/hunxiao-ai/checkpoints/hunxiao-hex-healthy-seed-20261109.pt
    ```
 
-   这是持续循环任务，会在每代结束时保存权重，并自动用新权重进入下一代。启动前检查内存余量和 worker 设置；训练过程不需要保持试玩页打开。不要把试玩服务误认为训练进程。
+   这是独立的本地循环，按健康检查和预声明的小规模评测选择冠军，旧权重与候选分开保存。启动前检查内存；停止、恢复、REVIEW_REQUIRED 状态见自主训练说明。Codex 定时分析任务需要在新设备另行配置；本地 supervisor 不依赖聊天额度。
 
 8. 把启动结果回报给用户：GPU/后端、检查点路径、测试结果、训练 PID、当前代数和输出目录。不要公开 `.env`、访问令牌或其他本机凭据。
 

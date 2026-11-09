@@ -10,7 +10,7 @@
 - `apps/server`：Colyseus 房间中继服务和创意工坊 API/存储。
 - `packages/`：共享规则内核、SDK、地图/Mod 内容、校验和示例 Mod。
 - `docs/`、`deploy/`：产品/架构文档和服务器部署脚本。
-- `experiments/hunxiao-ai`：昏晓 AI 训练与试玩工具，以及第 20 代模型检查点。
+- `experiments/hunxiao-ai`：昏晓 AI 训练与试玩工具、第 20 代基线和健康 Hex 空间模型 seed。
 
 本清单的目标是先启动网页和本地中继。AI 训练是可选任务，用户要求时再按 [`AI_START_CHECKLIST.md`](AI_START_CHECKLIST.md) 启动。
 
@@ -89,4 +89,4 @@ corepack pnpm dev:web
 
 ## 6. 启动结果回报
 
-完成后向用户报告：克隆路径和 Git 提交、Node/pnpm 版本、全仓库检查结果、网页和中继的运行状态/端口，以及尚未解决的问题。若用户还要启动 AI，再单独按 [`AI_START_CHECKLIST.md`](AI_START_CHECKLIST.md) 操作；第 21 代训练会从第 20 代检查点重新开始，不会恢复旧机器的历史棋谱或半成品批次。
+完成后向用户报告：克隆路径和 Git 提交、Node/pnpm 版本、全仓库检查结果、网页和中继的运行状态/端口，以及尚未解决的问题。若用户还要启动 AI，再单独按 [`AI_START_CHECKLIST.md`](AI_START_CHECKLIST.md) 从健康 Hex seed 重新采局；旧第 20 代保留作对照，不会恢复旧机器的历史棋谱或半成品批次。

@@ -108,7 +108,7 @@ def main():
         parser.error("max-samples, steps, batch-size and lr must be positive")
     torch.set_num_threads(2)
     metadata = json.loads(Path(args.metadata).read_text(encoding="utf-8"))
-    samples, total_source_samples = read_bounded_samples(
+    samples, source_stats = read_bounded_samples(
         Path(args.data), metadata["fingerprint"], args.max_samples, args.seed
     )
     training, validation, validation_games = split_games(samples, args.seed)
@@ -124,7 +124,8 @@ def main():
     output_dir = Path(args.output_dir)
     results = {
         "protocol": "same samples, game split, batches, loss weights, optimizer and update count",
-        "samplesRead": total_source_samples,
+        "samplesRead": source_stats["sourceSamples"],
+        "eligibleSamplesRead": source_stats["eligibleSamples"],
         "samplesUsed": len(samples),
         "trainingSamples": len(training),
         "validationSamples": len(validation),

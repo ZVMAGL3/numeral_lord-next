@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 import torch
@@ -16,7 +17,7 @@ from hex_model import (
     load_checkpoint,
     position_batch,
 )
-from train_hex import split_games
+from train_hex import model_diagnostics, read_bounded_samples, sample_weights, split_games
 
 
 def make_candidate(source: tuple[int, int] | None, target: tuple[int, int] | None):
@@ -39,6 +40,56 @@ def make_position(candidate_count: int):
 
 
 class HexModelTests(unittest.TestCase):
+    def test_sample_weights_apply_seat_tilt_and_game_weight(self):
+        batch = [
+            {"seat": 1, "gameWeight": 0.5},
+            {"seat": 2, "gameWeight": 2.0},
+        ]
+        weights = sample_weights(batch, torch.device("cpu"), seat2_weight=1.1)
+        self.assertTrue(torch.allclose(weights, torch.tensor([0.5, 2.2])))
+
+    def test_bounded_reader_excludes_truncated_games_and_restores_terminal_value(self):
+        position = make_position(1)
+        base = {"schemaVersion": 1, "fingerprint": "rules", "seat": 1,
+                "policy": [1.0], **position}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = [
+                {**base, "gameId": 1, "seat": 1},
+                {**base, "gameId": 1, "seat": 2},
+                {**base, "gameId": 1, "seat": 1},
+                {**base, "gameId": 2, "seat": 1},
+            ]
+            (root / "samples.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+            (root / "game-1.json").write_text(json.dumps({
+                "finished": True, "truncated": False, "winningTeamIds": ["team-1"], "rounds": 8
+            }), encoding="utf-8")
+            (root / "game-2.json").write_text(json.dumps({
+                "finished": False, "truncated": True, "winningTeamIds": []
+            }), encoding="utf-8")
+            samples, stats = read_bounded_samples(root / "samples.jsonl", "rules", 3, 7)
+        self.assertEqual(len(samples), 3)
+        self.assertEqual(stats["sourceSamples"], 4)
+        self.assertEqual(stats["eligibleSamples"], 3)
+        self.assertEqual(stats["skippedIncompleteGames"], 1)
+        self.assertEqual([sample["value"] for sample in samples], [1.0, -1.0, 1.0])
+        self.assertTrue(all(sample["valueSource"] == "terminal" for sample in samples))
+
+    def test_health_probe_changes_only_board_for_primary_context_check(self):
+        first = make_position(2)
+        first.update({"gameId": 1})
+        second = make_position(2)
+        second.update({"gameId": 2})
+        second["observation"] = [1.0] * (9 * 9 * 20)
+        second["global"] = [1.0] * 12
+        model = HexPolicyValueNet(width=16, blocks=1)
+        health = model_diagnostics(model, [first, second], torch.device("cpu"))
+        self.assertTrue(health["finite"])
+        self.assertGreater(health["maximumPolicyProbabilityDeltaAfterBoardOnlySwap"], 0)
+        self.assertGreater(health["wrongTargetValueGradientNorm"], 0)
+
     def test_two_game_split_keeps_validation_game_out_of_training(self):
         samples = [{"gameId": 10, "seat": 1}, {"gameId": 11, "seat": 2}]
         training, validation, validation_games = split_games(samples, seed=3)

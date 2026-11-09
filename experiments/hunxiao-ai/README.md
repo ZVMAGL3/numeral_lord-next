@@ -1,5 +1,9 @@
 # 昏晓 AI 本地训练
 
+2026-11-09 已实施健康 Hex 模型训练闭环，完成 XPU 热启动及自然对局/续训验证，并启动独立的 100 局节点 supervisor。当前阶段、checkpoint、恢复与效果观察说明见[自主训练说明](AUTONOMOUS_TRAINING.md)。此前的“训练保持暂停”仅描述 11 月 8 日审计时状态，当前授权与状态以自主训练说明和本地 progress 为准。
+
+2026-11-08 重新审计发现当前主线存在策略上下文退化、历史价值饱和、样本权重遗漏和增援搜索效率问题。证据、论文与后续小规模验证顺序见[训练重新评估](../../docs/ai-training-reassessment-2026-11-08.md)。本轮仅诊断，训练保持暂停；下述历史代数和训练损失不能单独作为棋力进步的证明。
+
 跨设备恢复使用的当前权重保存在 [`checkpoints/hunxiao-iteration-20.pt`](checkpoints/hunxiao-iteration-20.pt)，通过 Git LFS 管理。新设备的完整拉取与启动步骤见仓库根目录 [`AI_START_CHECKLIST.md`](../../AI_START_CHECKLIST.md)。连续训练脚本默认使用 16 个 worker，可按机器资源用 `-Workers` 调整。
 
 本实验固定使用用户确认的“昏晓”9×9地图、初始摆子和双人两队。训练和本地试玩都从仓库中的 `packages/game-core`、`packages/core-content` 读取本地共享 TypeScript 规则；不会调用线上内核，也不会改写正式地图。地图文件仍保存 `matchConditionIds: []`，实验加载时只挂载游戏核心默认条件：失去全部据点淘汰、最后存活队伍获胜。

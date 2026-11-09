@@ -52,6 +52,21 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def opponent_mix_arguments(opponent_pool, opponent_model_family, league_ratio):
+    """Return explicit CLI arguments for a frozen-opponent game mix."""
+    if not opponent_pool:
+        if league_ratio != 0:
+            raise ValueError("league-ratio requires at least one opponent-pool checkpoint")
+        return ["--league-ratio", "0"]
+    if not 0 < league_ratio <= 1:
+        raise ValueError("opponent-pool requires league-ratio in (0, 1]")
+    if opponent_model_family not in {"mlp", "hex-graph-v1", "phase-head-v1"}:
+        raise ValueError("unsupported opponent model family")
+    return ["--opponent-pool", "|".join(opponent_pool),
+            "--opponent-model-family", opponent_model_family,
+            "--league-ratio", format(league_ratio, ".12g")]
+
+
 def owned_root(path, runs=RUNS):
     path, runs = Path(path).resolve(), Path(runs).resolve()
     if path == runs or path.parent != runs or not re.fullmatch(r"[a-zA-Z0-9_-]+", path.name):
@@ -219,7 +234,31 @@ class Supervisor:
                           "generation": 1, "attempt": 1,
                           "champion": str(Path(args.checkpoint).resolve()), "consecutiveNoPromotion": 0,
                           "failures": 0, "needsReview": False, "currentJob": None}
-        self.state["configuration"] = {key: value for key, value in vars(args).items()}
+
+        # None means the caller omitted the new option. Restore each omitted
+        # field from persisted configuration so an ordinary restart cannot
+        # silently revert a frozen-opponent run to pure self-play.
+        saved_configuration = self.state.get("configuration") or {}
+        raw_pool = args.opponent_pool if args.opponent_pool is not None \
+            else saved_configuration.get("opponent_pool", [])
+        opponent_model_family = args.opponent_model_family if args.opponent_model_family is not None \
+            else saved_configuration.get("opponent_model_family", "mlp")
+        league_ratio = args.league_ratio if args.league_ratio is not None \
+            else saved_configuration.get("league_ratio", 0.0)
+        if not isinstance(raw_pool, list) or not all(isinstance(path, str) for path in raw_pool):
+            raise ValueError("persisted opponent-pool must be a list of checkpoint paths")
+        self.opponent_pool = []
+        for checkpoint in raw_pool:
+            resolved = Path(checkpoint).resolve()
+            if not resolved.is_file():
+                raise ValueError(f"opponent-pool checkpoint does not exist: {resolved}")
+            self.opponent_pool.append(str(resolved))
+        # Validate only after omitted fields have been restored.
+        opponent_mix_arguments(self.opponent_pool, opponent_model_family, league_ratio)
+        args.opponent_pool = self.opponent_pool
+        args.opponent_model_family = opponent_model_family
+        args.league_ratio = league_ratio
+        self.state["configuration"] = {**vars(args), "opponent_pool": self.opponent_pool}
 
     def save(self, **updates):
         self.state.update(updates)
@@ -323,6 +362,19 @@ class Supervisor:
             self.save(needsReview=False, failures=0, consecutiveNoPromotion=0)
             self.event("review_released")
 
+    def selfplay_command(self, name, champion, seed):
+        common = ["--device", "xpu", "--workers", str(self.args.workers),
+                  "--max-actions", "10000", "--max-learning-rounds", "0",
+                  "--seed", str(seed)]
+        return [self.node, str(EXPERIMENT / "launch.mjs"), "selfplay", "--name", name,
+                "--checkpoint", champion, "--model-family", "hex-graph-v1",
+                "--games", str(self.args.games), "--simulations", str(self.args.simulations),
+                "--min-simulations", str(self.args.min_simulations),
+                "--think-ms", str(self.args.think_ms), "--bootstrap", "none",
+                *opponent_mix_arguments(self.opponent_pool, self.args.opponent_model_family,
+                                        self.args.league_ratio),
+                "--max-samples", "256", "--replay", *common]
+
     def one_generation(self):
         generation, attempt = self.state["generation"], self.state["attempt"]
         name = f"{self.root.name}-g{generation:04d}-a{attempt:03d}"
@@ -338,11 +390,7 @@ class Supervisor:
         seed = self.args.seed + generation * 100 + attempt
         common = ["--device", "xpu", "--workers", str(self.args.workers), "--max-actions", "10000",
                   "--max-learning-rounds", "0", "--seed", str(seed)]
-        collect = [self.node, str(EXPERIMENT / "launch.mjs"), "selfplay", "--name", name,
-                   "--checkpoint", champion, "--model-family", "hex-graph-v1", "--games", str(self.args.games),
-                   "--simulations", str(self.args.simulations), "--min-simulations", str(self.args.min_simulations),
-                   "--think-ms", str(self.args.think_ms), "--bootstrap", "none", "--league-ratio", "0",
-                   "--max-samples", "256", "--replay", *common]
+        collect = self.selfplay_command(name, champion, seed)
         self.save(generationDirectory=str(directory), candidate=str(candidate), evaluation=None)
         self.run_job("selfplay", collect, log_dir / "selfplay.log", directory)
         if not data.exists() or not metadata.exists() or len(completed_games(directory)) != self.args.games:
@@ -440,6 +488,12 @@ def main():
     parser.add_argument("--simulations", type=int, default=16)
     parser.add_argument("--min-simulations", type=int, default=4)
     parser.add_argument("--think-ms", type=int, default=100)
+    parser.add_argument("--opponent-pool", action="append", default=None,
+                        help="repeat for frozen opponent checkpoints; all must share opponent-model-family")
+    parser.add_argument("--opponent-model-family", default=None,
+                        choices=["mlp", "hex-graph-v1", "phase-head-v1"])
+    parser.add_argument("--league-ratio", type=float, default=None,
+                        help="fraction of games against opponent-pool; remaining games are self-play")
     parser.add_argument("--evaluation-games", type=int, default=32)
     parser.add_argument("--evaluation-simulations", type=int, default=32)
     parser.add_argument("--review-after", type=int, default=5)
@@ -461,6 +515,8 @@ def main():
         parser.error("training/search/review limits must be positive")
     if args.min_simulations > args.simulations or args.think_ms < 0 or args.max_generations < 0:
         parser.error("invalid search/generation limits")
+    if args.league_ratio is not None and not 0 <= args.league_ratio <= 1:
+        parser.error("league-ratio must be in [0,1]")
     if min(args.poll_seconds, args.min_free_memory_gib, args.min_free_disk_gib,
            args.stall_minutes, args.job_hours) <= 0:
         parser.error("resource/time limits must be positive")

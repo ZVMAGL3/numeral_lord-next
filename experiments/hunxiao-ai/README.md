@@ -2,6 +2,8 @@
 
 2026-11-09 已实施健康 Hex 模型训练闭环，完成 XPU 热启动及自然对局/续训验证，并启动独立的 100 局节点 supervisor。当前阶段、checkpoint、恢复与效果观察说明见[自主训练说明](AUTONOMOUS_TRAINING.md)。此前的“训练保持暂停”仅描述 11 月 8 日审计时状态，当前授权与状态以自主训练说明和本地 progress 为准。
 
+2026-11-10 首轮外部对照仍落后于旧 MLP20（固定 16 次模拟下 7/32 胜），已开始冻结旧模型陪练的单因素试验，不能把内部晋级当作架构升级成功。详见[首轮效果复核](../../docs/ai-training-observations-2026-11-10.md)。
+
 2026-11-08 重新审计发现当前主线存在策略上下文退化、历史价值饱和、样本权重遗漏和增援搜索效率问题。证据、论文与后续小规模验证顺序见[训练重新评估](../../docs/ai-training-reassessment-2026-11-08.md)。本轮仅诊断，训练保持暂停；下述历史代数和训练损失不能单独作为棋力进步的证明。
 
 跨设备恢复使用的当前权重保存在 [`checkpoints/hunxiao-iteration-20.pt`](checkpoints/hunxiao-iteration-20.pt)，通过 Git LFS 管理。新设备的完整拉取与启动步骤见仓库根目录 [`AI_START_CHECKLIST.md`](../../AI_START_CHECKLIST.md)。连续训练脚本默认使用 16 个 worker，可按机器资源用 `-Workers` 调整。

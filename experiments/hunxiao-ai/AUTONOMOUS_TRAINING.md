@@ -15,6 +15,8 @@
 
 已启动主运行根目录：`runs/spatial-autonomous-20261109/`。它按 100 局一个小节点继续采局、训练和评测，结果充分后再决定是否扩量。
 
+2026-11-10 首轮外部对照：选定的 Hex 节点 2 对冻结旧 MLP20，在双方固定 16 次模拟的 32 局中仅 7 胜、25 负。内部两次晋级没有传递为胜过旧模型。已在节点 4 完整结束后安全切换节点 5 的对手分布试验：60% 自身对局、40% 对冻结旧 MLP20，其余参数不变。证据与边界见[首轮效果复核](../../docs/ai-training-observations-2026-11-10.md)。这是待验证调整，不宣称棋力已修好。
+
 ## 无需载入模型的进度查看
 
 在仓库根目录运行：
@@ -35,6 +37,7 @@ Get-Content .\experiments\hunxiao-ai\runs\spatial-autonomous-20261109\events.jso
 当前配置：
 
 - 8 workers，100 局；每命令最多 16 次、至少 4 次搜索，100ms 软预算。
+- 当前本机节点 5 起使用 `--opponent-pool experiments/hunxiao-ai/checkpoints/hunxiao-iteration-20.pt --opponent-model-family mlp --league-ratio 0.4`（实际保存的是绝对路径）；100 局精确分为 40 局陪练和 60 局纯自身对战。陪练局只采集学习方，不把旧对手走法当最佳标签。新建 supervisor 不配置对手池时仍默认纯自博弈。
 - 每局最多保留 256 个局面；10,000 原子动作只是安全计算预算，截断不判胜、不伪造平局。
 - 新采样阶段只学习自然完成、非截断对局。所有回合可学习，实际使用局长/短胜与席位权重。
 - 每节点 300 步、batch 32、最多 16,384 条有界样本，学习率 0.0001；每 100 步保存 latest。
@@ -56,7 +59,11 @@ Get-Content .\experiments\hunxiao-ai\runs\spatial-autonomous-20261109\events.jso
 experiments/hunxiao-ai/.venv/Scripts/python.exe -u experiments/hunxiao-ai/python/train_autonomous.py --run-root experiments/hunxiao-ai/runs/spatial-autonomous-20261109 --checkpoint experiments/hunxiao-ai/runs/hunxiao-hex-healthy-seed-20261109/seed.pt
 ```
 
-已有 progress 会使用保存的冠军与代数。停止请求：
+已有 progress 会使用保存的冠军与代数。
+
+已有 progress 的对手池、模型族和混合比例也会在未显式传入时恢复；矛盾配置会拒绝启动，不能静默回到纯自身对战。新设备要复现当前混合试验时，显式追加 `--opponent-pool experiments/hunxiao-ai/checkpoints/hunxiao-iteration-20.pt --opponent-model-family mlp --league-ratio 0.4`。
+
+停止请求：
 
 ```powershell
 New-Item -ItemType File -Force .\experiments\hunxiao-ai\runs\spatial-autonomous-20261109\STOP

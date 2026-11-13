@@ -28,6 +28,7 @@ const { values: flags, positionals } = parseArgs({ allowPositionals: true, optio
   bootstrap: { type: "string", default: "none" }, device: { type: "string", default: "auto" },
   name: { type: "string" }, steps: { type: "string", default: "400" },
   "batch-size": { type: "string", default: "64" }, "think-ms": { type: "string", default: "0" },
+  "inference-flush-mode": { type: "string", default: "timer" },
   iterations: { type: "string", default: "1" }, data: { type: "string" }, metadata: { type: "string" },
   output: { type: "string" }, resume: { type: "string" }, "seed-data": { type: "string" },
   "seed-metadata": { type: "string" }, port: { type: "string", default: "8060" },
@@ -169,6 +170,8 @@ function modelLabel(path: string): string {
 }
 
 async function runGames(settings: RunSettings) {
+  const flushMode = flags["inference-flush-mode"];
+  if (flushMode !== "timer" && flushMode !== "immediate") throw new Error("inference flush mode must be timer or immediate");
   const directory = join(experimentRoot, "runs", settings.name);
   if (existsSync(join(directory, "summary.json")) || existsSync(join(directory, "samples.jsonl"))) throw new Error(`run already exists: ${directory}`);
   mkdirSync(directory, { recursive: true });
@@ -179,6 +182,7 @@ async function runGames(settings: RunSettings) {
       opponent: modelFamily(flags["opponent-model-family"], "opponent-model-family") },
     evaluation: { stochasticArena: settings.exploratory && !settings.collect,
       pairedSeatSeeds: settings.pairedSeatSeeds ?? false },
+    inferenceFlushMode: flushMode,
     search: { simulations: settings.simulations, minimumSimulations: settings.minimumSimulations,
       thinkMs: settings.thinkMs, adaptiveMultiplier: settings.searchMultiplier,
       consecutiveNonPromotions: settings.consecutiveNonPromotions } };
@@ -203,16 +207,16 @@ async function runGames(settings: RunSettings) {
       || (settings.opponentPool.length > 0 && settings.leagueRatio > 0)) {
       if (!settings.checkpoint) throw new Error("network policy/bootstrap requires --checkpoint");
       services.candidate = new InferenceService(resolve(settings.checkpoint), env.fingerprint, flags.device,
-        32, 2, inferenceScript(modelFamily(flags["model-family"], "model-family")));
+        32, 2, inferenceScript(modelFamily(flags["model-family"], "model-family")), flushMode);
       await services.candidate.start();
       if (settings.opponentCheckpoint) {
         services.opponent = new InferenceService(resolve(settings.opponentCheckpoint), env.fingerprint, flags.device,
-          32, 2, inferenceScript(modelFamily(flags["opponent-model-family"], "opponent-model-family")));
+          32, 2, inferenceScript(modelFamily(flags["opponent-model-family"], "opponent-model-family")), flushMode);
         await services.opponent.start();
       }
       for (let index = 0; index < settings.opponentPool.length && settings.leagueRatio > 0; index += 1) {
         const service = new InferenceService(settings.opponentPool[index]!, env.fingerprint, flags.device,
-          32, 2, inferenceScript(modelFamily(flags["opponent-model-family"], "opponent-model-family")));
+          32, 2, inferenceScript(modelFamily(flags["opponent-model-family"], "opponent-model-family")), flushMode);
         services[`opponent-${index}`] = service;
         await service.start();
       }

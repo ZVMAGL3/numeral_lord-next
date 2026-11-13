@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 EXPERIMENT = Path(__file__).resolve().parents[1]
@@ -307,23 +307,28 @@ class Supervisor:
             child.kill()
             child.wait(timeout=15)
 
-    def run_job(self, stage, command, log_path, game_directory=None):
+    def run_job(self, stage, command, log_path, game_directory=None, *, validate=None):
         self.wait_resources()
         log_path = Path(log_path)
         self.save(status=stage, currentJob={"stage": stage, "pid": None,
                   "command": command, "log": str(log_path), "startedAt": now()})
         started = last_growth = time.monotonic()
         last_size, low_memory_polls = -1, 0
-        with log_path.open("xb") as stream:
-            kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
-            child = subprocess.Popen(command, cwd=REPOSITORY, stdin=subprocess.DEVNULL,
-                                     stdout=stream, stderr=subprocess.STDOUT, **kwargs)
-            self.state["currentJob"]["pid"] = child.pid
-            self.save()
-            self.event("job_started", stage=stage, pid=child.pid, log=str(log_path))
-            try:
+        child = None
+        try:
+            if validate:
+                validate()
+            with log_path.open("xb") as stream:
+                kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+                child = subprocess.Popen(command, cwd=REPOSITORY, stdin=subprocess.DEVNULL,
+                                         stdout=stream, stderr=subprocess.STDOUT, **kwargs)
+                self.state["currentJob"]["pid"] = child.pid
+                self.save(lastProgressAt=now())
+                self.event("job_started", stage=stage, pid=child.pid, log=str(log_path))
                 while child.poll() is None:
                     self.check_stop()
+                    if validate:
+                        validate()
                     measured = resources(self.root)
                     low_memory_polls = low_memory_polls + 1 if not self.enough_resources(measured) else 0
                     if low_memory_polls >= 3:
@@ -331,6 +336,7 @@ class Supervisor:
                     size = log_path.stat().st_size
                     if size != last_size:
                         last_size, last_growth = size, time.monotonic()
+                        self.state["lastProgressAt"] = now()
                     if time.monotonic() - last_growth > self.args.stall_minutes * 60:
                         raise RuntimeError("job log stopped growing beyond its stall budget")
                     if time.monotonic() - started > self.args.job_hours * 3600:
@@ -340,11 +346,12 @@ class Supervisor:
                     time.sleep(self.args.poll_seconds)
                 if child.returncode:
                     raise RuntimeError(f"{stage} exited with code {child.returncode}; see {log_path}")
-            except BaseException:
+        except BaseException:
+            if child is not None:
                 self.stop_owned_child(child)
-                raise
-            finally:
-                self.save(currentJob=None)
+            raise
+        finally:
+            self.save(currentJob=None, lastProgressAt=now())
         self.event("job_finished", stage=stage, elapsedSeconds=time.monotonic() - started)
 
     def require_review(self, reason):
@@ -354,26 +361,77 @@ class Supervisor:
         self.event("review_required", reason=reason)
 
     def wait_review(self):
-        while self.review_file.exists():
+        from review_pilot import ReviewPilot
+
+        while self.review_file.exists() or (self.root / "review-plan.json").exists():
             self.check_stop()
-            self.save(status="waiting_review")
+            pilot = None
+            try:
+                pilot = ReviewPilot.load(self)
+                status = pilot.run() if pilot is not None else {
+                    "status": "unplanned",
+                    "nextAction": "Register a bounded experiment or report the blocker.",
+                }
+            except (StopRequested, KeyboardInterrupt):
+                raise
+            except Exception as error:
+                status = {"status": "failed", "error": str(error),
+                          "nextAction": "Inspect the failure and register the next experiment."}
+                if pilot is not None:
+                    status["planId"] = pilot.plan["id"]
+                    status["statusFile"] = str(pilot.state_path)
+                    pilot.save(status="failed", review=status)
+            previous = self.state.get("reviewWorkflow") or {}
+            details = {key: value for key, value in previous.items() if key not in {"since", "notifyAfter"}}
+            if details != status or self.state["status"] != "waiting_review":
+                start = datetime.now(timezone.utc)
+                self.save(status="waiting_review", reviewWorkflow={
+                    **status, "since": start.isoformat(), "notifyAfter": (start + timedelta(minutes=30)).isoformat(),
+                })
+                self.event("review_waiting", **status)
             time.sleep(self.args.poll_seconds)
+        if self.state.get("reviewWorkflow"):
+            self.save(reviewWorkflow=None)
         if self.state.get("needsReview"):
             self.save(needsReview=False, failures=0, consecutiveNoPromotion=0)
             self.event("review_released")
 
-    def selfplay_command(self, name, champion, seed):
+    def selfplay_command(self, name, champion, seed, *, games=None, flush_mode="timer"):
         common = ["--device", "xpu", "--workers", str(self.args.workers),
                   "--max-actions", "10000", "--max-learning-rounds", "0",
                   "--seed", str(seed)]
         return [self.node, str(EXPERIMENT / "launch.mjs"), "selfplay", "--name", name,
                 "--checkpoint", champion, "--model-family", "hex-graph-v1",
-                "--games", str(self.args.games), "--simulations", str(self.args.simulations),
+                "--games", str(self.args.games if games is None else games), "--simulations", str(self.args.simulations),
                 "--min-simulations", str(self.args.min_simulations),
-                "--think-ms", str(self.args.think_ms), "--bootstrap", "none",
+                "--think-ms", str(self.args.think_ms), "--bootstrap", "none", "--inference-flush-mode", flush_mode,
                 *opponent_mix_arguments(self.opponent_pool, self.args.opponent_model_family,
                                         self.args.league_ratio),
                 "--max-samples", "256", "--replay", *common]
+
+    def training_command(self, data, metadata, candidate, champion, seed):
+        return [sys.executable, "-u", str(EXPERIMENT / "python/train_hex.py"), "--data", str(data),
+                "--metadata", str(metadata), "--output", str(candidate), "--resume", champion,
+                "--device", "xpu", "--max-samples", str(self.args.max_samples),
+                "--steps", str(self.args.steps), "--batch-size", str(self.args.batch_size),
+                "--seed", str(seed), "--lr", "0.0001", "--seat2-weight", "1.10",
+                "--policy-loss-weight", "1", "--eval-interval", "25", "--checkpoint-interval", "100"]
+
+    def health_command(self, candidate, data, report):
+        return [sys.executable, "-u", str(EXPERIMENT / "python/audit_hex_checkpoint.py"),
+                "--checkpoint", str(candidate), "--data", str(data), "--output", str(report)]
+
+    def evaluation_command(self, name, candidate, champion, seed, *, simulations=None, flush_mode="timer"):
+        budget = str(self.args.evaluation_simulations if simulations is None else simulations)
+        return [self.node, str(EXPERIMENT / "launch.mjs"), "arena", "--name", name,
+                "--policy", "network", "--opponent", "network", "--checkpoint", str(candidate),
+                "--opponent-checkpoint", champion, "--model-family", "hex-graph-v1",
+                "--opponent-model-family", "hex-graph-v1", "--games", str(self.args.evaluation_games),
+                "--simulations", budget, "--min-simulations", budget, "--think-ms", "0",
+                "--inference-flush-mode", flush_mode,
+                "--stochastic-arena", "--paired-seat-seeds", "--league-ratio", "0", "--replay",
+                "--device", "xpu", "--workers", str(self.args.workers), "--max-actions", "10000",
+                "--max-learning-rounds", "0", "--seed", str(seed)]
 
     def one_generation(self):
         generation, attempt = self.state["generation"], self.state["attempt"]
@@ -388,38 +446,24 @@ class Supervisor:
         candidate = log_dir / "candidate.pt"
         data, metadata = directory / "samples.jsonl", directory / "metadata.json"
         seed = self.args.seed + generation * 100 + attempt
-        common = ["--device", "xpu", "--workers", str(self.args.workers), "--max-actions", "10000",
-                  "--max-learning-rounds", "0", "--seed", str(seed)]
         collect = self.selfplay_command(name, champion, seed)
         self.save(generationDirectory=str(directory), candidate=str(candidate), evaluation=None)
         self.run_job("selfplay", collect, log_dir / "selfplay.log", directory)
         if not data.exists() or not metadata.exists() or len(completed_games(directory)) != self.args.games:
             raise RuntimeError("self-play did not persist the complete data/metadata/game set")
-        train = [sys.executable, "-u", str(EXPERIMENT / "python/train_hex.py"), "--data", str(data),
-                 "--metadata", str(metadata), "--output", str(candidate), "--resume", champion,
-                 "--device", "xpu", "--max-samples", str(self.args.max_samples),
-                 "--steps", str(self.args.steps), "--batch-size", str(self.args.batch_size),
-                 "--seed", str(seed), "--lr", "0.0001", "--seat2-weight", "1.10",
-                 "--policy-loss-weight", "1", "--eval-interval", "25", "--checkpoint-interval", "100"]
+        train = self.training_command(data, metadata, candidate, champion, seed)
         self.run_job("training", train, log_dir / "train.log")
         if not candidate.exists():
             raise RuntimeError("training exited without its completed candidate checkpoint")
         health_path = log_dir / "health.json"
-        health = [sys.executable, str(EXPERIMENT / "python/audit_hex_checkpoint.py"),
-                  "--checkpoint", str(candidate), "--data", str(data), "--output", str(health_path)]
+        health = self.health_command(candidate, data, health_path)
         self.run_job("health_check", health, log_dir / "health.log")
         health_report = json.loads(health_path.read_text(encoding="utf-8"))
         if not health_report.get("success"):
             raise RuntimeError("candidate failed numerical/context/gradient health checks")
         arena_name = name + "-evaluation"
         arena_directory = RUNS / arena_name
-        arena = [self.node, str(EXPERIMENT / "launch.mjs"), "arena", "--name", arena_name,
-                 "--policy", "network", "--opponent", "network", "--checkpoint", str(candidate),
-                 "--opponent-checkpoint", champion, "--model-family", "hex-graph-v1",
-                 "--opponent-model-family", "hex-graph-v1", "--games", str(self.args.evaluation_games),
-                 "--simulations", str(self.args.evaluation_simulations),
-                 "--min-simulations", str(self.args.evaluation_simulations), "--think-ms", "0",
-                 "--stochastic-arena", "--paired-seat-seeds", "--league-ratio", "0", "--replay", *common]
+        arena = self.evaluation_command(arena_name, candidate, champion, seed)
         self.run_job("evaluation", arena, log_dir / "evaluation.log", arena_directory)
         score = paired_score(arena_directory, self.args.evaluation_games, seed)
         if score["promoted"]:
@@ -437,13 +481,17 @@ class Supervisor:
 
     def run(self):
         with single_instance(RUNS / ".autonomous-training-gpu.lock"), single_instance(self.root / "supervisor.lock"):
+            if self.path.exists():
+                current = json.loads(self.path.read_text(encoding="utf-8"))
+                if current.get("updatedAt") != self.state.get("updatedAt"):
+                    raise RuntimeError("supervisor state changed before acquiring the lock; reload before recovery")
             previous = self.state.get("currentJob") or {}
             if previous.get("pid") and pid_alive(previous["pid"]):
                 # Never kill/adopt a possibly reused PID or launch a second GPU task.
                 raise RuntimeError("previous child PID is still alive; inspect its identity before recovery")
-            if previous:
+            if previous and not previous.get("stage", "").startswith("review_"):
                 self.state["attempt"] += 1
-            self.save(currentJob=None, status="starting")
+            self.save(currentJob=None, status="starting", lastError=None)
             self.event("supervisor_started", pid=os.getpid(), champion=self.state["champion"])
             completed = 0
             try:

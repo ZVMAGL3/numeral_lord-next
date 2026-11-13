@@ -6,6 +6,39 @@ import type { PositionPayload } from "./protocol.js";
 
 export interface NetworkResult { priors: number[]; value: number }
 
+export type FlushMode = "timer" | "immediate";
+
+/** One pending handle per event-loop window; the inference service owns batching. */
+export class FlushScheduler {
+  private handle: NodeJS.Timeout | NodeJS.Immediate | undefined;
+
+  constructor(readonly mode: FlushMode, private waitMs: number, private callback: () => void) {
+    if (mode !== "timer" && mode !== "immediate") throw new Error("flush mode must be timer or immediate");
+    if (!Number.isFinite(waitMs) || waitMs < 0) throw new Error("flush wait must be non-negative");
+  }
+
+  schedule(): void {
+    if (this.handle) return;
+    this.handle = this.mode === "immediate"
+      ? setImmediate(() => this.run())
+      : setTimeout(() => this.run(), this.waitMs);
+  }
+
+  cancel(): void {
+    if (!this.handle) return;
+    if (this.mode === "immediate") clearImmediate(this.handle as NodeJS.Immediate);
+    else clearTimeout(this.handle as NodeJS.Timeout);
+    this.handle = undefined;
+  }
+
+  get scheduled(): boolean { return this.handle !== undefined; }
+
+  private run(): void {
+    this.handle = undefined;
+    this.callback();
+  }
+}
+
 export function pythonExecutable(): string {
   if (process.env.HUNXIAO_PYTHON) return process.env.HUNXIAO_PYTHON;
   const relative = process.platform === "win32" ? "./.venv/Scripts/python.exe" : "./.venv/bin/python";
@@ -25,7 +58,7 @@ export class InferenceService {
   private waiting: Request[] = [];
   private pending = new Map<number, { requests: Request[]; timer: NodeJS.Timeout; started: number }>();
   private nextId = 0;
-  private flushTimer: NodeJS.Timeout | undefined;
+  private flushScheduler: FlushScheduler;
   private failure: Error | undefined;
   private readyResolve!: () => void;
   private readyReject!: (error: Error) => void;
@@ -33,8 +66,9 @@ export class InferenceService {
   private readyTimer: NodeJS.Timeout;
   readonly stats = { calls: 0, positions: 0, maxBatch: 0, inferenceRoundtripMs: 0, device: "starting", torch: "" };
 
-  constructor(checkpoint: string, fingerprint: string, device = "auto", private maxBatch = 32, private waitMs = 2,
-    serverScript: "serve.py" | "serve_hex.py" | "serve_phase.py" = "serve.py") {
+  constructor(checkpoint: string, fingerprint: string, device = "auto", private maxBatch = 32, waitMs = 2,
+    serverScript: "serve.py" | "serve_hex.py" | "serve_phase.py" = "serve.py", flushMode: FlushMode = "timer") {
+    this.flushScheduler = new FlushScheduler(flushMode, waitMs, () => this.flush());
     this.ready = new Promise<void>((resolve, reject) => { this.readyResolve = resolve; this.readyReject = reject; });
     // A rejected startup is also observed when no job has reached its first leaf yet.
     void this.ready.catch(() => {});
@@ -99,13 +133,12 @@ export class InferenceService {
     return new Promise<NetworkResult[]>((resolve, reject) => {
       this.waiting.push({ positions, resolve, reject });
       if (this.waiting.reduce((sum, item) => sum + item.positions.length, 0) >= this.maxBatch) this.flush();
-      else if (!this.flushTimer) this.flushTimer = setTimeout(() => this.flush(), this.waitMs);
+      else this.flushScheduler.schedule();
     });
   }
 
   private flush(): void {
-    if (this.flushTimer) clearTimeout(this.flushTimer);
-    this.flushTimer = undefined;
+    this.flushScheduler.cancel();
     if (!this.waiting.length || this.failure) return;
     const requests: Request[] = [];
     let count = 0;
@@ -124,14 +157,14 @@ export class InferenceService {
     this.child.stdin.write(JSON.stringify({ id, positions: requests.flatMap((request) => request.positions) }) + "\n", (error) => {
       if (error) this.fail(error);
     });
-    if (this.waiting.length) this.flushTimer = setTimeout(() => this.flush(), this.waitMs);
+    if (this.waiting.length) this.flushScheduler.schedule();
   }
 
   private fail(error: Error): void {
     if (this.failure) return;
     this.failure = error;
     clearTimeout(this.readyTimer);
-    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushScheduler.cancel();
     this.readyReject(error);
     for (const request of this.waiting.splice(0)) request.reject(error);
     for (const batch of this.pending.values()) {
@@ -144,7 +177,7 @@ export class InferenceService {
 
   close(): void {
     clearTimeout(this.readyTimer);
-    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushScheduler.cancel();
     if (this.waiting.length || this.pending.size) this.fail(new Error("网络服务被关闭"));
     else this.child.stdin.end();
   }

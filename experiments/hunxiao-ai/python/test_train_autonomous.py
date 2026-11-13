@@ -11,7 +11,8 @@ from unittest.mock import patch
 
 from train_autonomous import (RUNS, StopRequested, Supervisor, atomic_json,
                               opponent_mix_arguments, owned_root, paired_score,
-                              pid_alive, single_instance)
+                              pid_alive, sha256, single_instance)
+from review_pilot import ReviewPilot
 
 
 def args_for(root, checkpoint):
@@ -24,6 +25,56 @@ def args_for(root, checkpoint):
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_review_stage_recovers_a_finished_artifact_without_rerunning(self):
+        RUNS.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="supervisor-test-", dir=RUNS) as folder:
+            root = owned_root(folder)
+            seed = root / "seed.pt"
+            seed.write_bytes(b"incumbent")
+            runner = Supervisor(args_for(root, seed))
+            runner.state.update(generation=6, consecutiveNoPromotion=3)
+            atomic_json(runner.review_file, {"expectedBoundaryGeneration": 6})
+            plan = {"schemaVersion": 1, "kind": "training-pilot", "id": "recovery", "generation": 6,
+                    "markerSha256": sha256(runner.review_file), "championSha256": sha256(seed),
+                    "games": 12, "seed": 3, "evaluationSimulations": 16, "inferenceFlushMode": "immediate",
+                    "hypothesis": "More search within the same time budget improves training targets."}
+            atomic_json(root / "review-plan.json", plan)
+            pilot = ReviewPilot.load(runner)
+            cmd = ["test-command"]
+            artifact = pilot.output / "artifact.json"
+
+            def interrupted(*_args, **_kwargs):
+                atomic_json(artifact, {"verified": True})
+                raise KeyboardInterrupt()
+
+            def inspect():
+                return json.loads(artifact.read_text(encoding="utf-8"))
+
+            with patch.object(runner, "run_job", side_effect=interrupted):
+                with self.assertRaises(KeyboardInterrupt):
+                    pilot.stage("selfplay", cmd, inspect)
+            recovered = ReviewPilot.load(runner)
+            with patch.object(runner, "run_job") as run_job:
+                self.assertEqual(recovered.stage("selfplay", cmd, inspect), {"verified": True})
+                run_job.assert_not_called()
+            self.assertEqual(runner.state["consecutiveNoPromotion"], 3)
+            self.assertEqual(runner.state["champion"], str(seed))
+            runner.review_file.unlink()
+            with self.assertRaisesRegex(ValueError, "boundary"):
+                ReviewPilot.load(runner)
+
+    def test_failed_spawn_clears_current_job(self):
+        RUNS.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="supervisor-test-", dir=RUNS) as folder:
+            root = owned_root(folder)
+            seed = root / "seed.pt"
+            seed.write_bytes(b"seed")
+            runner = Supervisor(args_for(root, seed))
+            with patch.object(runner, "wait_resources"), patch("train_autonomous.subprocess.Popen", side_effect=OSError):
+                with self.assertRaises(OSError):
+                    runner.run_job("test", ["missing-command"], root / "job.log")
+            self.assertIsNone(runner.state["currentJob"])
+
     def test_opponent_mix_arguments_require_an_explicit_bounded_pool(self):
         self.assertEqual(opponent_mix_arguments([], "mlp", 0), ["--league-ratio", "0"])
         self.assertEqual(opponent_mix_arguments(["old20.pt"], "mlp", 0.4),

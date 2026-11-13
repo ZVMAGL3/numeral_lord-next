@@ -44,6 +44,15 @@ def collection_summary(reports):
     return result
 
 
+def inference_summary(directory):
+    summary = read_json(directory / "summary.json")
+    return {
+        "commandsPerSecond": summary["actions"] / summary["elapsedSeconds"],
+        "services": {name: {**stats, "meanBatch": stats["positions"] / stats["calls"]}
+                     for name, stats in summary["inference"].items() if stats["calls"]},
+    }
+
+
 def paired_diagnostic(reports, seed):
     if not reports or len(reports) % 2:
         raise ValueError("paired analysis requires a complete even set")
@@ -109,7 +118,10 @@ def analyze(root, baseline=None):
                 "partial": status != "completed"}
     if baseline:
         evidence["baselineCollection"] = collection_summary(game_reports(baseline))
+        evidence["baselineInference"] = inference_summary(baseline)
         evidence["baselineLimit"] = "Historical games can differ in seeds, sample counts, training exposure and trajectories."
+    if stages.get("selfplay", {}).get("status") == "completed":
+        evidence["inference"] = inference_summary(RUNS / games_name)
     if stages.get("training", {}).get("status") == "completed":
         metrics = read_json(pilot_dir / "candidate.metrics.json")
         evidence["training"] = {**stages["training"]["result"],

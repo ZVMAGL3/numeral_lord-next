@@ -22,6 +22,13 @@ export interface SearchEnvironment {
 export type Evaluation = { priors: number[]; value: number };
 export type Evaluator = (positions: EncodedPosition[]) => Promise<Evaluation[]>;
 
+export interface LeafContinuationOptions {
+  /** Hard cap on legal engine steps after an otherwise ordinary tree leaf. */
+  maximumAtomicSteps: number;
+  /** Hard cap on neural positions, including the search root and tree leaves. */
+  evaluationBudget: number;
+}
+
 export interface SearchOptions {
   simulations: number;
   /** Minimum amount of useful tree expansion before a soft time budget can stop search. */
@@ -35,6 +42,23 @@ export interface SearchOptions {
   maxDepth?: number;
   /** Soft wall-clock budget, including root evaluation; one simulation is guaranteed. */
   timeLimitMs?: number;
+  /** Experimental opt-in. Omitted by every normal search/training caller. */
+  leafContinuation?: LeafContinuationOptions;
+}
+
+export interface LeafContinuationStats {
+  evaluationPositions: number;
+  attemptedSimulations: number;
+  discardedSimulations: number;
+  discardedForEvaluationBudget: number;
+  discardedForStepLimit: number;
+  /** Neural positions consumed by each discarded simulation, in attempt order. */
+  discardedEvaluationPositions: number[];
+  continuationSteps: number;
+  continuationEvaluationPositions: number;
+  opponentResponseSteps: number;
+  completedWithOpponentResponse: number;
+  completedWithNaturalTerminal: number;
 }
 
 export interface SearchResult {
@@ -43,7 +67,8 @@ export interface SearchResult {
   policy: number[];
   value: number;
   visits: number[];
-  stats: { simulations: number; expanded: number; maxDepth: number; elapsedMs: number };
+  stats: { simulations: number; expanded: number; maxDepth: number; elapsedMs: number;
+    leafContinuation?: LeafContinuationStats };
 }
 
 // Teacher state never becomes a JSON field or enters neural-inference IPC.
@@ -254,6 +279,25 @@ function chooseIntent(node: Node, policy: number[], temperature: number, random:
   return policy.length - 1;
 }
 
+function samplePrior(priors: number[], random: () => number): number {
+  let sample = random();
+  for (let index = 0; index < priors.length; index++) {
+    sample -= priors[index]!;
+    if (sample < 0) return index;
+  }
+  return priors.length - 1;
+}
+
+function resetExpansion(node: Node): void {
+  node.expanded = false;
+  node.value = node.terminal ?? 0;
+  node.intents = [];
+  node.priors = [];
+  node.edgeVisits = [];
+  node.edgeValues = [];
+  node.children = [];
+}
+
 /** PUCT over exact engine states; evaluation may batch across concurrent searches. */
 export async function search(
   env: SearchEnvironment,
@@ -261,7 +305,8 @@ export async function search(
   evaluate: Evaluator,
   options: SearchOptions
 ): Promise<SearchResult> {
-  const { simulations, minimumSimulations = 1, cpuct = 1.5, seed = 0, temperature = 1, rootNoise = 0, maxDepth = 128, timeLimitMs } = options;
+  const { simulations, minimumSimulations = 1, cpuct = 1.5, seed = 0, temperature = 1, rootNoise = 0,
+    maxDepth = 128, timeLimitMs, leafContinuation } = options;
   if (!Number.isSafeInteger(simulations) || simulations < 1) throw new Error("simulations must be a positive integer.");
   if (!Number.isSafeInteger(minimumSimulations) || minimumSimulations < 1 || minimumSimulations > simulations) {
     throw new Error("minimumSimulations must be a positive integer no greater than simulations.");
@@ -274,19 +319,42 @@ export async function search(
   if (timeLimitMs !== undefined && (!Number.isFinite(timeLimitMs) || timeLimitMs <= 0)) {
     throw new Error("timeLimitMs must be finite and positive when supplied.");
   }
+  if (leafContinuation && (!Number.isSafeInteger(leafContinuation.maximumAtomicSteps)
+      || leafContinuation.maximumAtomicSteps < 1)) {
+    throw new Error("leaf continuation maximumAtomicSteps must be a positive integer.");
+  }
+  if (leafContinuation && (!Number.isSafeInteger(leafContinuation.evaluationBudget)
+      || leafContinuation.evaluationBudget < 1)) {
+    throw new Error("leaf continuation evaluationBudget must be a positive integer.");
+  }
+  if (leafContinuation && maxDepth === 0) {
+    throw new Error("leaf continuation requires maxDepth to be positive.");
+  }
   const started = performance.now();
   const random = randomSource(seed);
   const root = makeNode(env, state);
   if (root.terminal !== null) throw new Error("Cannot search a terminal position.");
   let expanded = 0;
   let deepest = 0;
+  let evaluationPositions = 0;
+  const continuationStats: LeafContinuationStats | undefined = leafContinuation ? {
+    evaluationPositions: 0, attemptedSimulations: 0, discardedSimulations: 0,
+    discardedForEvaluationBudget: 0, discardedForStepLimit: 0,
+    discardedEvaluationPositions: [],
+    continuationSteps: 0, continuationEvaluationPositions: 0, opponentResponseSteps: 0,
+    completedWithOpponentResponse: 0, completedWithNaturalTerminal: 0
+  } : undefined;
 
-  const expand = async (node: Node): Promise<number> => {
+  const expand = async (node: Node): Promise<Evaluation> => {
+    if (leafContinuation && evaluationPositions >= leafContinuation.evaluationBudget) {
+      throw new Error("leaf continuation attempted to exceed its neural-position budget");
+    }
     const intents = env.legal(node.state);
     if (intents.length === 0) throw new Error("Nonterminal search state has no legal intents.");
     const position = encodeForSearch(env, node.state);
     checkCandidateOrder(position, intents, node.teamId);
     const batch = await evaluate([position]);
+    evaluationPositions++;
     if (!Array.isArray(batch) || batch.length !== 1) throw new Error("Evaluator must return one result per position.");
     const result = checkedEvaluation(batch[0], intents.length);
     node.intents = [...intents];
@@ -297,7 +365,7 @@ export async function search(
     node.children = intents.map(() => undefined);
     node.expanded = true;
     expanded++;
-    return result.value;
+    return result;
   };
 
   await expand(root);
@@ -305,23 +373,129 @@ export async function search(
   let rootValueSum = 0;
   let completed = 0;
   for (let simulation = 0; simulation < simulations; simulation++) {
+    // Any new nonterminal attempt needs at least a leaf evaluation and one
+    // successor evaluation. Keep the remainder unused rather than start a
+    // simulation that is known to be unable to back up.
+    if (leafContinuation && leafContinuation.evaluationBudget - evaluationPositions < 2) break;
     if (completed >= minimumSimulations && timeLimitMs !== undefined && performance.now() - started >= timeLimitMs) break;
+    if (continuationStats) continuationStats.attemptedSimulations++;
+    const simulationStartEvaluationPositions = evaluationPositions;
     let node = root;
     let depth = 0;
     const path: Array<{ parent: Node; edge: number; child: Node }> = [];
-    let value: number;
+    let value: number | undefined;
+    let completedByOpponentResponse = false;
+    let completedByNaturalTerminal = false;
+    let newlyExpanded: Node | undefined;
+    let incompleteReason: "evaluation-budget" | "step-limit" | undefined;
     for (;;) {
       deepest = Math.max(deepest, depth);
-      if (node.terminal !== null) { value = node.terminal; break; }
-      if (!node.expanded) { value = await expand(node); break; }
-      if (depth >= maxDepth) { value = node.value; break; }
-      const edge = selectEdge(node, cpuct, random);
-      const child = node.children[edge] ?? makeNode(env, env.step(node.state, node.intents[edge]!));
-      node.children[edge] = child;
-      path.push({ parent: node, edge, child });
-      node = child;
-      depth++;
+      if (node.terminal !== null) {
+        value = node.terminal;
+        completedByNaturalTerminal = true;
+        if (leafContinuation) {
+          completedByOpponentResponse = path.some((entry) => entry.parent.teamId !== root.teamId);
+        }
+        break;
+      }
+      let leafEvaluation: Evaluation | undefined;
+      if (!node.expanded) {
+        leafEvaluation = await expand(node);
+        newlyExpanded = node;
+      }
+      if (!leafContinuation) {
+        if (leafEvaluation || depth >= maxDepth) {
+          value = leafEvaluation?.value ?? node.value;
+          break;
+        }
+        const edge = selectEdge(node, cpuct, random);
+        const child = node.children[edge] ?? makeNode(env, env.step(node.state, node.intents[edge]!));
+        node.children[edge] = child;
+        path.push({ parent: node, edge, child });
+        node = child;
+        depth++;
+        continue;
+      }
+      const pathHasOpponentResponse = path.some((entry) => entry.parent.teamId !== root.teamId);
+      if (pathHasOpponentResponse) {
+        value = leafEvaluation?.value ?? node.value;
+        completedByOpponentResponse = pathHasOpponentResponse;
+        break;
+      }
+      if (depth < maxDepth && !leafEvaluation) {
+        const edge = selectEdge(node, cpuct, random);
+        const child = node.children[edge] ?? makeNode(env, env.step(node.state, node.intents[edge]!));
+        node.children[edge] = child;
+        path.push({ parent: node, edge, child });
+        node = child;
+        depth++;
+        continue;
+      }
+      if (!leafEvaluation) leafEvaluation = { priors: node.priors, value: node.value };
+      let rolloutState = node.state;
+      let rolloutTeam = node.teamId;
+      let leafSign = 1;
+      let rolloutEvaluation = leafEvaluation;
+      let rolloutComplete = false;
+      for (let step = 0; step < leafContinuation.maximumAtomicSteps; step++) {
+        // A root-team step needs at least one evaluation for the opponent policy and
+        // one for the opponent action's successor. An opponent step needs the latter.
+        const minimumRemainingEvaluations = rolloutTeam === root.teamId ? 2 : 1;
+        if (leafContinuation.evaluationBudget - evaluationPositions < minimumRemainingEvaluations) {
+          incompleteReason = "evaluation-budget";
+          break;
+        }
+        const intents = env.legal(rolloutState);
+        if (intents.length === 0) throw new Error("Nonterminal continuation state has no legal intents.");
+        const selected = samplePrior(rolloutEvaluation.priors, random);
+        const actingTeam = rolloutTeam;
+        const nextState = env.step(rolloutState, intents[selected]!);
+        const nextTeam = currentTeam(env, nextState);
+        continuationStats!.continuationSteps++;
+        if (actingTeam !== root.teamId) continuationStats!.opponentResponseSteps++;
+        if (actingTeam !== nextTeam) leafSign = -leafSign;
+        rolloutState = nextState;
+        rolloutTeam = nextTeam;
+        const terminal = env.terminalValue(rolloutState, rolloutTeam);
+        if (terminal !== null) {
+          value = leafSign * checkedValue(terminal, "Terminal value");
+          if (actingTeam !== root.teamId) completedByOpponentResponse = true;
+          completedByNaturalTerminal = true;
+          rolloutComplete = true;
+          break;
+        }
+        if (evaluationPositions >= leafContinuation.evaluationBudget) {
+          incompleteReason = "evaluation-budget";
+          break;
+        }
+        const position = encodeForSearch(env, rolloutState);
+        const nextIntents = env.legal(rolloutState);
+        checkCandidateOrder(position, nextIntents, rolloutTeam);
+        const batch = await evaluate([position]);
+        evaluationPositions++;
+        continuationStats!.continuationEvaluationPositions++;
+        if (!Array.isArray(batch) || batch.length !== 1) throw new Error("Evaluator must return one result per position.");
+        rolloutEvaluation = checkedEvaluation(batch[0], nextIntents.length);
+        if (actingTeam !== root.teamId) {
+          value = leafSign * rolloutEvaluation.value;
+          completedByOpponentResponse = true;
+          rolloutComplete = true;
+          break;
+        }
+      }
+      if (!rolloutComplete && !incompleteReason) incompleteReason = "step-limit";
+      break;
     }
+    if (incompleteReason) {
+      continuationStats!.discardedSimulations++;
+      continuationStats!.discardedEvaluationPositions.push(
+        evaluationPositions - simulationStartEvaluationPositions);
+      if (incompleteReason === "evaluation-budget") continuationStats!.discardedForEvaluationBudget++;
+      else continuationStats!.discardedForStepLimit++;
+      if (newlyExpanded) { resetExpansion(newlyExpanded); expanded--; }
+      continue;
+    }
+    if (value === undefined) throw new Error("completed search simulation has no backed-up value");
     node.visits++;
     for (let index = path.length - 1; index >= 0; index--) {
       const { parent, edge, child } = path[index]!;
@@ -333,14 +507,20 @@ export async function search(
     }
     rootValueSum += value;
     completed++;
+    if (continuationStats) {
+      continuationStats.completedWithOpponentResponse += Number(completedByOpponentResponse);
+      continuationStats.completedWithNaturalTerminal += Number(completedByNaturalTerminal);
+    }
     // A single awaited evaluator call can exceed the budget; this is not a hard deadline.
     if (completed >= minimumSimulations && timeLimitMs !== undefined && performance.now() - started >= timeLimitMs) break;
   }
   const policy = policyFromVisits(root.edgeVisits, root.priors, 1);
   const selectionPolicy = policyFromVisits(root.edgeVisits, root.priors, temperature);
   const selected = chooseIntent(root, selectionPolicy, temperature, random);
+  if (continuationStats) continuationStats.evaluationPositions = evaluationPositions;
   return {
-    intent: root.intents[selected]!, policy, value: rootValueSum / completed, visits: [...root.edgeVisits],
-    stats: { simulations: completed, expanded, maxDepth: deepest, elapsedMs: performance.now() - started }
+    intent: root.intents[selected]!, policy, value: completed ? rootValueSum / completed : root.value, visits: [...root.edgeVisits],
+    stats: { simulations: completed, expanded, maxDepth: deepest, elapsedMs: performance.now() - started,
+      ...(continuationStats ? { leafContinuation: continuationStats } : {}) }
   };
 }

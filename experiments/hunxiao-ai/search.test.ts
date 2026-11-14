@@ -9,6 +9,7 @@ import {
 interface GraphNode {
   team: "A" | "B";
   children?: number[];
+  intentType?: "move-unit" | "end-reinforcement-phase";
   terminalA?: number;
   heuristicA?: number;
 }
@@ -28,18 +29,19 @@ function graphEnvironment(graph: GraphNode[]): SearchEnvironment & { initial: Ga
     players: { p1: { id: "p1", teamId: "A" }, p2: { id: "p2", teamId: "B" } },
     teams: {}
   } as unknown as GameState);
-  const intentsAt = (index: number): GameIntent[] => (graph[index]!.children ?? []).map((target, offset) => ({
-    type: "move-unit", unitId: `u-${offset}`, destinationId: `${target}`
-  } as GameIntent));
+  const intentsAt = (index: number): GameIntent[] => (graph[index]!.children ?? []).map((target, offset) =>
+    graph[index]!.intentType === "end-reinforcement-phase"
+      ? { type: "end-reinforcement-phase" } as GameIntent
+      : { type: "move-unit", unitId: `u-${offset}`, destinationId: `${target}` } as GameIntent);
   const env: SearchEnvironment & { initial: GameState } = {
     initial: stateAt(0),
     team: (state) => graph[state.sequence]!.team,
     legal: (state) => intentsAt(state.sequence),
     step: (state, intent) => {
       const legal = intentsAt(state.sequence);
-      assert.ok(legal.some((candidate) => JSON.stringify(candidate) === JSON.stringify(intent)), "engine rejects illegal intent");
-      assert.equal(intent.type, "move-unit");
-      return stateAt(Number((intent as Extract<GameIntent, { type: "move-unit" }>).destinationId));
+      const index = legal.findIndex((candidate) => JSON.stringify(candidate) === JSON.stringify(intent));
+      assert.ok(index >= 0, "engine rejects illegal intent");
+      return stateAt(graph[state.sequence]!.children![index]!);
     },
     terminalValue: (state, team) => {
       const value = graph[state.sequence]!.terminalA;
@@ -237,6 +239,10 @@ test("terminal roots and invalid search limits are rejected", async () => {
   await assert.rejects(search(env, env.initial, uniform, { simulations: 0 }), /positive integer/);
   await assert.rejects(search(env, env.initial, uniform, { simulations: 1, minimumSimulations: 2 }), /no greater than simulations/);
   await assert.rejects(search(env, env.initial, uniform, { simulations: 1, maxDepth: -1 }), /nonnegative integer/);
+  await assert.rejects(search(env, env.initial, uniform, {
+    simulations: 1, maxDepth: 0,
+    leafContinuation: { maximumAtomicSteps: 4, evaluationBudget: 8 }
+  }), /requires maxDepth to be positive/);
   await assert.rejects(search(env, env.initial, uniform, { simulations: 1, timeLimitMs: 0 }), /finite and positive/);
 });
 
@@ -282,4 +288,155 @@ test("action temperature does not discard root-visit training targets", async ()
   });
   assert.deepEqual(cold.policy, warm.policy);
   assert.ok(cold.policy.every((probability) => probability > 0));
+});
+
+test("leaf continuation executes a real opponent response and preserves acting-team value perspective", async () => {
+  const env = graphEnvironment([
+    { team: "A", children: [1] },
+    { team: "A", children: [2] },
+    { team: "B", children: [3] },
+    { team: "A", children: [4] },
+    { team: "A", terminalA: 1 }
+  ]);
+  const evaluator: Evaluator = async (positions) => positions.map((position) => ({
+    priors: position.intents.map(() => 1),
+    value: position.observation[0] === 3 ? 0.6 : 0
+  }));
+  const result = await search(env, env.initial, evaluator, {
+    simulations: 1, temperature: 0, seed: 4,
+    leafContinuation: { maximumAtomicSteps: 8, evaluationBudget: 8 }
+  });
+  assert.equal(result.stats.simulations, 1);
+  assert.deepEqual(result.visits, [1]);
+  assert.ok(Math.abs(result.value - 0.6) < 1e-12, `unexpected root-team value ${result.value}`);
+  assert.deepEqual(result.stats.leafContinuation, {
+    evaluationPositions: 4,
+    attemptedSimulations: 1,
+    discardedSimulations: 0,
+    discardedForEvaluationBudget: 0,
+    discardedForStepLimit: 0,
+    discardedEvaluationPositions: [],
+    continuationSteps: 2,
+    continuationEvaluationPositions: 2,
+    opponentResponseSteps: 1,
+    completedWithOpponentResponse: 1,
+    completedWithNaturalTerminal: 0
+  });
+});
+
+test("a root-team continuation does not start without the two minimum successor evaluations", async () => {
+  const env = graphEnvironment([
+    { team: "A", children: [1] },
+    { team: "A", children: [2] },
+    { team: "B", children: [3] },
+    { team: "A", children: [4] },
+    { team: "A", terminalA: 1 }
+  ]);
+  const result = await search(env, env.initial, uniform, {
+    simulations: 4, seed: 5,
+    leafContinuation: { maximumAtomicSteps: 8, evaluationBudget: 3 }
+  });
+  assert.equal(result.stats.simulations, 0);
+  assert.deepEqual(result.visits, [0]);
+  assert.equal(result.stats.leafContinuation?.evaluationPositions, 2);
+  assert.equal(result.stats.leafContinuation?.continuationSteps, 0);
+  assert.equal(result.stats.leafContinuation?.opponentResponseSteps, 0,
+    "reaching and encoding the opponent turn is not an opponent action");
+  assert.equal(result.stats.leafContinuation?.discardedForEvaluationBudget, 1);
+  assert.deepEqual(result.stats.leafContinuation?.discardedEvaluationPositions, [1]);
+  assert.equal(result.stats.leafContinuation?.completedWithOpponentResponse, 0);
+  assert.equal(result.value, 0);
+});
+
+test("continuation search does not begin an attempt with fewer than two neural positions", async () => {
+  const env = graphEnvironment([
+    { team: "A", children: [1] },
+    { team: "B", children: [2] },
+    { team: "A", children: [3] },
+    { team: "A", terminalA: 1 }
+  ]);
+  const result = await search(env, env.initial, uniform, {
+    simulations: 1, seed: 5,
+    leafContinuation: { maximumAtomicSteps: 8, evaluationBudget: 2 }
+  });
+  assert.equal(result.stats.simulations, 0);
+  assert.deepEqual(result.visits, [0]);
+  assert.equal(result.stats.leafContinuation?.continuationSteps, 0);
+  assert.equal(result.stats.leafContinuation?.opponentResponseSteps, 0);
+  assert.equal(result.stats.leafContinuation?.evaluationPositions, 1);
+  assert.equal(result.stats.leafContinuation?.attemptedSimulations, 0);
+  assert.deepEqual(result.stats.leafContinuation?.discardedEvaluationPositions, []);
+  assert.equal(result.stats.leafContinuation?.completedWithOpponentResponse, 0);
+});
+
+test("continuation step-cap truncation is not counted as a simulation or root visit", async () => {
+  const env = graphEnvironment([
+    { team: "A", children: [1] },
+    { team: "A", children: [2] },
+    { team: "B", children: [3] },
+    { team: "A", terminalA: 1 }
+  ]);
+  const result = await search(env, env.initial, uniform, {
+    simulations: 1, seed: 6,
+    leafContinuation: { maximumAtomicSteps: 1, evaluationBudget: 8 }
+  });
+  assert.equal(result.stats.simulations, 0);
+  assert.deepEqual(result.visits, [0]);
+  assert.equal(result.stats.leafContinuation?.discardedForStepLimit, 1);
+  assert.equal(result.stats.leafContinuation?.evaluationPositions, 3);
+});
+
+test("leaf continuation accepts an exact natural terminal without inventing an opponent action", async () => {
+  const env = graphEnvironment([
+    { team: "A", children: [1] },
+    { team: "A", children: [2] },
+    { team: "B", terminalA: 1 }
+  ]);
+  const result = await search(env, env.initial, uniform, {
+    simulations: 1, seed: 7,
+    leafContinuation: { maximumAtomicSteps: 4, evaluationBudget: 4 }
+  });
+  assert.equal(result.stats.simulations, 1);
+  assert.deepEqual(result.visits, [1]);
+  assert.equal(result.value, 1);
+  assert.equal(result.stats.leafContinuation?.evaluationPositions, 2);
+  assert.equal(result.stats.leafContinuation?.completedWithNaturalTerminal, 1);
+  assert.equal(result.stats.leafContinuation?.completedWithOpponentResponse, 0);
+});
+
+test("an opponent action that directly terminates counts as both response and natural terminal", async () => {
+  const env = graphEnvironment([
+    { team: "A", children: [1] },
+    { team: "A", children: [2] },
+    { team: "B", children: [3] },
+    { team: "A", terminalA: 1 }
+  ]);
+  const result = await search(env, env.initial, uniform, {
+    simulations: 1, seed: 8,
+    leafContinuation: { maximumAtomicSteps: 4, evaluationBudget: 5 }
+  });
+  assert.equal(result.stats.simulations, 1);
+  assert.deepEqual(result.visits, [1]);
+  assert.equal(result.stats.leafContinuation?.opponentResponseSteps, 1);
+  assert.equal(result.stats.leafContinuation?.completedWithOpponentResponse, 1);
+  assert.equal(result.stats.leafContinuation?.completedWithNaturalTerminal, 1);
+});
+
+test("leaf continuation can sample a legal early phase end and is seed reproducible", async () => {
+  const env = graphEnvironment([
+    { team: "A", children: [1] },
+    { team: "A", children: [2], intentType: "end-reinforcement-phase" },
+    { team: "B", children: [3] },
+    { team: "A", children: [4, 5] },
+    { team: "A", terminalA: 1 }, { team: "A", terminalA: -1 }
+  ]);
+  const options = { simulations: 3, seed: 9127, temperature: 0,
+    leafContinuation: { maximumAtomicSteps: 8, evaluationBudget: 16 } };
+  const first = await search(env, env.initial, uniform, options);
+  const second = await search(env, env.initial, uniform, options);
+  assert.deepEqual(first.intent, second.intent);
+  assert.deepEqual(first.visits, second.visits);
+  assert.deepEqual(first.policy, second.policy);
+  assert.deepEqual(first.stats.leafContinuation, second.stats.leafContinuation);
+  assert.ok(first.stats.leafContinuation!.completedWithOpponentResponse > 0);
 });

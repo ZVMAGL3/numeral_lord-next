@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 import time
@@ -117,7 +118,7 @@ def sample_weights(batch: list[dict], device: torch.device, seat2_weight: float)
 
 
 def losses(model, batch: list[dict], device: torch.device, seat2_weight: float,
-           policy_loss_weight: float = 1.0):
+           policy_loss_weight: float = 1.0, value_loss_weight: float = 1.0):
     logits, predicted_value = model(*position_batch(batch, device))
     policy_target = torch.zeros_like(logits)
     values: list[float] = []
@@ -133,18 +134,18 @@ def losses(model, batch: list[dict], device: torch.device, seat2_weight: float,
     value_target = torch.tensor(values, dtype=torch.float32, device=device)
     value_weight = torch.tensor(value_weights, dtype=torch.float32, device=device) * weights
     value_loss = ((predicted_value - value_target).square() * value_weight).sum() / value_weight.sum().clamp_min(1)
-    return policy_loss * policy_loss_weight + value_loss, policy_loss, value_loss
+    return policy_loss * policy_loss_weight + value_loss * value_loss_weight, policy_loss, value_loss
 
 
 def evaluate(model, samples: list[dict], device: torch.device, seat2_weight: float, batch_size: int,
-             policy_loss_weight: float = 1.0):
+             policy_loss_weight: float = 1.0, value_loss_weight: float = 1.0):
     model.eval()
     sums = [0.0, 0.0, 0.0]
     count = 0
     with torch.no_grad():
         for start in range(0, len(samples), batch_size):
             batch = samples[start:start + batch_size]
-            measured = losses(model, batch, device, seat2_weight, policy_loss_weight)
+            measured = losses(model, batch, device, seat2_weight, policy_loss_weight, value_loss_weight)
             for index, value in enumerate(measured):
                 sums[index] += float(value.cpu()) * len(batch)
             count += len(batch)
@@ -275,13 +276,20 @@ def main():
     parser.add_argument("--seat2-weight", type=float, default=1.10)
     parser.add_argument("--policy-loss-weight", type=float, default=1.0,
                         help="scale policy imitation relative to terminal value learning")
+    parser.add_argument("--value-loss-weight", type=float, default=1.0,
+                        help="scale the value gradient while continuing to report the value loss")
     parser.add_argument("--eval-interval", type=int, default=25)
     parser.add_argument("--checkpoint-interval", type=int, default=100)
     args = parser.parse_args()
     if min(args.steps, args.batch_size, args.max_samples, args.width, args.blocks) < 1 or args.lr <= 0:
         parser.error("steps, batch-size, max-samples, width, blocks and lr must be positive")
-    if args.seat2_weight <= 0 or args.policy_loss_weight < 0 or args.eval_interval < 1 or args.checkpoint_interval < 1:
+    if (args.seat2_weight <= 0 or not math.isfinite(args.policy_loss_weight) or args.policy_loss_weight < 0
+            or args.eval_interval < 1 or args.checkpoint_interval < 1):
         parser.error("seat2-weight, eval-interval and checkpoint-interval must be positive; policy-loss-weight must be non-negative")
+    if not math.isfinite(args.value_loss_weight) or args.value_loss_weight < 0:
+        parser.error("value-loss-weight must be finite and non-negative")
+    if args.policy_loss_weight == 0 and args.value_loss_weight == 0:
+        parser.error("at least one loss weight must be positive")
 
     torch.set_num_threads(2)
     random.seed(args.seed)
@@ -309,7 +317,8 @@ def main():
     if (not initial_health["finite"] or initial_health["maximumPolicyProbabilityDeltaAfterBoardOnlySwap"] <= 1e-8
             or initial_health["wrongTargetValueGradientNorm"] <= 0):
         raise RuntimeError(f"hex model failed initial health check: {initial_health}")
-    initial = evaluate(model, validation, device, args.seat2_weight, args.batch_size, args.policy_loss_weight)
+    initial = evaluate(model, validation, device, args.seat2_weight, args.batch_size,
+                       args.policy_loss_weight, args.value_loss_weight)
     best_loss = initial[0]
     best_step = 0
     best_state = {key: tensor.detach().cpu().clone() for key, tensor in model.state_dict().items()}
@@ -323,7 +332,7 @@ def main():
         "source": source_stats, "samplesUsed": len(samples), "trainingSamples": len(training),
         "validationSamples": len(validation), "validationGames": validation_games,
         "weights": {"seat2": args.seat2_weight, "gameLengthAndWinner": True,
-                    "policyLoss": args.policy_loss_weight, "terminalValue": 1.0},
+                    "policyLoss": args.policy_loss_weight, "terminalValue": args.value_loss_weight},
         "initialLoss": initial, "initialHealth": initial_health,
     }
     atomic_json(progress_output, progress)
@@ -332,7 +341,7 @@ def main():
         model.train()
         batch = random.choices(training, k=min(args.batch_size, len(training)))
         optimizer.zero_grad(set_to_none=True)
-        loss, _, _ = losses(model, batch, device, args.seat2_weight, args.policy_loss_weight)
+        loss, _, _ = losses(model, batch, device, args.seat2_weight, args.policy_loss_weight, args.value_loss_weight)
         if not torch.isfinite(loss):
             raise RuntimeError("non-finite training loss")
         loss.backward()
@@ -340,7 +349,7 @@ def main():
         optimizer.step()
         if step % args.eval_interval == 0 or step == args.steps:
             measured = evaluate(model, validation, device, args.seat2_weight, args.batch_size,
-                                args.policy_loss_weight)
+                                args.policy_loss_weight, args.value_loss_weight)
             if measured[0] < best_loss - 1e-4:
                 best_loss = measured[0]
                 best_step = step
@@ -357,6 +366,7 @@ def main():
                 "learningRate": args.lr, "sourceSamples": source_stats["sourceSamples"],
                 "eligibleSamples": source_stats["eligibleSamples"], "sampleLimit": args.max_samples,
                 "policyLossWeight": args.policy_loss_weight,
+                "valueLossWeight": args.value_loss_weight,
                 "resumedFrom": str(Path(args.resume).resolve()) if args.resume else None,
             }, optimizer)
 
@@ -366,9 +376,11 @@ def main():
         "seed": args.seed, "learningRate": args.lr, "sourceSamples": source_stats["sourceSamples"],
         "eligibleSamples": source_stats["eligibleSamples"], "sampleLimit": args.max_samples,
         "policyLossWeight": args.policy_loss_weight,
+        "valueLossWeight": args.value_loss_weight,
         "resumedFrom": str(Path(args.resume).resolve()) if args.resume else None,
     })
-    final = evaluate(model, validation, device, args.seat2_weight, args.batch_size, args.policy_loss_weight)
+    final = evaluate(model, validation, device, args.seat2_weight, args.batch_size,
+                     args.policy_loss_weight, args.value_loss_weight)
     final_health = model_diagnostics(model, validation, device)
     source_hash = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     metrics = {
@@ -388,8 +400,9 @@ def main():
         "validationMode": "held-out-games" if validation_games else "in-sample-no-holdout",
         "stepsRequested": args.steps,
         "policyLossWeight": args.policy_loss_weight,
+        "valueLossWeight": args.value_loss_weight,
         "sampleWeighting": {"seatBalance": "within each training batch", "seat2": args.seat2_weight,
-                            "gameLengthAndWinner": "train.game_sample_weight", "terminalValue": 1.0},
+                            "gameLengthAndWinner": "train.game_sample_weight", "terminalValue": args.value_loss_weight},
         "bestStep": best_step,
         "initialProbeLoss": initial,
         "finalProbeLoss": final,

@@ -3,9 +3,10 @@ import { appendActionNotation, appendPhaseEndNotation, appendReinforcementNotati
 import { createEnvironment } from "./environment.js";
 import { occupiedCellsByTeam, totalStrengthByTeam } from "./temporary-rules.js";
 import { createHeuristicEvaluator, encodeForSearch, search } from "./search.js";
+import { PHASE_ARENA, phaseArenaSearchOptions } from "./phase-continuation-arena.js";
 import { isWithinLearningRoundWindow } from "./training-policy.js";
 import type { Evaluator } from "./search.js";
-import type { GameOutput, JobOptions, PositionPayload, TrainingSample } from "./protocol.js";
+import type { GameOutput, JobOptions, PhaseArenaSeatDiagnostics, PositionPayload, TrainingSample } from "./protocol.js";
 import type { NetworkResult } from "./runtime.js";
 
 if (!parentPort) throw new Error("worker.ts must run in a worker thread");
@@ -47,6 +48,16 @@ async function run(job: JobOptions): Promise<GameOutput> {
   let notation: Parameters<typeof appendPhaseEndNotation>[0] = [];
   let actions = 0;
   let searchSimulations = 0;
+  const phaseArenaSearch = job.experimentalPhaseContinuationArena ? {
+    maximumNetworkPositionsPerMove: PHASE_ARENA.maximumNetworkPositionsPerMove,
+    bySeat: Object.fromEntries(([1, 2] as const).map((seat) => [seat, {
+      mode: seat === job.candidateSeat ? "leaf-policy-continuation" : "atomic-puct-control",
+      moves: 0, networkPositions: 0, maximumPositionsPerMove: 0, searchElapsedMs: 0,
+      completedSimulations: 0, fallbackMoves: 0, incompleteContinuations: 0,
+      incompleteByEvaluationBudget: 0, incompleteByStepLimit: 0,
+      incompleteEvaluationPositions: 0
+    } satisfies PhaseArenaSeatDiagnostics])) as unknown as Record<1 | 2, PhaseArenaSeatDiagnostics>
+  } : undefined;
   let maxRoundPlayed = 0;
   const started = performance.now();
   while (state.turn.phase !== "finished" && actions < job.maxActions) {
@@ -66,12 +77,26 @@ async function run(job: JobOptions): Promise<GameOutput> {
       policy = result.priors;
       intent = encoded.intents[choose(policy, random, job.exploratory)]!;
     } else {
-      const evaluator = policyKind === "network"
+      const rawEvaluator = policyKind === "network"
         ? network(job.networkOpponent && seat !== job.candidateSeat ? job.opponentSlot ?? "opponent" : "candidate") : teacher;
+      let movePositions = 0;
+      const evaluator: Evaluator = job.experimentalPhaseContinuationArena
+        ? async (positions) => {
+          if (movePositions + positions.length > PHASE_ARENA.maximumNetworkPositionsPerMove) {
+            throw new Error(`phase arena seat ${seat} exceeded ${PHASE_ARENA.maximumNetworkPositionsPerMove} neural positions in one move`);
+          }
+          movePositions += positions.length;
+          return rawEvaluator(positions);
+        }
+        : rawEvaluator;
       // Diversify openings, then let the learned policy finish the game without perpetual noise.
       const openingExploration = job.exploratory && actions < 80;
-      const result = await search(env, state, evaluator, { simulations: job.simulations, minimumSimulations: job.minimumSimulations,
-        seed: Math.floor(random() * 0xffffffff),
+      const searchSeed = Math.floor(random() * 0xffffffff);
+      const searchStarted = performance.now();
+      const result = await search(env, state, evaluator, job.experimentalPhaseContinuationArena
+        ? phaseArenaSearchOptions(seat === job.candidateSeat ? "continuation" : "atomic", searchSeed)
+        : { simulations: job.simulations, minimumSimulations: job.minimumSimulations,
+        seed: searchSeed,
         // Vary self-play openings, then let the learned policy finish without perpetual noise.
         // Evaluation games set exploratory=false and remain deterministic for comparison.
         temperature: job.exploratory ? (actions < 80 ? 1 : 0.2) : 0, rootNoise: openingExploration ? 0.12 : 0, maxDepth: 96,
@@ -80,6 +105,21 @@ async function run(job: JobOptions): Promise<GameOutput> {
       intent = result.intent;
       simulations = result.stats.simulations;
       searchSimulations += simulations;
+      if (phaseArenaSearch) {
+        const diagnostic = phaseArenaSearch.bySeat[seat];
+        const leaf = result.stats.leafContinuation;
+        diagnostic.moves++;
+        diagnostic.networkPositions += movePositions;
+        diagnostic.maximumPositionsPerMove = Math.max(diagnostic.maximumPositionsPerMove, movePositions);
+        diagnostic.searchElapsedMs += performance.now() - searchStarted;
+        diagnostic.completedSimulations += result.stats.simulations;
+        diagnostic.fallbackMoves += Number(result.stats.simulations === 0);
+        diagnostic.incompleteContinuations += leaf?.discardedSimulations ?? 0;
+        diagnostic.incompleteByEvaluationBudget += leaf?.discardedForEvaluationBudget ?? 0;
+        diagnostic.incompleteByStepLimit += leaf?.discardedForStepLimit ?? 0;
+        diagnostic.incompleteEvaluationPositions += leaf?.discardedEvaluationPositions
+          .reduce((sum, positions) => sum + positions, 0) ?? 0;
+      }
     }
     // Reservoir sampling bounds memory while retaining positions across the full game.
     if (job.collect && job.maxSamples > 0 && policyKind !== "random"
@@ -161,6 +201,7 @@ async function run(job: JobOptions): Promise<GameOutput> {
     notation: notation.map((entry) => [...entry.tuple] as [number, number, number]),
     ...(state.result?.message ? { resultMessage: state.result.message } : {}),
     elapsedMs: performance.now() - started, sampleCount: samples.length, searchSimulations,
+    ...(phaseArenaSearch ? { phaseArenaSearch } : {}),
     ...(job.recordReplay ? { replay } : {}) };
   return { samples, report };
 }

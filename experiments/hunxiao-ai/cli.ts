@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 import { createEnvironment, OBSERVATION_SIZE, GLOBAL_SIZE, CANDIDATE_SIZE } from "./environment.js";
 import { InferenceService, pythonExecutable, type NetworkResult } from "./runtime.js";
 import { effectiveLearningRoundLimit, effectiveSearchBudget, effectiveWorkerCount, pairedSeatSeed, PROMOTION_SEAT2_SCORE_WEIGHT, weightedSeatScoreRate } from "./training-policy.js";
+import { PHASE_ARENA, phaseArenaGate, reconcilePhaseArenaInference } from "./phase-continuation-arena.js";
 import type { GameOutput, GameReport, JobOptions, PolicyKind, PositionPayload } from "./protocol.js";
 
 const experimentRoot = fileURLToPath(new URL(".", import.meta.url));
@@ -29,6 +30,9 @@ const { values: flags, positionals } = parseArgs({ allowPositionals: true, optio
   name: { type: "string" }, steps: { type: "string", default: "400" },
   "batch-size": { type: "string", default: "64" }, "think-ms": { type: "string", default: "0" },
   "inference-flush-mode": { type: "string", default: "timer" },
+  "experimental-phase-continuation-arena": { type: "boolean", default: false },
+  "phase-probe": { type: "string" }, "phase-probe-sha256": { type: "string" },
+  "check-only": { type: "boolean", default: false },
   iterations: { type: "string", default: "1" }, data: { type: "string" }, metadata: { type: "string" },
   output: { type: "string" }, resume: { type: "string" }, "seed-data": { type: "string" },
   "seed-metadata": { type: "string" }, port: { type: "string", default: "8060" },
@@ -93,7 +97,7 @@ function consecutivePromotionFailures(name: string): number {
 }
 
 function metadata() {
-  const files = ["environment.ts", "search.ts", "worker.ts", "training-policy.ts", "protocol.ts", "runtime.ts", "cli.ts", "tsconfig.json", "launch.mjs", "worker-bootstrap.mjs",
+  const files = ["environment.ts", "search.ts", "worker.ts", "training-policy.ts", "protocol.ts", "runtime.ts", "cli.ts", "phase-continuation-arena.ts", "tsconfig.json", "launch.mjs", "worker-bootstrap.mjs",
     "python/model.py", "python/train.py", "python/train_v2.py", "python/serve.py",
     "python/hex_model.py", "python/train_hex.py", "python/compare_hex.py", "python/serve_hex.py",
     "python/phase_model.py", "python/train_phase.py", "python/serve_phase.py", "python/requirements-xpu.txt"];
@@ -130,6 +134,8 @@ interface RunSettings {
   leagueRatio: number;
   recordReplay: boolean;
   pairedSeatSeeds?: boolean;
+  experimentalPhaseContinuationArena?: boolean;
+  phaseArenaProvenance?: Record<string, unknown>;
 }
 
 function automaticOpponentPool(name: string, candidateCheckpoint: string): string[] {
@@ -181,8 +187,10 @@ async function runGames(settings: RunSettings) {
     modelFamilies: { candidate: modelFamily(flags["model-family"], "model-family"),
       opponent: modelFamily(flags["opponent-model-family"], "opponent-model-family") },
     evaluation: { stochasticArena: settings.exploratory && !settings.collect,
-      pairedSeatSeeds: settings.pairedSeatSeeds ?? false },
+      pairedSeatSeeds: settings.pairedSeatSeeds ?? false,
+      experimentalPhaseContinuationArena: settings.experimentalPhaseContinuationArena ?? false },
     inferenceFlushMode: flushMode,
+    ...(settings.phaseArenaProvenance ? { phaseArenaProvenance: settings.phaseArenaProvenance } : {}),
     search: { simulations: settings.simulations, minimumSimulations: settings.minimumSimulations,
       thinkMs: settings.thinkMs, adaptiveMultiplier: settings.searchMultiplier,
       consecutiveNonPromotions: settings.consecutiveNonPromotions } };
@@ -244,6 +252,7 @@ async function runGames(settings: RunSettings) {
           maxSamples: settings.maxSamples, recordReplay: settings.recordReplay, candidateSeat,
           networkOpponent: useLeagueOpponent, ...(opponentSlot ? { opponentSlot } : {}),
           ...(useLeagueOpponent && opponentPath ? { opponentLabel: modelLabel(opponentPath) } : {}), thinkMs: settings.thinkMs };
+        if (settings.experimentalPhaseContinuationArena) job.experimentalPhaseContinuationArena = true;
         worker.postMessage({ type: "job", job });
       };
       const fail = (error: Error) => { if (!failed) { failed = true; rejectRun(error); } };
@@ -270,10 +279,16 @@ async function runGames(settings: RunSettings) {
             try {
               const { report, samples } = message.output!;
               const { replay: replayActions, ...gameSummary } = report;
+              const replaySha256 = replayActions
+                ? createHash("sha256").update(JSON.stringify(replayActions)).digest("hex") : undefined;
+              if (settings.experimentalPhaseContinuationArena && !replaySha256) {
+                throw new Error(`phase arena game ${report.id} did not preserve its full replay`);
+              }
               // Persist exact replays per game, then release their large action arrays instead of
               // retaining every full replay until a 1,000-game run has finished.
-              reports.push(gameSummary);
-              writeFileSync(join(directory, `game-${report.id}.json`), JSON.stringify(gameSummary, null, 2));
+              const persistedGame = { ...gameSummary, ...(replaySha256 ? { replaySha256 } : {}) };
+              reports.push(persistedGame);
+              writeFileSync(join(directory, `game-${report.id}.json`), JSON.stringify(persistedGame, null, 2));
               if (replayActions) writeFileSync(join(directory, `game-${report.id}.replay.json`), JSON.stringify({
                 schemaVersion: 1, fingerprint: env.fingerprint, map: env.normalizedMap,
                 result: { finished: report.finished, winningTeamIds: report.winningTeamIds,
@@ -308,14 +323,24 @@ async function runGames(settings: RunSettings) {
         gamesFilteredAfterLearningWindow: games.filter((r) => r.trainingFilteredAfterRound).length };
     });
     const summaryReports = reports.map(({ replay: _replay, ...report }) => report);
+    const inference = Object.fromEntries(Object.entries(services).map(([slot, service]) => [slot, service.stats]));
+    const phaseArena = settings.experimentalPhaseContinuationArena ? phaseArenaGate(reports) : undefined;
+    const phaseArenaInference = settings.experimentalPhaseContinuationArena
+      ? reconcilePhaseArenaInference(reports, inference) : undefined;
+    const uniqueTrajectoryCount = settings.experimentalPhaseContinuationArena
+      ? new Set(reports.map((report) => report.replaySha256)).size : undefined;
     const summary = { schemaVersion: 1, fingerprint: env.fingerprint, settings, games: reports.length,
       naturalFinished: reports.filter((r) => r.finished).length, truncated: reports.filter((r) => r.truncated).length,
       gamesWithNoTrainingSamples: reports.filter((r) => !r.sampleCount).length,
       gamesFilteredAfterLearningWindow: reports.filter((r) => r.trainingFilteredAfterRound).length,
       actions: reports.reduce((sum, r) => sum + r.actions, 0), samples: reports.reduce((sum, r) => sum + r.sampleCount, 0),
       elapsedSeconds: (performance.now() - started) / 1000, scoreBySeat,
-      inference: Object.fromEntries(Object.entries(services).map(([slot, service]) => [slot, service.stats])),
-      budgetNote: settings.thinkMs > 0 ? "same soft per-command thinking budget; one evaluation can overshoot" : "equal simulation cap; wall-clock thinking time can differ",
+      inference,
+      budgetNote: settings.experimentalPhaseContinuationArena
+        ? `hard cap ${PHASE_ARENA.maximumNetworkPositionsPerMove} actual neural positions per move for both sides; no wall-clock cutoff`
+        : settings.thinkMs > 0 ? "same soft per-command thinking budget; one evaluation can overshoot" : "equal simulation cap; wall-clock thinking time can differ",
+      ...(phaseArena ? { phaseArena } : {}),
+      ...(phaseArenaInference ? { phaseArenaInference, uniqueTrajectoryCount } : {}),
       dataPath: settings.collect ? dataPath : null, metadataPath, reports: summaryReports };
     writeFileSync(join(directory, "summary.json"), JSON.stringify(summary, null, 2));
     console.log(JSON.stringify({ summary: join(directory, "summary.json"), naturalFinished: summary.naturalFinished,
@@ -481,9 +506,69 @@ function settings(name: string, collect: boolean): RunSettings {
     exploratory: collect || flags["stochastic-arena"]!,
     thinkMs: searchBudget.thinkMs, recordReplay: flags.replay!,
     opponentPool, leagueRatio: parsedRatio,
+    ...(flags["experimental-phase-continuation-arena"] ? { experimentalPhaseContinuationArena: true } : {}),
     ...(flags["paired-seat-seeds"] ? { pairedSeatSeeds: true } : {}),
     ...(flags.checkpoint ? { checkpoint: flags.checkpoint } : {}),
     ...(flags["opponent-checkpoint"] ? { opponentCheckpoint: flags["opponent-checkpoint"] } : {}) };
+}
+
+function sha256File(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function validatePhaseContinuationArena(options: RunSettings): Record<string, unknown> {
+  if (!flags["experimental-phase-continuation-arena"]) throw new Error("phase arena validation requires explicit experimental option");
+  if (!flags.name) throw new Error("experimental phase arena requires an explicit unique --name");
+  if (options.games !== PHASE_ARENA.games || options.workers !== PHASE_ARENA.workers
+      || options.seed !== PHASE_ARENA.seed || options.maxActions !== PHASE_ARENA.maxActions
+      || options.simulations !== PHASE_ARENA.continuationSimulations || options.minimumSimulations !== 1
+      || options.thinkMs !== 0 || options.policy !== "network" || options.opponent !== "network"
+      || options.collect || options.bootstrap !== "none" || options.exploratory
+      || !options.pairedSeatSeeds || options.opponentPool.length !== 0 || options.leagueRatio !== 0
+      || options.maxLearningRounds !== 0 || !options.recordReplay) {
+    throw new Error("experimental phase arena settings differ from the predeclared 32-game equal-position comparison");
+  }
+  if (modelFamily(flags["model-family"], "model-family") !== "hex-graph-v1"
+      || modelFamily(flags["opponent-model-family"], "opponent-model-family") !== "hex-graph-v1"
+      || flags.device !== "xpu" || flags["inference-flush-mode"] !== "timer") {
+    throw new Error("experimental phase arena requires hex-graph-v1 vs hex-graph-v1 on XPU timer inference");
+  }
+  if (!options.checkpoint || !options.opponentCheckpoint) throw new Error("experimental phase arena requires both checkpoint paths");
+  const checkpoint = resolve(options.checkpoint);
+  const opponentCheckpoint = resolve(options.opponentCheckpoint);
+  if (!existsSync(checkpoint) || !existsSync(opponentCheckpoint)) throw new Error("phase arena checkpoint does not exist");
+  const checkpointSha256 = sha256File(checkpoint);
+  const opponentCheckpointSha256 = sha256File(opponentCheckpoint);
+  if (checkpointSha256 !== opponentCheckpointSha256) throw new Error("phase arena sides must use byte-identical frozen G2 weights");
+  if (!flags["phase-probe"] || !flags["phase-probe-sha256"]) {
+    throw new Error("experimental phase arena requires --phase-probe and --phase-probe-sha256");
+  }
+  const phaseProbe = resolve(flags["phase-probe"]);
+  if (!existsSync(phaseProbe)) throw new Error("phase probe report does not exist");
+  const phaseProbeSha256 = sha256File(phaseProbe);
+  if (phaseProbeSha256 !== flags["phase-probe-sha256"].toLowerCase()) throw new Error("phase probe report SHA256 mismatch");
+  const probe = JSON.parse(readFileSync(phaseProbe, "utf8")) as {
+    status?: string; checkpointSha256?: string; fingerprint?: string; gate?: { pass?: boolean };
+    settings?: { maximumNetworkPositionsPerRoot?: number; maximumContinuationSteps?: number;
+      maxDepth?: number; device?: string; flushMode?: string };
+  };
+  if (probe.status !== "complete" || probe.checkpointSha256 !== checkpointSha256
+      || probe.fingerprint !== env.fingerprint || probe.gate?.pass !== true
+      || probe.settings?.maximumNetworkPositionsPerRoot !== PHASE_ARENA.maximumNetworkPositionsPerMove
+      || probe.settings.maximumContinuationSteps !== PHASE_ARENA.maximumContinuationSteps
+      || probe.settings.maxDepth !== PHASE_ARENA.maxDepth || probe.settings.device !== "xpu"
+      || probe.settings.flushMode !== "timer") {
+    throw new Error("phase probe did not pass with the frozen G2 equal-position configuration");
+  }
+  const outputDirectory = join(experimentRoot, "runs", options.name);
+  if (existsSync(outputDirectory)) throw new Error(`experimental phase arena output already exists: ${outputDirectory}`);
+  const phaseArenaSource = fileURLToPath(new URL("./phase-continuation-arena.ts", import.meta.url));
+  const phaseArenaSourceSha256 = sha256File(phaseArenaSource);
+  return { validated: true, checkpoint, checkpointSha256, opponentCheckpoint, opponentCheckpointSha256,
+    phaseProbe, phaseProbeSha256, phaseArenaSource, phaseArenaSourceSha256, outputDirectory,
+    games: PHASE_ARENA.games, workers: PHASE_ARENA.workers, seed: PHASE_ARENA.seed,
+    maximumNetworkPositionsPerMove: PHASE_ARENA.maximumNetworkPositionsPerMove,
+    maximumActionsPerGame: PHASE_ARENA.maxActions };
 }
 
 async function main() {
@@ -495,6 +580,13 @@ async function main() {
   }
   if (command !== "arena" && (flags["stochastic-arena"] || flags["paired-seat-seeds"])) {
     throw new Error("stochastic-arena and paired-seat-seeds are arena-only options");
+  }
+  if (!flags["experimental-phase-continuation-arena"]
+      && (flags["phase-probe"] || flags["phase-probe-sha256"] || flags["check-only"])) {
+    throw new Error("phase-probe and check-only options require --experimental-phase-continuation-arena");
+  }
+  if (flags["experimental-phase-continuation-arena"] && command !== "arena") {
+    throw new Error("experimental phase continuation is arena-only");
   }
   if (flags.help || command === "help") {
     console.log(`昏晓 AI 实验（本地共享规则；不会操作线上房间）
@@ -522,6 +614,11 @@ Truncation defaults to no value label. Bootstrap labels are explicitly marked, n
   } else if (command === "sample" || command === "arena" || command === "selfplay") {
     const options = settings(runName(command), command !== "arena");
     if (command === "selfplay") { options.policy = "network"; options.opponent = "network"; }
+    if (flags["experimental-phase-continuation-arena"]) {
+      const validation = validatePhaseContinuationArena(options);
+      if (flags["check-only"]) { console.log(JSON.stringify(validation)); return; }
+      options.phaseArenaProvenance = validation;
+    }
     await runGames(options);
   } else if (command === "train") {
     if (!flags.data || !flags.metadata || !flags.output) throw new Error("train requires --data, --metadata, --output");

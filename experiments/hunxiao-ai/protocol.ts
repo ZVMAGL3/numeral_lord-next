@@ -18,6 +18,22 @@ export interface JobOptions {
   opponentSlot?: string;
   opponentLabel?: string;
   thinkMs: number;
+  /** Isolated G2 continuation-vs-atomic arena; absent from normal games. */
+  experimentalPhaseContinuationArena?: boolean;
+}
+
+export interface PhaseArenaSeatDiagnostics {
+  mode: "leaf-policy-continuation" | "atomic-puct-control";
+  moves: number;
+  networkPositions: number;
+  maximumPositionsPerMove: number;
+  searchElapsedMs: number;
+  completedSimulations: number;
+  fallbackMoves: number;
+  incompleteContinuations: number;
+  incompleteByEvaluationBudget: number;
+  incompleteByStepLimit: number;
+  incompleteEvaluationPositions: number;
 }
 
 export interface PositionPayload {
@@ -60,6 +76,9 @@ export interface GameReport {
   elapsedMs: number;
   sampleCount: number;
   searchSimulations: number;
+  replaySha256?: string;
+  phaseArenaSearch?: { maximumNetworkPositionsPerMove: 258;
+    bySeat: Record<1 | 2, PhaseArenaSeatDiagnostics> };
   replay?: { sequence: number; round: number; phase: string; seat: number; intent: import("../../packages/game-core/src/index.js").GameIntent }[];
 }
 

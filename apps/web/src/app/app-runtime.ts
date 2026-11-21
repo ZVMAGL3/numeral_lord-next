@@ -1,3 +1,4 @@
+import { createDeferredSnapshotCache } from "../rooms/deferred-snapshot-cache";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { Client, type Room } from "@colyseus/sdk";
@@ -568,45 +569,18 @@ export function useAppRuntime(): AppRuntime {
     return `${minutes}:${remainder}`;
   }
 
-  let pendingHostSnapshotCacheFrame = 0;
-  let pendingHostSnapshotCacheTimer: number | undefined;
-
-  /** Cache-only snapshots are recovery data, so let the local board paint first. */
-  function scheduleHostSnapshotCacheUpdate(): void {
-    if (pendingHostSnapshotCacheFrame || pendingHostSnapshotCacheTimer !== undefined) return;
-    const flush = (): void => {
-      if (pendingHostSnapshotCacheFrame) cancelAnimationFrame(pendingHostSnapshotCacheFrame);
-      if (pendingHostSnapshotCacheTimer !== undefined) window.clearTimeout(pendingHostSnapshotCacheTimer);
-      pendingHostSnapshotCacheFrame = 0;
-      pendingHostSnapshotCacheTimer = undefined;
-      if (!relayRoom || !relayIsHost.value || lobbyState.value.phase !== "playing" || !matchStore.game) return;
-      const sequence = game.value.sequence;
-      const startedAt = performance.now();
-      broadcastSnapshot({ cacheOnly: true });
-      logConnection("board.snapshot-cache-timing", {
-        sequence,
-        syncMs: performance.now() - startedAt,
-        cellCount: Object.keys(game.value.cells).length,
-        unitCount: Object.keys(game.value.units).length
-      });
-    };
-
-    // The timer is a fallback for background tabs where requestAnimationFrame is
-    // throttled. Active tabs flush in a task after the next render opportunity.
-    pendingHostSnapshotCacheTimer = window.setTimeout(flush, 250);
-    pendingHostSnapshotCacheFrame = requestAnimationFrame(() => {
-      pendingHostSnapshotCacheFrame = 0;
-      if (pendingHostSnapshotCacheTimer !== undefined) window.clearTimeout(pendingHostSnapshotCacheTimer);
-      pendingHostSnapshotCacheTimer = window.setTimeout(flush, 0);
+  const hostSnapshotCache = createDeferredSnapshotCache(() => {
+    if (!relayRoom || !relayIsHost.value || lobbyState.value.phase !== "playing" || !matchStore.game) return;
+    const sequence = game.value.sequence;
+    const startedAt = performance.now();
+    broadcastSnapshot({ cacheOnly: true });
+    logConnection("board.snapshot-cache-timing", {
+      sequence,
+      syncMs: performance.now() - startedAt,
+      cellCount: Object.keys(game.value.cells).length,
+      unitCount: Object.keys(game.value.units).length
     });
-  }
-
-  function cancelHostSnapshotCacheUpdate(): void {
-    if (pendingHostSnapshotCacheFrame) cancelAnimationFrame(pendingHostSnapshotCacheFrame);
-    if (pendingHostSnapshotCacheTimer !== undefined) window.clearTimeout(pendingHostSnapshotCacheTimer);
-    pendingHostSnapshotCacheFrame = 0;
-    pendingHostSnapshotCacheTimer = undefined;
-  }
+  });
 
   function broadcastSnapshot(resolution?: {
     readonly resolvedCommandId?: string;
@@ -692,7 +666,7 @@ export function useAppRuntime(): AppRuntime {
         intentSendMs = performance.now() - intentSendStartedAt;
         if (relayIsHost.value) {
           const snapshotScheduleStartedAt = performance.now();
-          scheduleHostSnapshotCacheUpdate();
+          hostSnapshotCache.schedule();
           hostSnapshotScheduleMs = performance.now() - snapshotScheduleStartedAt;
         }
       } catch (error) {
@@ -818,6 +792,7 @@ export function useAppRuntime(): AppRuntime {
     cancelReconnect();
     connectionAttempt += 1;
     const room = relayRoom;
+    hostSnapshotCache.cancel();
     relayRoom = undefined;
     if (room) void room.leave();
     relayStatus.value = "连接失败";
@@ -1099,7 +1074,7 @@ export function useAppRuntime(): AppRuntime {
         } else if (payload.command.type === "end-action-phase") recordSpecial("action");
         else if (payload.command.type === "end-reinforcement-phase") recordSpecial("reinforcement");
         applyResult(result, true);
-        if (relayIsHost.value) scheduleHostSnapshotCacheUpdate();
+        if (relayIsHost.value) hostSnapshotCache.schedule();
       });
       room.onMessage("host-snapshot", (payload: {
         state?: GameState;
@@ -1161,6 +1136,7 @@ export function useAppRuntime(): AppRuntime {
         });
         console.warn("PvP room socket closed", { code, roomId: room.roomId });
         relayStatus.value = "连接已断开";
+        hostSnapshotCache.cancel();
         relayRoom = undefined;
         relayRoomId.value = "";
         boardInteraction.clear();
@@ -1605,6 +1581,7 @@ export function useAppRuntime(): AppRuntime {
     cancelReconnect();
     if (relayRoom) logConnection("room.left-by-user", { roomId: relayRoom.roomId });
     const room = relayRoom;
+    hostSnapshotCache.cancel();
     relayRoom = undefined;
     const workshop = workshopClient;
     workshopClient = undefined;
@@ -2250,7 +2227,7 @@ export function useAppRuntime(): AppRuntime {
   onBeforeUnmount(() => {
     clearReinforcementHold();
     cancelReconnect();
-    cancelHostSnapshotCacheUpdate();
+    hostSnapshotCache.cancel();
     window.removeEventListener("online", logBrowserConnectionState);
     window.removeEventListener("offline", logBrowserConnectionState);
     document.removeEventListener("visibilitychange", logBrowserConnectionState);

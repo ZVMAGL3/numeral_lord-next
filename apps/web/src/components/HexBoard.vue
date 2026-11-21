@@ -404,12 +404,17 @@ onBeforeUnmount(() => {
   }
 });
 // 规则会整体替换不可变的 GameState 快照；无需深度遍历，选择单位也不应重建地形、文字或命中区域。
-watch([() => props.state, () => props.actionableUnitIds, () => props.highlightedUnitIds, () => props.poweredUnitIds], draw);
+watch([
+  () => props.state,
+  () => props.actionableUnitIds,
+  () => props.highlightedUnitIds,
+  () => props.poweredUnitIds,
+  () => props.highlightedPlayerId
+], draw);
 watch([() => props.terrainCatalog, () => props.terrainVisualAssets], () => {
   terrainVisualRevisionCache = undefined;
   draw();
 }, { deep: true });
-watch(() => props.highlightedPlayerId, draw);
 watch([() => props.selectedUnitId, () => props.legalActionCellIds, () => props.counterattackCellIds,
   () => props.noCounterattackCellIds], drawInteractionOverlay);
 watch([() => props.viewZoom, () => props.viewPan], () => applyCamera());
